@@ -31,8 +31,11 @@ use crate::request::RetryOptions;
 use crate::request::TruncateKeyspace;
 use crate::timestamp::TimestampExt;
 use crate::transaction::buffer::Buffer;
+use crate::transaction::coprocessor::send_coprocessor_request;
 use crate::transaction::lock::format_key_for_log;
 use crate::transaction::lowering::*;
+use crate::transaction::CopRequest;
+use crate::transaction::CopResponseStream;
 use crate::BoundRange;
 use crate::Error;
 use crate::Key;
@@ -449,6 +452,46 @@ impl<PdC: PdClient> Transaction<PdC> {
             .scan_inner(range, limit, true, true)
             .await?
             .map(KvPair::into_key))
+    }
+
+    /// Send a coprocessor request (e.g. a TiDB DAG request) over the given key ranges, reading
+    /// at this transaction's start timestamp.
+    ///
+    /// The request payload and the response payloads are opaque bytes (e.g. an encoded
+    /// `tipb.DAGRequest` and `tipb.SelectResponse`s). The ranges are split by region and
+    /// executed concurrently; region errors are retried after re-splitting the remaining
+    /// ranges, and encountered locks are resolved before retrying. See [`CopRequest`].
+    ///
+    /// Local, uncommitted mutations buffered in this transaction are **not** visible to the
+    /// coprocessor.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use tikv_client::{CopRequest, TransactionClient, TransactionOptions};
+    /// # use tikv_client::transaction::REQ_TYPE_DAG;
+    /// # use futures::prelude::*;
+    /// # futures::executor::block_on(async {
+    /// # let client = TransactionClient::new(vec!["192.168.0.100"]).await.unwrap();
+    /// # let dag_request_bytes = vec![];
+    /// let ts = client.current_timestamp().await.unwrap();
+    /// let mut snapshot = client.snapshot(ts, TransactionOptions::new_optimistic());
+    /// let req = CopRequest::new(REQ_TYPE_DAG, dag_request_bytes, vec![(vec![b't']..vec![b'u']).into()])
+    ///     .keep_order(true);
+    /// let responses: Vec<_> = snapshot.coprocessor(req).await.unwrap().try_collect().await.unwrap();
+    /// # });
+    /// ```
+    pub async fn coprocessor(&mut self, request: CopRequest) -> Result<CopResponseStream> {
+        debug!("invoking transactional coprocessor request");
+        self.check_allow_operation().await?;
+        send_coprocessor_request(
+            self.rpc.clone(),
+            self.keyspace,
+            self.timestamp.clone(),
+            self.options.retry_options.clone(),
+            request,
+        )
+        .await
     }
 
     /// Sets the value associated with the given key.

@@ -10,6 +10,14 @@
 
 pub use client::Client;
 pub use client::ProtoLockInfo;
+pub use coprocessor::CopRequest;
+pub use coprocessor::CopResponse;
+pub use coprocessor::CopResponseStream;
+pub use coprocessor::DEFAULT_COPROCESSOR_CONCURRENCY;
+pub use coprocessor::DEFAULT_COPROCESSOR_TIMEOUT;
+pub use coprocessor::REQ_TYPE_ANALYZE;
+pub use coprocessor::REQ_TYPE_CHECKSUM;
+pub use coprocessor::REQ_TYPE_DAG;
 pub(crate) use lock::resolve_locks;
 pub(crate) use lock::HasLocks;
 pub use snapshot::Snapshot;
@@ -26,6 +34,7 @@ pub use transaction::TransactionOptions;
 
 mod buffer;
 mod client;
+mod coprocessor;
 mod lock;
 pub mod lowering;
 mod requests;

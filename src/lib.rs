@@ -162,6 +162,12 @@ pub use crate::transaction::CheckLevel;
 #[doc(inline)]
 pub use crate::transaction::Client as TransactionClient;
 #[doc(inline)]
+pub use crate::transaction::CopRequest;
+#[doc(inline)]
+pub use crate::transaction::CopResponse;
+#[doc(inline)]
+pub use crate::transaction::CopResponseStream;
+#[doc(inline)]
 pub use crate::transaction::ProtoLockInfo;
 #[doc(inline)]
 pub use crate::transaction::Scanner;

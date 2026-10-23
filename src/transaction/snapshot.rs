@@ -4,6 +4,8 @@ use derive_new::new;
 use log::{debug, trace};
 
 use crate::BoundRange;
+use crate::CopRequest;
+use crate::CopResponseStream;
 use crate::Key;
 use crate::KvPair;
 use crate::Result;
@@ -92,5 +94,13 @@ impl Snapshot {
     ) -> Result<impl Iterator<Item = Key>> {
         debug!("invoking scan_keys_reverse request on snapshot");
         self.transaction.scan_keys_reverse(range, limit).await
+    }
+
+    /// Send a coprocessor request reading at the snapshot's timestamp.
+    ///
+    /// See [`Transaction::coprocessor`](crate::Transaction::coprocessor).
+    pub async fn coprocessor(&mut self, request: CopRequest) -> Result<CopResponseStream> {
+        debug!("invoking coprocessor request on snapshot");
+        self.transaction.coprocessor(request).await
     }
 }

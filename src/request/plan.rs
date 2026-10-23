@@ -301,13 +301,13 @@ impl<PdC> Clone for RetryContext<PdC> {
     }
 }
 
-enum GrpcErrorAction {
+pub(crate) enum GrpcErrorAction {
     TryNextPeer,
     TryNextPeerAndInvalidate,
     Return,
 }
 
-fn grpc_error_action(error: &Error) -> GrpcErrorAction {
+pub(crate) fn grpc_error_action(error: &Error) -> GrpcErrorAction {
     match error {
         // A transport setup error means this Store cannot currently be used.
         Error::Grpc(_) => GrpcErrorAction::TryNextPeerAndInvalidate,
