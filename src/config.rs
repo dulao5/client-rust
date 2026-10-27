@@ -26,10 +26,14 @@ pub struct Config {
     pub timeout: Duration,
     pub grpc_max_decoding_message_size: usize,
     pub keyspace: Option<String>,
+    /// Number of gRPC connections opened to each TiKV store; requests are spread over them
+    /// round-robin (client-go's `grpc-connection-count`, default 4 there).
+    pub grpc_connection_count: usize,
 }
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_GRPC_MAX_DECODING_MESSAGE_SIZE: usize = 4 * 1024 * 1024; // 4MB
+const DEFAULT_GRPC_CONNECTION_COUNT: usize = 1;
 
 impl Default for Config {
     fn default() -> Self {
@@ -40,6 +44,7 @@ impl Default for Config {
             timeout: DEFAULT_REQUEST_TIMEOUT,
             grpc_max_decoding_message_size: DEFAULT_GRPC_MAX_DECODING_MESSAGE_SIZE,
             keyspace: None,
+            grpc_connection_count: DEFAULT_GRPC_CONNECTION_COUNT,
         }
     }
 }
@@ -104,6 +109,15 @@ impl Config {
     /// Set to use default keyspace.
     ///
     /// Server should enable `storage.api-version = 2` to use this feature.
+    /// Open `count` gRPC connections to each TiKV store (at least one). One HTTP/2 connection
+    /// serialises all its streams on one lock in the client and on one completion queue in
+    /// TiKV, which limits throughput under many concurrent requests.
+    #[must_use]
+    pub fn with_grpc_connection_count(mut self, count: usize) -> Self {
+        self.grpc_connection_count = count.max(1);
+        self
+    }
+
     #[must_use]
     pub fn with_default_keyspace(self) -> Self {
         self.with_keyspace("DEFAULT")
