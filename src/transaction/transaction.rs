@@ -152,6 +152,12 @@ impl<PdC: PdClient> Transaction<PdC> {
         let retry_options = self.options.retry_options.clone();
         let keyspace = self.keyspace;
 
+        if timestamp.version() == u64::MAX {
+            return self
+                .buffer
+                .get_or_else(key, |key| get_at_max_ts(rpc, keyspace, key, retry_options))
+                .await;
+        }
         self.buffer
             .get_or_else(key, |key| async move {
                 let request = new_get_request(key, timestamp.clone());
@@ -1135,6 +1141,72 @@ impl<PdC: PdClient> Transaction<PdC> {
     }
 }
 
+/// A point get at `u64::MAX` (TiDB's autocommit point get with MaxTS): reads the latest
+/// committed version without a TSO, at high priority, with client-go's lock handling for
+/// such reads (`KVSnapshot.get` with `version == maxTimestamp`):
+///
+/// - TiKV itself ignores a lock on the read key when the key is the lock's primary and the
+///   transaction uses neither async commit nor 1PC (`check_ts_conflict_si`).
+/// - Only the *first* lock met blocks the read. If a retry meets a lock of another
+///   transaction, that transaction started after the read began, so the read may ignore it
+///   (it is passed in `Context.resolved_locks`).
+/// - The first lock is resolved with `caller_start_ts = u64::MAX`: committed or rolled back
+///   transactions are resolved and the read retried; a live transaction for which TiKV answers
+///   `MinCommitTsPushed` is not committed, so the read ignores it; anything else (a live
+///   async-commit transaction) is waited for with the lock backoff.
+async fn get_at_max_ts<PdC: PdClient>(
+    rpc: Arc<PdC>,
+    keyspace: Keyspace,
+    key: Key,
+    retry_options: RetryOptions,
+) -> Result<Option<Value>> {
+    let mut lock_backoff = retry_options.lock_backoff;
+    let mut first_lock: Option<u64> = None;
+    let mut resolved_locks: Vec<u64> = Vec::new();
+    loop {
+        let mut request = new_get_request(key.clone(), Timestamp::from_version(u64::MAX));
+        let ctx = request.context.get_or_insert_with(Default::default);
+        ctx.priority = kvrpcpb::CommandPri::High as i32;
+        ctx.resolved_locks = resolved_locks.clone();
+        // A lock fails the plan at once (no lock backoff): it is handled below.
+        let plan = PlanBuilder::new(rpc.clone(), keyspace, request)
+            .resolve_lock(
+                Timestamp::from_version(u64::MAX),
+                Backoff::no_backoff(),
+                keyspace,
+            )
+            .retry_multi_region(DEFAULT_REGION_BACKOFF)
+            .merge(CollectSingle)
+            .post_process_default()
+            .plan();
+        let mut locks = match plan.execute().await {
+            Err(Error::ResolveLockError(locks)) if !locks.is_empty() => locks,
+            other => return other,
+        };
+        let lock = locks.swap_remove(0);
+        match first_lock {
+            Some(first) if first != lock.lock_version => {
+                resolved_locks.push(lock.lock_version);
+                continue;
+            }
+            _ => first_lock = Some(lock.lock_version),
+        }
+        let outcome = crate::transaction::lock::resolve_locks_for_max_ts_read(
+            vec![lock],
+            rpc.clone(),
+            keyspace,
+        )
+        .await?;
+        resolved_locks.extend(outcome.ignorable);
+        if !outcome.live.is_empty() {
+            match lock_backoff.next_delay_duration() {
+                None => return Err(Error::ResolveLockError(outcome.live)),
+                Some(delay) => tokio::time::sleep(delay).await,
+            }
+        }
+    }
+}
+
 impl<PdC: PdClient> Drop for Transaction<PdC> {
     fn drop(&mut self) {
         debug!(
@@ -2008,5 +2080,75 @@ mod tests {
                 ..Default::default()
             })
         )));
+    }
+
+    /// A point get at `u64::MAX`: high priority, no TSO for the read itself; the first lock
+    /// of a live transaction for which TiKV answers `MinCommitTsPushed` is bypassed through
+    /// `resolved_locks`, and a later lock of another transaction is bypassed outright.
+    #[tokio::test]
+    async fn get_at_max_ts_bypasses_uncommitted_locks() {
+        let gets = Arc::new(Mutex::new(Vec::<kvrpcpb::GetRequest>::new()));
+        let gets_captured = gets.clone();
+        let lock = |txn: u64| kvrpcpb::LockInfo {
+            key: b"k".to_vec(),
+            primary_lock: b"p".to_vec(),
+            lock_version: txn,
+            lock_ttl: 3000,
+            lock_type: kvrpcpb::Op::Put as i32,
+            ..Default::default()
+        };
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if let Some(req) = req.downcast_ref::<kvrpcpb::GetRequest>() {
+                    let mut gets = gets_captured.lock().unwrap();
+                    gets.push(req.clone());
+                    let locked = match gets.len() {
+                        1 => Some(lock(10)),
+                        2 => Some(lock(20)),
+                        _ => None,
+                    };
+                    let resp = kvrpcpb::GetResponse {
+                        error: locked.map(|l| kvrpcpb::KeyError {
+                            locked: Some(l),
+                            ..Default::default()
+                        }),
+                        value: b"v".to_vec(),
+                        ..Default::default()
+                    };
+                    return Ok(Box::new(resp) as Box<dyn Any>);
+                }
+                if let Some(req) = req.downcast_ref::<kvrpcpb::CheckTxnStatusRequest>() {
+                    assert_eq!(req.caller_start_ts, u64::MAX);
+                    assert_eq!(req.lock_ts, 10);
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        lock_ttl: 3000,
+                        lock_info: Some(lock(10)),
+                        action: kvrpcpb::Action::MinCommitTsPushed as i32,
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                panic!("unexpected request {:?}", req.type_id());
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(u64::MAX),
+            pd_client,
+            TransactionOptions::new_optimistic().read_only(),
+            Keyspace::Disable,
+        );
+        assert_eq!(txn.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
+        let gets = gets.lock().unwrap();
+        assert_eq!(gets.len(), 3);
+        for g in gets.iter() {
+            assert_eq!(g.version, u64::MAX);
+            let ctx = g.context.as_ref().unwrap();
+            assert_eq!(ctx.priority, kvrpcpb::CommandPri::High as i32);
+        }
+        assert!(gets[0].context.as_ref().unwrap().resolved_locks.is_empty());
+        assert_eq!(gets[1].context.as_ref().unwrap().resolved_locks, vec![10]);
+        assert_eq!(
+            gets[2].context.as_ref().unwrap().resolved_locks,
+            vec![10, 20]
+        );
     }
 }

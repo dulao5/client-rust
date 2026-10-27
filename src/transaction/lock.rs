@@ -89,13 +89,59 @@ pub async fn resolve_locks(
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
 ) -> Result<Vec<kvrpcpb::LockInfo> /* live_locks */> {
+    Ok(
+        resolve_locks_impl(locks, timestamp, pd_client, keyspace, false)
+            .await?
+            .live,
+    )
+}
+
+/// What [`resolve_locks_for_max_ts_read`] found out about the encountered locks.
+#[derive(Debug, Default)]
+pub(crate) struct MaxTsReadLocks {
+    /// Locks of transactions that are still alive and must be waited for.
+    pub live: Vec<kvrpcpb::LockInfo>,
+    /// Start timestamps of live transactions the read may bypass (`Context.resolved_locks`).
+    pub ignorable: Vec<u64>,
+}
+
+/// [`resolve_locks`] for a read at `u64::MAX` (TiDB's autocommit point get, which reads the
+/// latest committed version without a TSO). It differs in one way, as in client-go's
+/// `ResolveLocksForRead`: when `CheckTxnStatus` (sent with `caller_start_ts = u64::MAX`)
+/// answers `MinCommitTsPushed` for a live transaction, the transaction is not committed yet
+/// and TiKV deliberately did not push its `min_commit_ts`, so the read may ignore its locks
+/// instead of waiting: the start timestamp is returned in `ignorable`. Committed and rolled
+/// back transactions are resolved as usual; live async-commit transactions (TiKV answers
+/// `NoAction` for them) stay in `live`.
+pub(crate) async fn resolve_locks_for_max_ts_read(
+    locks: Vec<kvrpcpb::LockInfo>,
+    pd_client: Arc<impl PdClient>,
+    keyspace: Keyspace,
+) -> Result<MaxTsReadLocks> {
+    resolve_locks_impl(
+        locks,
+        Timestamp::from_version(u64::MAX),
+        pd_client,
+        keyspace,
+        true,
+    )
+    .await
+}
+
+async fn resolve_locks_impl(
+    locks: Vec<kvrpcpb::LockInfo>,
+    timestamp: Timestamp,
+    pd_client: Arc<impl PdClient>,
+    keyspace: Keyspace,
+    max_ts_read: bool,
+) -> Result<MaxTsReadLocks> {
     debug!("resolving locks");
     reject_shared_locks(&locks)?;
     let ts = pd_client.clone().get_timestamp().await?;
     let caller_start_ts = timestamp.version();
     let current_ts = ts.version();
 
-    let mut live_locks = Vec::new();
+    let mut out = MaxTsReadLocks::default();
     // Final transaction statuses are cached in the resolver's context, so a transaction met
     // through several locks is queried (or recovered) only once.
     let mut lock_resolver = LockResolver::new(ResolveLocksContext::default());
@@ -126,8 +172,15 @@ pub async fn resolve_locks(
                 commit_version,
                 keys,
             } => (commit_version, keys),
-            LockAction::Live(primary_lock) => {
-                live_locks.push(primary_lock);
+            LockAction::Live {
+                primary_lock,
+                min_commit_ts_pushed,
+            } => {
+                if max_ts_read && min_commit_ts_pushed {
+                    out.ignorable.push(lock.lock_version);
+                } else {
+                    out.live.push(primary_lock);
+                }
                 continue;
             }
             LockAction::Done => continue,
@@ -147,7 +200,7 @@ pub async fn resolve_locks(
             .await?;
         }
     }
-    Ok(live_locks)
+    Ok(out)
 }
 
 /// What `resolve_locks` has to do about one encountered lock.
@@ -159,7 +212,11 @@ enum LockAction {
         keys: Vec<Vec<u8>>,
     },
     /// The transaction is still alive; its primary lock is reported back to the caller.
-    Live(kvrpcpb::LockInfo),
+    /// `min_commit_ts_pushed`: `CheckTxnStatus` answered `MinCommitTsPushed`.
+    Live {
+        primary_lock: kvrpcpb::LockInfo,
+        min_commit_ts_pushed: bool,
+    },
     /// The lock has been dealt with on its own (a stale pessimistic lock rolled back by
     /// itself) and nothing else needs resolving.
     Done,
@@ -177,9 +234,10 @@ impl LockAction {
                 commit_version: 0,
                 keys: Vec::new(),
             },
-            TransactionStatusKind::Locked(_, primary_lock) => {
-                LockAction::Live(primary_lock.clone())
-            }
+            TransactionStatusKind::Locked(_, primary_lock) => LockAction::Live {
+                primary_lock: primary_lock.clone(),
+                min_commit_ts_pushed: status.action == kvrpcpb::Action::MinCommitTsPushed,
+            },
         }
     }
 }
