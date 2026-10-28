@@ -358,6 +358,10 @@ impl Client {
             match backoff.next_delay_duration() {
                 None => return Ok(live_locks),
                 Some(delay_duration) => {
+                    crate::metrics::backoff(
+                        crate::metrics::BackoffType::TikvLockFast,
+                        delay_duration,
+                    );
                     tokio::time::sleep(delay_duration).await;
                 }
             }

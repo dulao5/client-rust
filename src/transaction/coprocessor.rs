@@ -39,6 +39,8 @@ use tonic::IntoRequest;
 
 use crate::backoff::Backoff;
 use crate::internal_err;
+use crate::metrics;
+use crate::metrics::BackoffType;
 use crate::pd::PdClient;
 use crate::proto::coprocessor;
 use crate::proto::kvrpcpb;
@@ -333,10 +335,18 @@ impl Request for CoprocessorRpc {
     ) -> Result<Box<dyn std::any::Any>> {
         let mut req = self.inner.clone().into_request();
         req.set_timeout(self.timeout);
-        client
-            .clone()
-            .coprocessor(req)
-            .await
+        let start = std::time::Instant::now();
+        let result = client.clone().coprocessor(req).await;
+        let wall_ns = result.as_ref().map_or(0, |r| {
+            crate::store::exec_details_wall_time_ns(r.get_ref().exec_details_v2.as_ref())
+        });
+        crate::metrics::rpc(
+            crate::metrics::CmdType::Cop,
+            crate::store::context_store_id(self.inner.context.as_ref()),
+            start.elapsed(),
+            wall_ns,
+        );
+        result
             .map(|r| Box::new(r.into_inner()) as Box<dyn std::any::Any>)
             .map_err(Error::from)
     }
@@ -616,9 +626,11 @@ async fn handle_task_once<PdC: PdClient>(
             );
             return Err(Error::RegionError(Box::new(region_error)));
         };
+        let backoff_type = metrics::backoff_type_for_region_error(&region_error);
         let resolved =
             handle_region_error(ctx.pd_client.clone(), region_error, region_store).await?;
         if !resolved {
+            metrics::backoff(backoff_type, delay);
             sleep(delay).await;
         }
         return resplit(ctx, task).await;
@@ -639,7 +651,10 @@ async fn handle_task_once<PdC: PdClient>(
         .await?;
         if !live_locks.is_empty() {
             match lock_backoff.next_delay_duration() {
-                Some(delay) => sleep(delay).await,
+                Some(delay) => {
+                    metrics::backoff(BackoffType::TikvLockFast, delay);
+                    sleep(delay).await
+                }
                 None => return Err(Error::ResolveLockError(live_locks)),
             }
         }
@@ -694,6 +709,14 @@ async fn retry_after_backoff<PdC: PdClient>(
 ) -> Result<TaskOutcome> {
     match region_backoff.next_delay_duration() {
         Some(delay) => {
+            // gRPC errors back off as client-go's `tikvRPC`; failing to locate the region
+            // or store as `regionMiss`.
+            let t = if is_grpc_error(&error) {
+                BackoffType::TikvRpc
+            } else {
+                BackoffType::RegionMiss
+            };
+            metrics::backoff(t, delay);
             sleep(delay).await;
             resplit(ctx, task).await
         }

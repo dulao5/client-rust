@@ -18,6 +18,8 @@ pub use self::client::TikvConnect;
 pub use self::errors::HasKeyErrors;
 pub use self::errors::HasRegionError;
 pub use self::errors::HasRegionErrors;
+pub(crate) use self::request::context_store_id;
+pub(crate) use self::request::exec_details_wall_time_ns;
 pub use self::request::Request;
 use crate::pd::PdClient;
 use crate::proto::kvrpcpb;

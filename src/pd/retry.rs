@@ -11,6 +11,8 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
+use crate::metrics;
+use crate::metrics::PdCmd;
 use crate::pd::Cluster;
 use crate::pd::Connection;
 use crate::proto::keyspacepb;
@@ -74,35 +76,42 @@ impl<Cl> RetryClient<Cl> {
 }
 
 macro_rules! retry_core {
-    ($self: ident, $tag: literal, $call: expr) => {{
+    ($self: ident, $tag: literal, $cmd: expr, $call: expr) => {{
         let stats = pd_stats($tag);
-        let mut last_err = Ok(());
-        for _ in 0..LEADER_CHANGE_RETRY {
-            let res = $call;
+        // PD client's `cmdDuration` / `cmdFailedDuration`: the whole call, retries included.
+        let start = Instant::now();
+        let result = async {
+            let mut last_err = Ok(());
+            for _ in 0..LEADER_CHANGE_RETRY {
+                let res = $call;
 
-            match stats.done(res) {
-                Ok(r) => return Ok(r),
-                Err(e) => last_err = Err(e),
-            }
-
-            let mut reconnect_count = MAX_REQUEST_COUNT;
-            while let Err(e) = $self.reconnect(RECONNECT_INTERVAL_SEC).await {
-                reconnect_count -= 1;
-                if reconnect_count == 0 {
-                    return Err(e);
+                match stats.done(res) {
+                    Ok(r) => return Ok(r),
+                    Err(e) => last_err = Err(e),
                 }
-                sleep(Duration::from_secs(RECONNECT_INTERVAL_SEC)).await;
-            }
-        }
 
-        last_err?;
-        unreachable!();
+                let mut reconnect_count = MAX_REQUEST_COUNT;
+                while let Err(e) = $self.reconnect(RECONNECT_INTERVAL_SEC).await {
+                    reconnect_count -= 1;
+                    if reconnect_count == 0 {
+                        return Err(e);
+                    }
+                    sleep(Duration::from_secs(RECONNECT_INTERVAL_SEC)).await;
+                }
+            }
+
+            last_err?;
+            unreachable!();
+        }
+        .await;
+        metrics::pd_cmd($cmd, start.elapsed(), result.is_ok());
+        result
     }};
 }
 
 macro_rules! retry_mut {
-    ($self: ident, $tag: literal, |$cluster: ident| $call: expr) => {{
-        retry_core!($self, $tag, {
+    ($self: ident, $tag: literal, $cmd: expr, |$cluster: ident| $call: expr) => {{
+        retry_core!($self, $tag, $cmd, {
             // use the block here to drop the guard of the lock,
             // otherwise `reconnect` will try to acquire the write lock and results in a deadlock
             let $cluster = &mut $self.cluster.write().await.0;
@@ -112,8 +121,8 @@ macro_rules! retry_mut {
 }
 
 macro_rules! retry {
-    ($self: ident, $tag: literal, |$cluster: ident| $call: expr) => {{
-        retry_core!($self, $tag, {
+    ($self: ident, $tag: literal, $cmd: expr, |$cluster: ident| $call: expr) => {{
+        retry_core!($self, $tag, $cmd, {
             // use the block here to drop the guard of the lock,
             // otherwise `reconnect` will try to acquire the write lock and results in a deadlock
             let $cluster = &$self.cluster.read().await.0;
@@ -146,7 +155,7 @@ impl RetryClientTrait for RetryClient<Cluster> {
     // These get_* functions will try multiple times to make a request, reconnecting as necessary.
     // It does not know about encoding. Caller should take care of it.
     async fn get_region(self: Arc<Self>, key: Vec<u8>) -> Result<RegionWithLeader> {
-        retry_mut!(self, "get_region", |cluster| {
+        retry_mut!(self, "get_region", PdCmd::GetRegion, |cluster| {
             let key = key.clone();
             async {
                 cluster
@@ -160,18 +169,23 @@ impl RetryClientTrait for RetryClient<Cluster> {
     }
 
     async fn get_region_by_id(self: Arc<Self>, region_id: RegionId) -> Result<RegionWithLeader> {
-        retry_mut!(self, "get_region_by_id", |cluster| async {
-            cluster
-                .get_region_by_id(region_id, self.timeout)
-                .await
-                .and_then(|resp| {
-                    region_from_response(resp, || Error::RegionNotFoundInResponse { region_id })
-                })
-        })
+        retry_mut!(
+            self,
+            "get_region_by_id",
+            PdCmd::GetRegionById,
+            |cluster| async {
+                cluster
+                    .get_region_by_id(region_id, self.timeout)
+                    .await
+                    .and_then(|resp| {
+                        region_from_response(resp, || Error::RegionNotFoundInResponse { region_id })
+                    })
+            }
+        )
     }
 
     async fn get_store(self: Arc<Self>, id: StoreId) -> Result<metapb::Store> {
-        retry_mut!(self, "get_store", |cluster| async {
+        retry_mut!(self, "get_store", PdCmd::GetStore, |cluster| async {
             cluster
                 .get_store(id, self.timeout)
                 .await
@@ -180,31 +194,45 @@ impl RetryClientTrait for RetryClient<Cluster> {
     }
 
     async fn get_all_stores(self: Arc<Self>) -> Result<Vec<metapb::Store>> {
-        retry_mut!(self, "get_all_stores", |cluster| async {
-            cluster
-                .get_all_stores(self.timeout)
-                .await
-                .map(|resp| resp.stores)
-        })
+        retry_mut!(
+            self,
+            "get_all_stores",
+            PdCmd::GetAllStores,
+            |cluster| async {
+                cluster
+                    .get_all_stores(self.timeout)
+                    .await
+                    .map(|resp| resp.stores)
+            }
+        )
     }
 
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp> {
-        retry!(self, "get_timestamp", |cluster| cluster.get_timestamp())
+        retry!(self, "get_timestamp", PdCmd::Tso, |cluster| cluster
+            .get_timestamp())
     }
 
     async fn update_safepoint(self: Arc<Self>, safepoint: u64) -> Result<bool> {
-        retry_mut!(self, "update_gc_safepoint", |cluster| async {
-            cluster
-                .update_safepoint(safepoint, self.timeout)
-                .await
-                .map(|resp| resp.new_safe_point == safepoint)
-        })
+        retry_mut!(
+            self,
+            "update_gc_safepoint",
+            PdCmd::UpdateGcSafePoint,
+            |cluster| async {
+                cluster
+                    .update_safepoint(safepoint, self.timeout)
+                    .await
+                    .map(|resp| resp.new_safe_point == safepoint)
+            }
+        )
     }
 
     async fn load_keyspace(&self, keyspace: &str) -> Result<keyspacepb::KeyspaceMeta> {
-        retry_mut!(self, "load_keyspace", |cluster| async {
-            cluster.load_keyspace(keyspace, self.timeout).await
-        })
+        retry_mut!(
+            self,
+            "load_keyspace",
+            PdCmd::LoadKeyspace,
+            |cluster| async { cluster.load_keyspace(keyspace, self.timeout).await }
+        )
     }
 }
 
@@ -282,11 +310,15 @@ mod test {
         }
 
         async fn retry_err(client: Arc<MockClient>) -> Result<()> {
-            retry_mut!(client, "test", |_c| ready(Err(internal_err!("whoops"))))
+            retry_mut!(client, "test", PdCmd::GetRegion, |_c| ready(Err(
+                internal_err!("whoops")
+            )))
         }
 
         async fn retry_ok(client: Arc<MockClient>) -> Result<()> {
-            retry!(client, "test", |_c| ready(Ok::<_, Error>(())))
+            retry!(client, "test", PdCmd::GetRegion, |_c| ready(
+                Ok::<_, Error>(())
+            ))
         }
 
         executor::block_on(async {
@@ -335,7 +367,7 @@ mod test {
             client: Arc<MockClient>,
             max_retries: Arc<AtomicUsize>,
         ) -> Result<()> {
-            retry_mut!(client, "test", |c| {
+            retry_mut!(client, "test", PdCmd::GetRegion, |c| {
                 c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 let max_retries = max_retries.fetch_sub(1, Ordering::SeqCst) - 1;
@@ -351,7 +383,7 @@ mod test {
             client: Arc<MockClient>,
             max_retries: Arc<AtomicUsize>,
         ) -> Result<()> {
-            retry!(client, "test", |c| {
+            retry!(client, "test", PdCmd::GetRegion, |c| {
                 c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 let max_retries = max_retries.fetch_sub(1, Ordering::SeqCst) - 1;

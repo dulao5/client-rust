@@ -114,6 +114,9 @@ async fn run_tso(
 struct RequestGroup {
     tso_request: TsoRequest,
     requests: Vec<TimestampRequest>,
+    /// When the batch was handed to the stream (PD client's `requestDurationTSO` is the
+    /// stream round trip of one batch).
+    sent: std::time::Instant,
 }
 
 #[pin_project]
@@ -165,6 +168,7 @@ impl Stream for TsoRequestStream {
             let request_group = RequestGroup {
                 tso_request: req.clone(),
                 requests,
+                sent: std::time::Instant::now(),
             };
             pending_requests.push_back(request_group);
 
@@ -194,8 +198,10 @@ fn allocate_timestamps(
     if let Some(RequestGroup {
         tso_request,
         requests,
+        sent,
     }) = pending_requests.pop_front()
     {
+        crate::metrics::pd_request_tso(sent.elapsed(), true);
         if tso_request.count != offset {
             return Err(internal_err!(
                 "PD gives different number of timestamps than expected"

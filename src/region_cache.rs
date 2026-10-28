@@ -10,6 +10,8 @@ use tokio::sync::Notify;
 use tokio::sync::RwLock;
 
 use crate::common::Error;
+use crate::metrics;
+use crate::metrics::RegionCacheOp;
 use crate::pd::Cluster;
 use crate::pd::RetryClient;
 use crate::pd::RetryClientTrait;
@@ -133,7 +135,11 @@ impl<C: RetryClientTrait> RegionCache<C> {
 
     /// Force read through (query from PD) and update cache
     pub async fn read_through_region_by_key(&self, key: Key) -> Result<RegionWithLeader> {
-        let region = self.inner_client.clone().get_region(key.into()).await?;
+        let region = timed_load(
+            RegionCacheOp::GetRegionWhenMiss,
+            self.inner_client.clone().get_region(key.into()),
+        )
+        .await?;
         self.add_region(region.clone()).await;
         Ok(region)
     }
@@ -147,7 +153,11 @@ impl<C: RetryClientTrait> RegionCache<C> {
             region_cache_guard.on_my_way_id.insert(id, notify.clone());
         }
 
-        let region = self.inner_client.clone().get_region_by_id(id).await?;
+        let region = timed_load(
+            RegionCacheOp::GetRegionById,
+            self.inner_client.clone().get_region_by_id(id),
+        )
+        .await?;
         self.add_region(region.clone()).await;
 
         // notify others
@@ -161,7 +171,11 @@ impl<C: RetryClientTrait> RegionCache<C> {
     }
 
     async fn read_through_store_by_id(&self, id: StoreId) -> Result<Store> {
-        let store = self.inner_client.clone().get_store(id).await?;
+        let store = timed_load(
+            RegionCacheOp::GetStore,
+            self.inner_client.clone().get_store(id),
+        )
+        .await?;
         self.store_cache.write().await.insert(id, store.clone());
         Ok(store)
     }
@@ -232,6 +246,7 @@ impl<C: RetryClientTrait> RegionCache<C> {
             cache.ver_id_to_region.remove(&ver_id);
             cache.id_to_ver_id.remove(&id);
             cache.key_to_ver_id.remove(&start_key);
+            metrics::region_cache(RegionCacheOp::InvalidateRegionFromCache, true);
             debug!("invalidated region cache entry, region: {:?}", ver_id);
         }
     }
@@ -262,6 +277,21 @@ impl<C: RetryClientTrait> RegionCache<C> {
         }
         Ok(stores)
     }
+}
+
+/// Load from PD and record client-go's region cache metrics: the operation's result, and its
+/// duration when it succeeded.
+async fn timed_load<T>(
+    op: RegionCacheOp,
+    load: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let start = std::time::Instant::now();
+    let result = load.await;
+    metrics::region_cache(op, result.is_ok());
+    if result.is_ok() {
+        metrics::load_region(op, start.elapsed());
+    }
+    result
 }
 
 const ENGINE_LABEL_KEY: &str = "engine";

@@ -16,6 +16,8 @@ use tokio::time::sleep;
 use tonic::Code;
 
 use crate::backoff::Backoff;
+use crate::metrics;
+use crate::metrics::BackoffType;
 use crate::pd::PdClient;
 use crate::proto::errorpb;
 use crate::proto::errorpb::EpochNotMatch;
@@ -668,6 +670,7 @@ where
     ) -> Result<<Self as Plan>::Result> {
         match backoff.next_delay_duration() {
             Some(duration) => {
+                metrics::backoff(BackoffType::TikvRpc, duration);
                 sleep(duration).await;
                 Self::single_shard_handler(context, plan, region, backoff, candidate_state).await
             }
@@ -868,9 +871,11 @@ where
 
         match backoff.next_delay_duration() {
             Some(duration) => {
+                let backoff_type = metrics::backoff_type_for_region_error(&error);
                 let region_error_resolved =
                     handle_region_error(context.pd_client.clone(), error, region_store).await?;
                 if !region_error_resolved {
+                    metrics::backoff(backoff_type, duration);
                     sleep(duration).await;
                 }
                 Self::single_plan_handler(context, plan, backoff).await
@@ -905,6 +910,12 @@ where
     ) -> Result<<Self as Plan>::Result> {
         match backoff.next_delay_duration() {
             Some(duration) => {
+                let t = if is_grpc_error(&error) {
+                    BackoffType::TikvRpc
+                } else {
+                    BackoffType::RegionMiss
+                };
+                metrics::backoff(t, duration);
                 sleep(duration).await;
                 Self::single_plan_handler(context, plan, backoff).await
             }
@@ -925,6 +936,7 @@ pub(crate) async fn handle_region_error<PdC: PdClient>(
     let ver_id = region_store.region_with_leader.ver_id();
     let store_id = region_store.region_with_leader.get_store_id();
     debug!("handling region error: {:?}, region: {:?}", e, ver_id);
+    metrics::region_error(&e, store_id.as_ref().copied().unwrap_or(0));
     if let Some(not_leader) = e.not_leader {
         if let Some(leader) = not_leader.leader {
             match pd_client
@@ -1139,6 +1151,7 @@ where
                 }
                 Err(e) if is_grpc_error(&e) => match backoff.next_delay_duration() {
                     Some(duration) => {
+                        metrics::backoff(BackoffType::TikvRpc, duration);
                         sleep(duration).await;
                         continue;
                     }
@@ -1297,6 +1310,7 @@ where
                 match clone.backoff.next_delay_duration() {
                     None => return Err(Error::ResolveLockError(live_locks)),
                     Some(delay_duration) => {
+                        metrics::backoff(BackoffType::TikvLockFast, delay_duration);
                         sleep(delay_duration).await;
                         result = clone.inner.execute().await?;
                     }

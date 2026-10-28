@@ -94,6 +94,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod backoff;
+pub mod metrics;
 #[doc(hidden)]
 pub mod raw;
 pub mod request;

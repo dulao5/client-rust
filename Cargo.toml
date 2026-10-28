@@ -12,6 +12,9 @@ rust-version = "1.93.0"
 [features]
 default = ["prometheus"]
 prometheus = ["prometheus/push", "prometheus/process"]
+# Record client-go's `tidb_tikvclient_*` and PD client's `pd_client_*` metrics (names, labels,
+# buckets as TiDB v8.5 exports them) in the default prometheus registry; see `src/metrics.rs`.
+client-go-metrics = []
 # Enable integration tests with a running TiKV and PD instance.
 # Use $PD_ADDRS, comma separated, to set the addresses the tests use.
 integration-tests = []

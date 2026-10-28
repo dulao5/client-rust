@@ -18,6 +18,9 @@ use crate::kv::HexRepr;
 use crate::pd::PdClient;
 use crate::Key;
 
+use crate::metrics;
+use crate::metrics::BackoffType;
+use crate::metrics::LockAction as LockMetric;
 use crate::proto::kvrpcpb;
 use crate::proto::kvrpcpb::TxnInfo;
 use crate::proto::pdpb::Timestamp;
@@ -137,6 +140,9 @@ async fn resolve_locks_impl(
 ) -> Result<MaxTsReadLocks> {
     debug!("resolving locks");
     reject_shared_locks(&locks)?;
+    if !locks.is_empty() {
+        metrics::lock_resolver(LockMetric::Resolve);
+    }
     let ts = pd_client.clone().get_timestamp().await?;
     let caller_start_ts = timestamp.version();
     let current_ts = ts.version();
@@ -171,7 +177,10 @@ async fn resolve_locks_impl(
             LockAction::Resolve {
                 commit_version,
                 keys,
-            } => (commit_version, keys),
+            } => {
+                metrics::lock_resolver(LockMetric::Expired);
+                (commit_version, keys)
+            }
             LockAction::Live {
                 primary_lock,
                 min_commit_ts_pushed,
@@ -179,11 +188,15 @@ async fn resolve_locks_impl(
                 if max_ts_read && min_commit_ts_pushed {
                     out.ignorable.push(lock.lock_version);
                 } else {
+                    metrics::lock_resolver(LockMetric::NotExpired);
                     out.live.push(primary_lock);
                 }
                 continue;
             }
-            LockAction::Done => continue,
+            LockAction::Done => {
+                metrics::lock_resolver(LockMetric::Expired);
+                continue;
+            }
         };
         let regions = clean_regions.entry(lock.lock_version).or_default();
         for key in keys.iter().chain([&lock.key]) {
@@ -199,6 +212,9 @@ async fn resolve_locks_impl(
             )
             .await?;
         }
+    }
+    if !out.live.is_empty() {
+        metrics::lock_resolver(LockMetric::WaitExpired);
     }
     Ok(out)
 }
@@ -300,6 +316,7 @@ async fn resolve_lock_with_retry(
         }
         let request =
             requests::new_resolve_lock_request(start_version, commit_version, is_txn_file);
+        metrics::lock_resolver(LockMetric::QueryResolveLocks);
         let plan_builder =
             match crate::request::PlanBuilder::new(pd_client.clone(), keyspace, request)
                 .single_region_with_store(store.clone())
@@ -310,6 +327,7 @@ async fn resolve_lock_with_retry(
                     pd_client.invalidate_region_cache(region.clone()).await;
                     match backoff.next_delay_duration() {
                         Some(duration) => {
+                            metrics::backoff(BackoffType::RegionScheduling, duration);
                             sleep(duration).await;
                             continue;
                         }
@@ -330,9 +348,11 @@ async fn resolve_lock_with_retry(
             Err(Error::MultipleRegionErrors(mut errors)) => match errors.pop() {
                 Some(Error::RegionError(e)) => match backoff.next_delay_duration() {
                     Some(duration) => {
+                        let backoff_type = metrics::backoff_type_for_region_error(&e);
                         let region_error_resolved =
                             handle_region_error(pd_client.clone(), *e, store.clone()).await?;
                         if !region_error_resolved {
+                            metrics::backoff(backoff_type, duration);
                             sleep(duration).await;
                         }
                         continue;
@@ -364,6 +384,7 @@ async fn resolve_lock_with_retry(
                     if let Ok(store_id) = store.region_with_leader.get_store_id() {
                         pd_client.invalidate_store_cache(store_id).await;
                     }
+                    metrics::backoff(BackoffType::TikvRpc, duration);
                     sleep(duration).await;
                     continue;
                 }
@@ -495,6 +516,7 @@ impl LockResolver {
 
         // TiKV will not roll back an expired async-commit primary: the transaction's decision
         // has to be recovered from its secondaries instead.
+        metrics::lock_resolver(LockMetric::ResolveAsyncCommit);
         let secondary_status = self
             .check_all_secondaries(
                 pd_client.clone(),
@@ -695,6 +717,7 @@ impl LockResolver {
         // 2.1 Txn Committed
         // 2.2 Txn Rollbacked -- rollback itself, rollback by others, GC tomb etc.
         // 2.3 No lock -- pessimistic lock rollback, concurrence prewrite.
+        metrics::lock_resolver(LockMetric::QueryTxnStatus);
         let req = new_check_txn_status_request(
             primary,
             txn_id,
@@ -739,6 +762,15 @@ impl LockResolver {
 
         let current = pd_client.clone().get_timestamp().await?;
         status.check_ttl(current);
+        match status.kind {
+            TransactionStatusKind::Committed(_) => {
+                metrics::lock_resolver(LockMetric::QueryTxnStatusCommitted)
+            }
+            TransactionStatusKind::RolledBack => {
+                metrics::lock_resolver(LockMetric::QueryTxnStatusRolledBack)
+            }
+            TransactionStatusKind::Locked(..) => {}
+        }
         let res = Arc::new(status);
         if res.is_cacheable() {
             self.ctx.save_resolved(txn_id, res.clone()).await;
@@ -753,6 +785,7 @@ impl LockResolver {
         keys: Vec<Vec<u8>>,
         txn_id: u64,
     ) -> Result<SecondaryLocksStatus> {
+        metrics::lock_resolver(LockMetric::QueryCheckSecondaryLocks);
         let req = new_check_secondary_locks_request(keys, txn_id);
         let plan = crate::request::PlanBuilder::new(pd_client.clone(), keyspace, req)
             .preserve_shard()
@@ -773,6 +806,7 @@ impl LockResolver {
         txn_infos: Vec<TxnInfo>,
     ) -> Result<RegionVerId> {
         let ver_id = store.region_with_leader.ver_id();
+        metrics::lock_resolver(LockMetric::BatchResolve);
         let request = requests::new_batch_resolve_lock_request(txn_infos.clone());
         let plan = crate::request::PlanBuilder::new(pd_client.clone(), keyspace, request)
             .single_region_with_store(store.clone())
@@ -841,6 +875,7 @@ impl LockResolver {
                     }
 
                     if let Some(duration) = backoff.next_delay_duration() {
+                        metrics::backoff(BackoffType::TxnNotFound, duration);
                         sleep(duration).await;
                         continue;
                     }
