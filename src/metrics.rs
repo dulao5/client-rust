@@ -671,7 +671,19 @@ pub fn register() {
         REPLICA_SELECTOR_FAILURE.with_label_values(&[t]);
     }
     LazyLock::force(&PD_CMD_CHILDREN);
-    LazyLock::force(&PD_CMD_FAILED);
+    // pd/client creates the failure children of these commands at start-up too.
+    for cmd in [
+        PdCmd::Tso,
+        PdCmd::GetRegion,
+        PdCmd::GetRegionById,
+        PdCmd::GetStore,
+        PdCmd::GetAllStores,
+        PdCmd::UpdateGcSafePoint,
+        PdCmd::LoadKeyspace,
+    ] {
+        PD_CMD_FAILED_CHILDREN[cmd as usize]
+            .get_or_init(|| PD_CMD_FAILED.with_label_values(&[PD_CMD_LABELS[cmd as usize]]));
+    }
     LazyLock::force(&PD_REQUEST_TSO);
     LazyLock::force(&PD_REQUEST_TSO_FAILED);
 }
