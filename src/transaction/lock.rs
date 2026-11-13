@@ -167,33 +167,88 @@ impl ReadLocks {
     }
 }
 
-/// How long to sleep before retrying a read that met live locks, given what
-/// [`resolve_locks_for_read`] / [`resolve_locks_with_expiry`] found: client-go
-/// `bo.BackoffWithMaxSleepTxnLockFast(msBeforeExpired)` (txnsnapshot/snapshot.go:582, :927;
-/// TiDB store/copr/coprocessor.go:1843), called only when `msBeforeExpired > 0`. The next
-/// delay of `backoff`, capped at the time left until the first live lock expires. When that
-/// time is 0 the retry is immediate, as client-go; but every second such retry in a row
-/// (`zero_streak`) spends one attempt without sleeping, so a lock that keeps looking expired
-/// yet live (a stale low-resolution timestamp, R7) cannot retry forever (#3 review). `None`
-/// when the backoff is exhausted.
+/// The lock backoff of one read: how long to sleep before retrying after meeting live locks,
+/// given what [`resolve_locks_for_read`] / [`resolve_locks_with_expiry`] found. client-go
+/// calls `bo.BackoffWithMaxSleepTxnLockFast(msBeforeExpired)` when `msBeforeExpired > 0`
+/// (txnsnapshot/snapshot.go:582, :927; TiDB store/copr/coprocessor.go:1843): the next delay,
+/// capped at the time left until the first live lock expires, charged to a budget of total
+/// **sleep time** (config/retry/backoff.go).
 ///
-/// One difference: client-go's budget is total sleep time, so capped sleeps use up less of
-/// it; `Backoff` counts attempts, so each capped sleep still spends one.
-pub(crate) fn lock_backoff_sleep(
-    backoff: &mut Backoff,
-    ms_before_expired: i64,
-    zero_streak: &mut u32,
-) -> Option<Duration> {
-    if ms_before_expired <= 0 {
-        *zero_streak += 1;
-        if zero_streak.is_multiple_of(2) {
-            return backoff.next_delay_duration().map(|_| Duration::ZERO);
+/// `Backoff` counts attempts instead, so the budget is kept in time here: a capped sleep
+/// takes only part of the current step (the delay `Backoff` handed out), and an attempt is
+/// spent only once the sleeps add up to a whole step. Without this, a read whose time left
+/// stays short (the low-resolution timestamp, R7, changes only when refreshed) would burn one
+/// attempt per millisecond-long sleep and fail long before client-go gives up (#8 review).
+///
+/// No time left: the retry is immediate, as client-go. Two such retries in a row mean the
+/// low-resolution timestamp and TiKV disagree right at the lock's expiry; the second one
+/// therefore asks the caller to refresh the timestamp with a TSO first
+/// ([`LockWait::refresh_ts`]), spending no attempt: the read neither spins nor fails where
+/// client-go would not (#3 / #8 review).
+#[derive(Clone, Debug)]
+pub(crate) struct LockBackoff {
+    backoff: Backoff,
+    /// What is left of the current step, if one is open.
+    step_left: Option<Duration>,
+    zero_streak: u32,
+}
+
+impl LockBackoff {
+    // glue: lock backoff with a time budget
+    pub(crate) fn new(backoff: Backoff) -> LockBackoff {
+        LockBackoff {
+            backoff,
+            step_left: None,
+            zero_streak: 0,
         }
-        return Some(Duration::ZERO);
     }
-    *zero_streak = 0;
-    let cap = Duration::from_millis(ms_before_expired as u64);
-    backoff.next_delay_duration().map(|d| d.min(cap))
+
+    /// What to do before the next retry, or `None` when the budget is spent.
+    pub(crate) fn next_wait(&mut self, ms_before_expired: i64) -> Option<LockWait> {
+        if ms_before_expired <= 0 {
+            self.zero_streak += 1;
+            return Some(LockWait {
+                sleep: Duration::ZERO,
+                refresh_ts: self.zero_streak.is_multiple_of(2),
+            });
+        }
+        self.zero_streak = 0;
+        let left = match self.step_left {
+            Some(left) => left,
+            None => self.backoff.next_delay_duration()?,
+        };
+        let sleep = left.min(Duration::from_millis(ms_before_expired as u64));
+        let rest = left - sleep;
+        self.step_left = (!rest.is_zero()).then_some(rest);
+        Some(LockWait {
+            sleep,
+            refresh_ts: false,
+        })
+    }
+}
+
+/// See [`LockBackoff::next_wait`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LockWait {
+    /// Sleep this long before retrying (possibly zero).
+    pub sleep: Duration,
+    /// Fetch a TSO before retrying, which refreshes the low-resolution timestamp.
+    pub refresh_ts: bool,
+}
+
+impl LockWait {
+    /// Sleep, refresh the low-resolution timestamp if asked, and record the backoff metric.
+    // glue: the retry wait of a read that met live locks
+    pub(crate) async fn wait(self, pd_client: Arc<impl PdClient>) -> Result<()> {
+        if !self.sleep.is_zero() {
+            metrics::backoff(BackoffType::TikvLockFast, self.sleep);
+            sleep(self.sleep).await;
+        }
+        if self.refresh_ts {
+            pd_client.get_timestamp().await?;
+        }
+        Ok(())
+    }
 }
 
 /// The lock hints of a snapshot or of one coprocessor request: client-go's pair of
@@ -1851,35 +1906,32 @@ mod tests {
     /// R3: `BackoffWithMaxSleepTxnLockFast(msBeforeExpired)`: the delay is capped at the time
     /// left; with no time left the retry is immediate and spends no attempt.
     #[test]
-    fn lock_backoff_sleep_is_capped_by_expiry() {
-        let mut backoff = Backoff::no_jitter_backoff(100, 1000, 3);
-        let mut zero_streak = 0;
-        // No time left: an immediate retry that spends no attempt...
-        assert_eq!(
-            lock_backoff_sleep(&mut backoff, 0, &mut zero_streak),
-            Some(std::time::Duration::ZERO)
-        );
-        assert_eq!(backoff.current_attempts(), 0);
-        // ...but the second in a row spends one, still without sleeping (#3 review).
-        assert_eq!(
-            lock_backoff_sleep(&mut backoff, 0, &mut zero_streak),
-            Some(std::time::Duration::ZERO)
-        );
-        assert_eq!(backoff.current_attempts(), 1);
-        // Time left: the delay (200 ms), capped at it; the streak restarts.
-        assert_eq!(
-            lock_backoff_sleep(&mut backoff, 30, &mut zero_streak),
-            Some(std::time::Duration::from_millis(30))
-        );
-        assert_eq!(zero_streak, 0);
-        assert_eq!(
-            lock_backoff_sleep(&mut backoff, 10_000, &mut zero_streak),
-            Some(std::time::Duration::from_millis(400))
-        );
-        assert_eq!(
-            lock_backoff_sleep(&mut backoff, 10_000, &mut zero_streak),
-            None
-        );
+    fn lock_backoff_charges_sleep_time() {
+        let wait = |sleep_ms: u64, refresh_ts: bool| {
+            Some(LockWait {
+                sleep: std::time::Duration::from_millis(sleep_ms),
+                refresh_ts,
+            })
+        };
+        // Steps of 100, 200, 400 ms.
+        let mut lb = LockBackoff::new(Backoff::no_jitter_backoff(100, 1000, 3));
+        // No time left: immediate; the second in a row asks for a TSO refresh; nothing spent.
+        assert_eq!(lb.next_wait(0), wait(0, false));
+        assert_eq!(lb.next_wait(0), wait(0, true));
+        assert_eq!(lb.next_wait(0), wait(0, false));
+        assert_eq!(lb.backoff.current_attempts(), 0);
+        // 100 ms step, capped sleeps of 30 ms: 30, 30, 30, 10, then the 200 ms step.
+        for _ in 0..3 {
+            assert_eq!(lb.next_wait(30), wait(30, false));
+        }
+        assert_eq!(lb.next_wait(30), wait(10, false));
+        assert_eq!(lb.backoff.current_attempts(), 1);
+        assert_eq!(lb.next_wait(30), wait(30, false));
+        assert_eq!(lb.backoff.current_attempts(), 2);
+        // Uncapped: the rest of the 200 ms step, then the whole 400 ms one, then spent.
+        assert_eq!(lb.next_wait(10_000), wait(170, false));
+        assert_eq!(lb.next_wait(10_000), wait(400, false));
+        assert_eq!(lb.next_wait(10_000), None);
     }
 
     /// R5: lite resolution (client-go `resolveLock`, lock_resolver.go:1204-1271). A

@@ -1195,9 +1195,8 @@ async fn get_at_max_ts<PdC: PdClient>(
     retry_options: RetryOptions,
     hints: ReadLockHints,
 ) -> Result<Option<Value>> {
-    let mut lock_backoff = retry_options.lock_backoff;
+    let mut lock_backoff = crate::transaction::LockBackoff::new(retry_options.lock_backoff);
     let mut first_lock: Option<u64> = None;
-    let mut zero_streak = 0;
     loop {
         let mut request = new_get_request(key.clone(), Timestamp::from_version(u64::MAX));
         let ctx = request.context.get_or_insert_with(Default::default);
@@ -1238,13 +1237,9 @@ async fn get_at_max_ts<PdC: PdClient>(
         hints.record(u64::MAX, &outcome);
         if !outcome.live.is_empty() {
             // `bo.BackoffWithMaxSleepTxnLockFast(msBeforeExpired)` (snapshot.go:927).
-            match crate::transaction::lock_backoff_sleep(
-                &mut lock_backoff,
-                outcome.ms_before_expired,
-                &mut zero_streak,
-            ) {
+            match lock_backoff.next_wait(outcome.ms_before_expired) {
                 None => return Err(Error::ResolveLockError(outcome.live)),
-                Some(delay) => tokio::time::sleep(delay).await,
+                Some(wait) => wait.wait(rpc.clone()).await?,
             }
         }
     }
@@ -1939,6 +1934,7 @@ mod tests {
 
     use crate::mock::MockKvClient;
     use crate::mock::MockPdClient;
+    use crate::pd::PdClient;
     use crate::proto::kvrpcpb;
     use crate::proto::pdpb::Timestamp;
     use crate::request::Keyspace;
@@ -2201,6 +2197,127 @@ mod tests {
                 (vec![], vec![3]),
             ]
         );
+    }
+
+    /// A mock cluster for the low-resolution timestamp tests (R7, #8 review): one key whose
+    /// lock (transaction 7) TiKV rolls back once a CheckTxnStatus carries a `current_ts` at or
+    /// past `rollback_from` (physical ms), and whose Get is locked until then. The PD clock
+    /// is `tso(n)` for the n-th TSO fetch.
+    fn low_res_cluster(
+        lock_physical: i64,
+        lock_ttl: u64,
+        rollback_from: i64,
+        tso: impl Fn(usize) -> i64 + Send + Sync + 'static,
+    ) -> (Arc<MockPdClient>, Arc<AtomicUsize>) {
+        let rolled_back = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tso_fetches = Arc::new(AtomicUsize::new(0));
+        let fetches = tso_fetches.clone();
+        let lock = kvrpcpb::LockInfo {
+            key: b"k".to_vec(),
+            primary_lock: b"p".to_vec(),
+            lock_version: Timestamp {
+                physical: lock_physical,
+                ..Default::default()
+            }
+            .version(),
+            lock_ttl,
+            txn_size: 100,
+            ..Default::default()
+        };
+        let pd = MockPdClient::new(MockKvClient::with_dispatch_hook(move |req: &dyn Any| {
+            if req.is::<kvrpcpb::GetRequest>() {
+                let locked = !rolled_back.load(Ordering::SeqCst);
+                return Ok(Box::new(kvrpcpb::GetResponse {
+                    error: locked.then(|| kvrpcpb::KeyError {
+                        locked: Some(lock.clone()),
+                        ..Default::default()
+                    }),
+                    value: b"v".to_vec(),
+                    ..Default::default()
+                }) as Box<dyn Any>);
+            }
+            if let Some(req) = req.downcast_ref::<kvrpcpb::CheckTxnStatusRequest>() {
+                if Timestamp::from_version(req.current_ts).physical >= rollback_from {
+                    rolled_back.store(true, Ordering::SeqCst);
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        action: kvrpcpb::Action::TtlExpireRollback as i32,
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                    lock_ttl,
+                    lock_info: Some(lock.clone()),
+                    ..Default::default()
+                }) as Box<dyn Any>);
+            }
+            if req.is::<kvrpcpb::ResolveLockRequest>() {
+                return Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>);
+            }
+            panic!("unexpected request {:?}", req.type_id());
+        }))
+        .with_timestamp_hook(move || Timestamp {
+            physical: tso(fetches.fetch_add(1, Ordering::SeqCst)),
+            ..Default::default()
+        });
+        (Arc::new(pd), tso_fetches)
+    }
+
+    /// #8 review: the last TSO is 1 s old and the lock expires 1 ms after it, so every round
+    /// sees 1 ms left. The lock backoff (16 attempts) is charged in sleep time, so the read
+    /// keeps waiting until the low-resolution timestamp is refreshed (after 2 s) and the lock
+    /// is rolled back, as client-go does. Charging one attempt per capped sleep failed after
+    /// ~16 ms with `ResolveLockError`.
+    #[tokio::test(start_paused = true)]
+    async fn max_ts_get_survives_a_stale_low_resolution_ts() {
+        let start = tokio::time::Instant::now();
+        let (pd, _) = low_res_cluster(500, 501, 1001, move |_| {
+            1000 + start.elapsed().as_millis() as i64
+        });
+        // An earlier read fetched a TSO (physical 1000); 1 s passes.
+        pd.clone().get_timestamp().await.unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut txn = Transaction::new(
+            Timestamp::from_version(u64::MAX),
+            pd,
+            TransactionOptions::new_optimistic()
+                .read_only()
+                .retry_options(crate::RetryOptions::new(
+                    crate::Backoff::no_jitter_backoff(2, 500, 10),
+                    crate::Backoff::no_jitter_backoff(2, 500, 16),
+                )),
+            Keyspace::Disable,
+        );
+        assert_eq!(txn.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
+        // It waited for the refresh (the low-resolution timestamp's 2 s), not longer.
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_secs(2), "{waited:?}");
+        assert!(waited < Duration::from_secs(3), "{waited:?}");
+    }
+
+    /// #8 review: when the low-resolution timestamp says the lock has expired but TiKV (with
+    /// that timestamp) still reports it live, the retry is immediate; the second such retry
+    /// first refreshes the timestamp with a TSO, which lets TiKV roll the lock back. No
+    /// attempt is spent and the read succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn max_ts_get_refreshes_the_ts_when_stuck_at_expiry() {
+        // TSO fetches: 1000, 2000, ...; the lock expired at 999 by its TTL, but TiKV only
+        // rolls it back from 2000 on.
+        let (pd, tso_fetches) = low_res_cluster(500, 499, 2000, |n| 1000 + 1000 * n as i64);
+        pd.clone().get_timestamp().await.unwrap();
+        let mut txn = Transaction::new(
+            Timestamp::from_version(u64::MAX),
+            pd,
+            TransactionOptions::new_optimistic()
+                .read_only()
+                .retry_options(crate::RetryOptions::new(
+                    crate::Backoff::no_jitter_backoff(2, 500, 10),
+                    crate::Backoff::no_backoff(),
+                )),
+            Keyspace::Disable,
+        );
+        // With no lock backoff at all, only free (zero-time) retries can succeed.
+        assert_eq!(txn.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
+        assert_eq!(tso_fetches.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
