@@ -37,7 +37,9 @@ use crate::store::KvClient;
 use crate::store::RegionStore;
 use crate::store::{HasKeyErrors, Store};
 use crate::transaction::resolve_locks;
+use crate::transaction::resolve_locks_for_read;
 use crate::transaction::HasLocks;
+use crate::transaction::ReadLockHints;
 use crate::transaction::ResolveLocksContext;
 use crate::transaction::ResolveLocksOptions;
 use crate::util::iter::FlatMapOkIterExt;
@@ -62,6 +64,9 @@ pub trait Plan: Sized + Clone + Sync + Send + 'static {
 pub struct Dispatch<Req: KvRequest> {
     pub request: Req,
     pub kv_client: Option<Arc<dyn KvClient + Send + Sync>>,
+    /// The lock hints of the snapshot (or coprocessor request) this request belongs to: their
+    /// current contents are sent with every dispatch, retries included.
+    pub lock_hints: Option<ReadLockHints>,
 }
 
 #[async_trait]
@@ -70,11 +75,23 @@ impl<Req: KvRequest> Plan for Dispatch<Req> {
 
     async fn execute(&self) -> Result<Self::Result> {
         let stats = tikv_stats(self.request.label());
+        // client-go `ClientHelper.SendReqCtx`: `req.ResolvedLocks = resolvedLocks.GetAll()`,
+        // `req.CommittedLocks = committedLocks.GetAll()` on every send.
+        let hinted;
+        let request = match self.lock_hints.as_ref().and_then(ReadLockHints::get_all) {
+            Some((resolved, committed)) => {
+                let mut request = self.request.clone();
+                request.set_lock_hints(resolved, committed);
+                hinted = request;
+                &hinted
+            }
+            None => &self.request,
+        };
         let result = self
             .kv_client
             .as_ref()
             .expect("Unreachable: kv_client has not been initialised in Dispatch")
-            .dispatch(&self.request)
+            .dispatch(request)
             .await;
         let result = stats.done(result);
         result.map(|r| {
@@ -1262,6 +1279,10 @@ pub struct ResolveLock<P: Plan, PdC: PdClient> {
     pub pd_client: Arc<PdC>,
     pub backoff: Backoff,
     pub keyspace: Keyspace,
+    /// `Some` for a read (client-go `ForRead`, through `ClientHelper`): locks are resolved for
+    /// read and the transactions the read may ignore or read through are added here. The
+    /// inner `Dispatch` must carry the same hints, so the retry sends them.
+    pub read_hints: Option<ReadLockHints>,
 }
 
 impl<P: Plan, PdC: PdClient> Clone for ResolveLock<P, PdC> {
@@ -1272,6 +1293,7 @@ impl<P: Plan, PdC: PdClient> Clone for ResolveLock<P, PdC> {
             pd_client: self.pd_client.clone(),
             backoff: self.backoff.clone(),
             keyspace: self.keyspace,
+            read_hints: self.read_hints.clone(),
         }
     }
 }
@@ -1297,13 +1319,30 @@ where
             }
 
             let pd_client = self.pd_client.clone();
-            let live_locks = resolve_locks(
-                locks,
-                self.timestamp.clone(),
-                pd_client.clone(),
-                self.keyspace,
-            )
-            .await?;
+            let live_locks = match &self.read_hints {
+                // client-go `ClientHelper.ResolveLocksWithOpts` (txnsnapshot/client_helper.go):
+                // ForRead, then `resolvedLocks.Put(IgnoreLocks)` / `committedLocks.Put(AccessLocks)`.
+                Some(hints) => {
+                    let read = resolve_locks_for_read(
+                        locks,
+                        self.timestamp.clone(),
+                        pd_client.clone(),
+                        self.keyspace,
+                    )
+                    .await?;
+                    hints.record(&read);
+                    read.live
+                }
+                None => {
+                    resolve_locks(
+                        locks,
+                        self.timestamp.clone(),
+                        pd_client.clone(),
+                        self.keyspace,
+                    )
+                    .await?
+                }
+            };
             if live_locks.is_empty() {
                 result = self.inner.execute().await?;
             } else {
@@ -1752,6 +1791,7 @@ mod test {
                 backoff: Backoff::no_backoff(),
                 pd_client: Arc::new(MockPdClient::default()),
                 keyspace: Keyspace::Disable,
+                read_hints: None,
             },
             pd_client: Arc::new(MockPdClient::default()),
             backoff: Backoff::no_backoff(),

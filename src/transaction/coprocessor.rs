@@ -58,7 +58,8 @@ use crate::request::RetryOptions;
 use crate::stats::tikv_stats;
 use crate::store::Request;
 use crate::timestamp::TimestampExt;
-use crate::transaction::resolve_locks;
+use crate::transaction::resolve_locks_for_read;
+use crate::transaction::ReadLockHints;
 use crate::BoundRange;
 use crate::Error;
 use crate::Key;
@@ -317,6 +318,9 @@ struct CopContext<PdC: PdClient> {
     desc: bool,
     max_paging_size: u64,
     retry_options: RetryOptions,
+    /// The request's lock hints, shared by all its tasks and retries (TiDB
+    /// `copIterator.resolvedLocks` / `committedLocks`, store/copr/coprocessor.go:708).
+    lock_hints: ReadLockHints,
 }
 
 /// The RPC wrapper: carries the coprocessor-specific timeout.
@@ -380,6 +384,15 @@ impl Request for CoprocessorRpc {
             .get_or_insert(kvrpcpb::Context::default());
         ctx.api_version = api_version.into();
     }
+
+    fn set_lock_hints(&mut self, resolved: Vec<u64>, committed: Vec<u64>) {
+        let ctx = self
+            .inner
+            .context
+            .get_or_insert(kvrpcpb::Context::default());
+        ctx.resolved_locks = resolved;
+        ctx.committed_locks = committed;
+    }
 }
 
 /// Send a coprocessor request at `timestamp` and stream back the responses.
@@ -438,6 +451,7 @@ pub(crate) async fn send_coprocessor_request<PdC: PdClient>(
         desc: req.desc,
         max_paging_size,
         retry_options: req.retry_options.unwrap_or(default_retry_options),
+        lock_hints: ReadLockHints::default(),
     });
 
     let task_count = tasks.len();
@@ -576,6 +590,11 @@ async fn handle_task_once<PdC: PdClient>(
     rpc.inner.ranges = task.ranges.clone();
     rpc.inner.paging_size = task.paging_size;
     rpc.set_leader(&region_store.region_with_leader)?;
+    // TiDB's copIterator sends through `ClientHelper.SendReqCtx` (store/copr/coprocessor.go:924),
+    // which attaches the request's lock hints to every RPC.
+    if let Some((resolved, committed)) = ctx.lock_hints.get_all() {
+        rpc.set_lock_hints(resolved, committed);
+    }
 
     let stats = tikv_stats(rpc.label());
     // Downcast right away: `Box<dyn Any>` is not `Send` and must not live across an await.
@@ -642,13 +661,17 @@ async fn handle_task_once<PdC: PdClient>(
             task.region.ver_id(),
             lock.lock_version
         );
-        let live_locks = resolve_locks(
+        // TiDB `copIteratorWorker.handleLockErr` (store/copr/coprocessor.go:1832): ForRead
+        // through the request's `ClientHelper`.
+        let read = resolve_locks_for_read(
             vec![lock],
             ctx.timestamp.clone(),
             ctx.pd_client.clone(),
             ctx.keyspace,
         )
         .await?;
+        ctx.lock_hints.record(&read);
+        let live_locks = read.live;
         if !live_locks.is_empty() {
             match lock_backoff.next_delay_duration() {
                 Some(delay) => {
@@ -1352,6 +1375,71 @@ mod tests {
         );
         assert_eq!(cop_attempts.load(Ordering::SeqCst), 3);
         assert!(resolved.lock().unwrap().is_empty());
+    }
+
+    /// R1 (#101): the transaction found through a lock is put into the request's lock hints
+    /// (here `canIgnore`: committed at 8, after the read's timestamp 0) and every later RPC of
+    /// the same coprocessor request sends them; a new coprocessor request starts with none
+    /// (TiDB keeps the sets on its `copIterator`).
+    #[tokio::test]
+    async fn test_lock_hints_sent_on_retry_and_per_request() {
+        let contexts = Arc::new(Mutex::new(Vec::<(Vec<u64>, Vec<u64>)>::new()));
+        let contexts_captured = contexts.clone();
+        let resolved = Arc::new(Mutex::new(Vec::new()));
+        let resolved_captured = resolved.clone();
+        let pd = Arc::new(mock_pd(move |req: &dyn Any| {
+            if let Some(req) = req.downcast_ref::<coprocessor::Request>() {
+                let ctx = req.context.as_ref().unwrap();
+                contexts_captured
+                    .lock()
+                    .unwrap()
+                    .push((ctx.resolved_locks.clone(), ctx.committed_locks.clone()));
+                if resolved_captured.lock().unwrap().is_empty() {
+                    return Ok(Box::new(coprocessor::Response {
+                        locked: Some(lock_info()),
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                echo(req)
+            } else if req.is::<kvrpcpb::CheckTxnStatusRequest>() {
+                Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                    commit_version: COMMIT_TS,
+                    ..Default::default()
+                }))
+            } else if let Some(req) = req.downcast_ref::<kvrpcpb::ResolveLockRequest>() {
+                resolved_captured
+                    .lock()
+                    .unwrap()
+                    .push((req.start_version, req.commit_version));
+                Ok(Box::new(kvrpcpb::ResolveLockResponse::default()))
+            } else {
+                panic!("unexpected request");
+            }
+        }));
+        for _ in 0..2 {
+            let responses: Vec<CopResponse> = send_coprocessor_request(
+                pd.clone(),
+                Keyspace::Disable,
+                Timestamp::default(),
+                RetryOptions::default_optimistic(),
+                request(vec![range(&[1], &[3])]),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+            assert_eq!(datas(&responses), vec!["1|[1]-[3]"]);
+        }
+        assert_eq!(
+            *contexts.lock().unwrap(),
+            vec![
+                (vec![], vec![]),
+                (vec![LOCK_TS], vec![]),
+                // The second coprocessor request has its own, empty hints.
+                (vec![], vec![]),
+            ]
+        );
     }
 
     /// Simulates TiKV paging over one row per key byte: a page returns at most `paging_size`

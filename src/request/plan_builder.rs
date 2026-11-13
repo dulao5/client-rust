@@ -27,6 +27,7 @@ use crate::store::HasRegionError;
 use crate::store::HasRegionErrors;
 use crate::store::RegionStore;
 use crate::transaction::HasLocks;
+use crate::transaction::ReadLockHints;
 use crate::transaction::ResolveLocksContext;
 use crate::transaction::ResolveLocksOptions;
 use crate::Result;
@@ -55,9 +56,18 @@ impl<PdC: PdClient, Req: KvRequest> PlanBuilder<PdC, Dispatch<Req>, NoTarget> {
             plan: Dispatch {
                 request,
                 kv_client: None,
+                lock_hints: None,
             },
             phantom: PhantomData,
         }
+    }
+
+    /// Send the current contents of `hints` with every dispatch of this request, retries
+    /// included (client-go `ClientHelper.SendReqCtx`). Pair it with
+    /// [`resolve_lock_for_read`](PlanBuilder::resolve_lock_for_read) on the same hints.
+    pub fn read_lock_hints(mut self, hints: ReadLockHints) -> Self {
+        self.plan.lock_hints = Some(hints);
+        self
     }
 }
 
@@ -88,9 +98,29 @@ impl<PdC: PdClient, P: Plan, Ph: PlanBuilderPhase> PlanBuilder<PdC, P, Ph> {
                 backoff,
                 pd_client: self.pd_client,
                 keyspace,
+                read_hints: None,
             },
             phantom: PhantomData,
         }
+    }
+
+    /// [`resolve_lock`](PlanBuilder::resolve_lock) for a read (client-go `ForRead`): the
+    /// transactions whose locks the read may ignore or read through are added to `hints`,
+    /// which the request (built with [`read_lock_hints`](PlanBuilder::read_lock_hints) on the
+    /// same hints) sends on its retry.
+    pub fn resolve_lock_for_read(
+        self,
+        timestamp: Timestamp,
+        backoff: Backoff,
+        keyspace: Keyspace,
+        hints: ReadLockHints,
+    ) -> PlanBuilder<PdC, ResolveLock<P, PdC>, Ph>
+    where
+        P::Result: HasLocks,
+    {
+        let mut builder = self.resolve_lock(timestamp, backoff, keyspace);
+        builder.plan.read_hints = Some(hints);
+        builder
     }
 
     pub fn cleanup_locks(
