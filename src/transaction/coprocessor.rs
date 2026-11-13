@@ -47,9 +47,12 @@ use crate::proto::kvrpcpb;
 use crate::proto::pdpb::Timestamp;
 use crate::proto::tikvpb::tikv_client::TikvClient;
 use crate::region::RegionWithLeader;
+use crate::request::plan::check_store_liveness;
 use crate::request::plan::grpc_error_action;
 use crate::request::plan::handle_region_error;
 use crate::request::plan::is_grpc_error;
+use crate::request::plan::liveness_target;
+use crate::request::plan::not_leader_hint_is_unreachable;
 use crate::request::plan::GrpcErrorAction;
 use crate::request::EncodeKeyspace;
 use crate::request::KeyMode;
@@ -596,16 +599,34 @@ async fn handle_task_once<PdC: PdClient>(
     region_backoff: &mut Backoff,
     lock_backoff: &mut LockBackoff,
 ) -> Result<TaskOutcome> {
-    let region_store = match ctx
-        .pd_client
+    // Store liveness: a cached leader on a store known to be unreachable is not tried; the
+    // task goes to another voter instead (see `liveness_target`).
+    let Some(target) = liveness_target(&*ctx.pd_client, &task.region) else {
+        debug!(
+            "coprocessor: every peer of region {:?} is on an unreachable store",
+            task.region.ver_id()
+        );
+        ctx.pd_client
+            .invalidate_region_cache(task.region.ver_id())
+            .await;
+        let error = Error::LeaderNotFound {
+            region: task.region.ver_id(),
+        };
+        return retry_after_backoff(ctx, task, region_backoff, error).await;
+    };
+    let target_store_id = target.get_store_id().ok();
+    let fallback_peer = target
+        .leader
         .clone()
-        .map_region_to_store(task.region.clone())
-        .await
-    {
+        .filter(|_| target.leader != task.region.leader);
+    let region_store = match ctx.pd_client.clone().map_region_to_store(target).await {
         Ok(region_store) => region_store,
         Err(e) => {
             debug!("coprocessor: failed to map region to store: {:?}", e);
-            if let Ok(store_id) = task.region.get_store_id() {
+            if let Some(store_id) = target_store_id {
+                if is_grpc_error(&e) {
+                    check_store_liveness(&ctx.pd_client, store_id).await;
+                }
                 ctx.pd_client.invalidate_store_cache(store_id).await;
             }
             ctx.pd_client
@@ -653,7 +674,10 @@ async fn handle_task_once<PdC: PdClient>(
             );
             match grpc_error_action(&e) {
                 GrpcErrorAction::TryNextPeerAndInvalidate => {
-                    if let Ok(store_id) = task.region.get_store_id() {
+                    if let Some(store_id) = target_store_id {
+                        // client-go `onSendFail` → `replicaSelector.onSendFailure` →
+                        // `checkLiveness` (internal/locate/replica_selector.go:609-625).
+                        check_store_liveness(&ctx.pd_client, store_id).await;
                         ctx.pd_client.invalidate_store_cache(store_id).await;
                     }
                     ctx.pd_client
@@ -702,13 +726,29 @@ async fn handle_task_once<PdC: PdClient>(
             );
             return Err(region_backoff.exhausted(Error::RegionError(Box::new(region_error))));
         };
+        let hint_unreachable = not_leader_hint_is_unreachable(&*ctx.pd_client, &region_error);
         let resolved =
             handle_region_error(ctx.pd_client.clone(), region_error, region_store).await?;
-        if !resolved {
+        if !resolved || hint_unreachable {
             metrics::backoff(backoff_type, delay);
             sleep(delay).await;
         }
         return resplit(ctx, task).await;
+    }
+
+    if let Some(peer) = fallback_peer {
+        // The peer took a leader request: it is the leader now (client-go `onSendSuccess` →
+        // `switchWorkLeaderToPeer`, internal/locate/replica_selector.go:636-638).
+        if let Err(e) = ctx
+            .pd_client
+            .update_leader(task.region.ver_id(), peer)
+            .await
+        {
+            debug!(
+                "coprocessor: failed to update leader after fallback: {:?}",
+                e
+            );
+        }
     }
 
     if let Some(lock) = resp.locked.take() {
@@ -922,10 +962,13 @@ mod tests {
     use futures::TryStreamExt;
 
     use super::*;
+    use crate::mock::DeadLeaderFixture;
     use crate::mock::MockKvClient;
     use crate::mock::MockPdClient;
     use crate::proto::errorpb;
     use crate::proto::metapb;
+    use crate::region::StoreId;
+    use crate::store::Liveness;
 
     type Hook = dyn Fn(&dyn Any) -> Result<Box<dyn Any>> + Send + Sync + 'static;
 
@@ -1366,6 +1409,167 @@ mod tests {
         }));
         let err = run(pd, request(vec![range(&[1], &[3])])).await.unwrap_err();
         assert!(matches!(err, Error::GrpcAPI(_)), "{err:?}");
+    }
+
+    /// The store a coprocessor request was sent to.
+    fn target_store(req: &coprocessor::Request) -> StoreId {
+        req.context
+            .as_ref()
+            .and_then(|ctx| ctx.peer.as_ref())
+            .expect("target peer")
+            .store_id
+    }
+
+    fn not_leader(hint: Option<(u64, StoreId)>) -> Result<Box<dyn Any>> {
+        region_error(errorpb::Error {
+            not_leader: Some(errorpb::NotLeader {
+                region_id: 1,
+                leader: hint.map(|(id, store_id)| metapb::Peer {
+                    id,
+                    store_id,
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        })
+    }
+
+    async fn run_shared(pd: &Arc<MockPdClient>, retry: RetryOptions) -> Result<Vec<CopResponse>> {
+        send_coprocessor_request(
+            pd.clone(),
+            Keyspace::Disable,
+            Timestamp::default(),
+            retry,
+            request(vec![range(&[1], &[3])]),
+        )
+        .await?
+        .try_collect()
+        .await
+    }
+
+    fn fast_retry() -> RetryOptions {
+        RetryOptions::new(Backoff::no_jitter_backoff(1, 1, 10), Backoff::no_backoff())
+    }
+
+    /// client-go store liveness on the coprocessor path: a task to a dead leader store fails
+    /// once, the store is found unreachable, and later tasks go to another voter
+    /// (`isLeaderCandidate`) instead of each rediscovering the dead store; once the
+    /// health-check loop sees the store back, tasks return to it.
+    #[tokio::test(start_paused = true)]
+    async fn test_dead_leader_is_tried_once_then_skipped_until_reachable() {
+        let fixture = DeadLeaderFixture::new();
+        let accesses = Arc::new(Mutex::new(Vec::new()));
+        let accesses_c = accesses.clone();
+        let down = fixture.down.clone();
+        let client = MockKvClient::with_dispatch_hook(cop_hook(move |req| {
+            let store_id = target_store(req);
+            accesses_c.lock().unwrap().push(store_id);
+            match store_id {
+                41 if down.load(Ordering::SeqCst) => Err(Error::GrpcAPI(
+                    tonic::Status::unavailable("connection refused"),
+                )),
+                // A follower that knows the new leader.
+                44 => not_leader(Some((3, 45))),
+                _ => echo(req),
+            }
+        }));
+        let pd = Arc::new(fixture.pd_client(client));
+        let liveness = pd.store_liveness().unwrap();
+        let take = || std::mem::take(&mut *accesses.lock().unwrap());
+
+        let responses = run_shared(&pd, fast_retry()).await.unwrap();
+        assert_eq!(datas(&responses), vec!["1|[1]-[3]"]);
+        assert_eq!(take(), [41, 44, 45]);
+        assert_eq!(fixture.probes.load(Ordering::SeqCst), 1);
+        assert_eq!(liveness.get(41), Liveness::Unreachable);
+
+        // PD keeps reporting the dead store as the leader: while it is unreachable it is not
+        // tried, and no request probes it again.
+        for _ in 0..3 {
+            fixture.reload_from_pd();
+            let responses = run_shared(&pd, fast_retry()).await.unwrap();
+            assert_eq!(datas(&responses), vec!["1|[1]-[3]"]);
+            assert_eq!(take(), [44, 45]);
+        }
+        assert_eq!(fixture.probes.load(Ordering::SeqCst), 1);
+
+        // The loop probes once a second while it stays down.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(fixture.probes.load(Ordering::SeqCst), 2);
+        assert_eq!(liveness.get(41), Liveness::Unreachable);
+
+        // It comes back: the next tick flips it to reachable and tasks return to it.
+        fixture.down.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(liveness.get(41), Liveness::Reachable);
+        fixture.reload_from_pd();
+        let responses = run_shared(&pd, fast_retry()).await.unwrap();
+        assert_eq!(datas(&responses), vec!["1|[1]-[3]"]);
+        assert_eq!(take(), [41]);
+    }
+
+    /// A voter that accepts the leader request sent to it in place of the unreachable leader
+    /// becomes the cached leader (client-go `onSendSuccess` → `switchWorkLeaderToPeer`).
+    #[tokio::test(start_paused = true)]
+    async fn test_peer_accepting_in_place_of_unreachable_leader_becomes_leader() {
+        let fixture = DeadLeaderFixture::new();
+        let accesses = Arc::new(Mutex::new(Vec::new()));
+        let accesses_c = accesses.clone();
+        let client = MockKvClient::with_dispatch_hook(cop_hook(move |req| {
+            accesses_c.lock().unwrap().push(target_store(req));
+            echo(req)
+        }));
+        let pd = Arc::new(fixture.pd_client(client));
+        let liveness = pd.store_liveness().unwrap();
+        assert_eq!(liveness.check(41).await, Liveness::Unreachable);
+
+        let responses = run_shared(&pd, fast_retry()).await.unwrap();
+        assert_eq!(datas(&responses), vec!["1|[1]-[3]"]);
+        assert_eq!(*accesses.lock().unwrap(), [44]);
+        assert_eq!(*fixture.leader_updates.lock().unwrap(), [44]);
+    }
+
+    /// A follower of a hibernated region can still name the dead leader. Its hint is taken,
+    /// but the task backs off before the next attempt instead of bouncing between the dead
+    /// leader's hint and the follower without a pause.
+    #[tokio::test(start_paused = true)]
+    async fn test_not_leader_hint_to_unreachable_store_backs_off() {
+        let fixture = DeadLeaderFixture::new();
+        let accesses = Arc::new(Mutex::new(Vec::new()));
+        let accesses_c = accesses.clone();
+        let stale_hints = Arc::new(AtomicUsize::new(2));
+        let client = MockKvClient::with_dispatch_hook(cop_hook(move |req| {
+            let store_id = target_store(req);
+            accesses_c.lock().unwrap().push(store_id);
+            assert_ne!(store_id, 41, "the unreachable leader is not tried");
+            if stale_hints
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return not_leader(Some((1, 41)));
+            }
+            echo(req)
+        }));
+        let pd = Arc::new(fixture.pd_client(client));
+        assert_eq!(
+            pd.store_liveness().unwrap().check(41).await,
+            Liveness::Unreachable
+        );
+
+        let start = tokio::time::Instant::now();
+        let retry = RetryOptions::new(
+            Backoff::no_jitter_backoff(100, 100, 10),
+            Backoff::no_backoff(),
+        );
+        let responses = run_shared(&pd, retry).await.unwrap();
+        assert_eq!(datas(&responses), vec!["1|[1]-[3]"]);
+        assert_eq!(*accesses.lock().unwrap(), [44, 44, 44]);
+        assert_eq!(*fixture.leader_updates.lock().unwrap(), [41, 41, 44]);
+        assert!(
+            start.elapsed() >= Duration::from_millis(200),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]

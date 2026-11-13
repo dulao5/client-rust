@@ -17,8 +17,13 @@ use crate::pd::PdClient;
 use crate::pd::PdRpcClient;
 use crate::proto::pdpb::Timestamp;
 use crate::region::RegionWithLeader;
+use crate::request::plan::check_store_liveness;
+use crate::request::plan::grpc_error_action;
 use crate::request::plan::handle_region_error;
 use crate::request::plan::is_grpc_error;
+use crate::request::plan::liveness_target;
+use crate::request::plan::not_leader_hint_is_unreachable;
+use crate::request::plan::GrpcErrorAction;
 use crate::request::EncodeKeyspace;
 use crate::request::KeyMode;
 use crate::request::Keyspace;
@@ -362,15 +367,30 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
                     (span, region_end)
                 };
 
+            // Store liveness: a cached leader on a store known to be unreachable is not
+            // tried; the page goes to another voter instead (see `liveness_target`).
+            let Some(target) = liveness_target(&*self.pd_client, &region) else {
+                let error = Error::LeaderNotFound {
+                    region: region.ver_id(),
+                };
+                self.retry_region_client_error(&region, &mut region_backoff, error)
+                    .await?;
+                continue;
+            };
+            let fallback_peer = target
+                .leader
+                .clone()
+                .filter(|_| target.leader != region.leader);
+
             let region_store = match self
                 .pd_client
                 .clone()
-                .map_region_to_store(region.clone())
+                .map_region_to_store(target.clone())
                 .await
             {
                 Ok(store) => store,
                 Err(error) => {
-                    self.retry_region_client_error(&region, &mut region_backoff, error)
+                    self.retry_region_client_error(&target, &mut region_backoff, error)
                         .await?;
                     continue;
                 }
@@ -396,7 +416,7 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
                     .lock_region_backoff(retry_options.region_backoff.clone())
                     .plan(),
                 Err(error) => {
-                    self.retry_region_client_error(&region, &mut region_backoff, error)
+                    self.retry_region_client_error(&target, &mut region_backoff, error)
                         .await?;
                     continue;
                 }
@@ -405,7 +425,7 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
             let mut response = match plan.execute().await {
                 Ok(response) => response,
                 Err(error) if is_grpc_error(&error) => {
-                    self.retry_region_client_error(&region, &mut region_backoff, error)
+                    self.retry_region_client_error(&target, &mut region_backoff, error)
                         .await?;
                     continue;
                 }
@@ -419,13 +439,26 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
                         region_backoff.exhausted(Error::RegionError(Box::new(region_error)))
                     );
                 };
+                let hint_unreachable =
+                    not_leader_hint_is_unreachable(&*self.pd_client, &region_error);
                 let retry_immediately =
                     handle_region_error(self.pd_client.clone(), region_error, region_store).await?;
-                if !retry_immediately {
+                if !retry_immediately || hint_unreachable {
                     metrics::backoff(backoff_type, delay);
                     sleep(delay).await;
                 }
                 continue;
+            }
+            if let Some(peer) = fallback_peer {
+                // The peer took a leader request: it is the leader now (client-go
+                // `onSendSuccess` → `switchWorkLeaderToPeer`,
+                // internal/locate/replica_selector.go:636-638).
+                if let Err(error) = self.pd_client.update_leader(region.ver_id(), peer).await {
+                    debug!(
+                        "scanner: failed to update leader after fallback: {:?}",
+                        error
+                    );
+                }
             }
             if let Some(errors) = response.key_errors() {
                 return Err(Error::MultipleKeyErrors(errors));
@@ -457,7 +490,11 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
     }
 
     /// Invalidate the failed location and apply the transaction's region
-    /// backoff before locating the current start key again.
+    /// backoff before locating the current start key again. `region`'s leader
+    /// is the peer the request was sent to; after a connection-level failure
+    /// its store's liveness is checked (client-go `onSendFail` →
+    /// `replicaSelector.onSendFailure` → `checkLiveness`,
+    /// internal/locate/replica_selector.go:609-625).
     async fn retry_region_client_error(
         &self,
         region: &RegionWithLeader,
@@ -469,6 +506,12 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
             .await;
         if is_grpc_error(&error) {
             if let Ok(store_id) = region.get_store_id() {
+                if matches!(
+                    grpc_error_action(&error),
+                    GrpcErrorAction::TryNextPeerAndInvalidate
+                ) {
+                    check_store_liveness(&self.pd_client, store_id).await;
+                }
                 self.pd_client.invalidate_store_cache(store_id).await;
             }
         }
@@ -519,6 +562,9 @@ mod tests {
 
     use super::super::Transaction;
     use super::super::TransactionOptions;
+    use std::time::Duration;
+
+    use crate::mock::DeadLeaderFixture;
     use crate::mock::MockKvClient;
     use crate::mock::MockPdClient;
     use crate::pd::PdClient;
@@ -533,6 +579,7 @@ mod tests {
     use crate::request::EncodeKeyspace;
     use crate::request::KeyMode;
     use crate::request::Keyspace;
+    use crate::store::Liveness;
     use crate::store::RegionStore;
     use crate::store::Store;
     use crate::Key;
@@ -1111,5 +1158,166 @@ mod tests {
         assert_eq!(get_calls.load(Ordering::SeqCst), 1);
 
         txn.rollback().await.unwrap();
+    }
+
+    /// The store a scan request was sent to.
+    fn scan_target_store(req: &dyn Any) -> crate::region::StoreId {
+        req.downcast_ref::<kvrpcpb::ScanRequest>()
+            .expect("only scan requests are expected")
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.peer.as_ref())
+            .expect("target peer")
+            .store_id
+    }
+
+    fn scan_not_leader(hint_store_id: u64, hint_peer_id: u64) -> kvrpcpb::ScanResponse {
+        kvrpcpb::ScanResponse {
+            region_error: Some(errorpb::Error {
+                not_leader: Some(errorpb::NotLeader {
+                    region_id: 1,
+                    leader: Some(metapb::Peer {
+                        id: hint_peer_id,
+                        store_id: hint_store_id,
+                        ..Default::default()
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn scan_data() -> BTreeMap<Vec<u8>, Vec<u8>> {
+        (0..3u32)
+            .map(|i| {
+                (
+                    format!("k{i:04}").into_bytes(),
+                    format!("v{i}").into_bytes(),
+                )
+            })
+            .collect()
+    }
+
+    async fn scan_all(
+        pd_client: &Arc<MockPdClient>,
+        region_backoff: crate::Backoff,
+    ) -> crate::Result<Vec<KvPair>> {
+        let mut txn = Transaction::new(
+            Timestamp::default(),
+            pd_client.clone(),
+            TransactionOptions::new_optimistic()
+                .read_only()
+                .retry_options(crate::RetryOptions::new(
+                    region_backoff,
+                    crate::Backoff::no_backoff(),
+                )),
+            Keyspace::Disable,
+        );
+        let mut scanner = txn.scanner("k0000".to_owned()..="k9999".to_owned()).await?;
+        let mut pairs = Vec::new();
+        while let Some(pair) = scanner.next().await? {
+            pairs.push(pair);
+        }
+        Ok(pairs)
+    }
+
+    /// client-go store liveness on the scanner path: a page sent to a dead leader store fails
+    /// once, the store is found unreachable, and later pages go to another voter
+    /// (`isLeaderCandidate`) instead of each rediscovering the dead store; once the
+    /// health-check loop sees the store back, pages return to it.
+    #[tokio::test(start_paused = true)]
+    async fn scanner_skips_unreachable_leader_until_reachable() {
+        let fixture = DeadLeaderFixture::new();
+        let data = scan_data();
+        let expected: Vec<KvPair> = data
+            .iter()
+            .map(|(key, value)| KvPair::new(key.clone(), value.clone()))
+            .collect();
+        let accesses = Arc::new(Mutex::new(Vec::new()));
+        let accesses_c = accesses.clone();
+        let down = fixture.down.clone();
+        let client = MockKvClient::with_dispatch_hook(move |req: &dyn Any| {
+            let store_id = scan_target_store(req);
+            accesses_c.lock().unwrap().push(store_id);
+            match store_id {
+                41 if down.load(Ordering::SeqCst) => Err(crate::Error::GrpcAPI(
+                    tonic::Status::unavailable("connection refused"),
+                )),
+                // A follower that knows the new leader.
+                44 => Ok(Box::new(scan_not_leader(45, 3)) as Box<dyn Any>),
+                _ => {
+                    let scan = req.downcast_ref::<kvrpcpb::ScanRequest>().unwrap();
+                    Ok(Box::new(mock_scan_response(&data, scan)) as Box<dyn Any>)
+                }
+            }
+        });
+        let pd_client = Arc::new(fixture.pd_client(client));
+        let liveness = pd_client.store_liveness().unwrap();
+        let fast = || crate::Backoff::no_jitter_backoff(1, 1, 10);
+        let take = || std::mem::take(&mut *accesses.lock().unwrap());
+
+        assert_eq!(scan_all(&pd_client, fast()).await.unwrap(), expected);
+        assert_eq!(take(), [41, 44, 45]);
+        assert_eq!(fixture.probes.load(Ordering::SeqCst), 1);
+        assert_eq!(liveness.get(41), Liveness::Unreachable);
+
+        // PD keeps reporting the dead store as the leader: while it is unreachable it is not
+        // tried, and no scan probes it again.
+        for _ in 0..3 {
+            fixture.reload_from_pd();
+            assert_eq!(scan_all(&pd_client, fast()).await.unwrap(), expected);
+            assert_eq!(take(), [44, 45]);
+        }
+        assert_eq!(fixture.probes.load(Ordering::SeqCst), 1);
+
+        fixture.down.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(liveness.get(41), Liveness::Reachable);
+        fixture.reload_from_pd();
+        assert_eq!(scan_all(&pd_client, fast()).await.unwrap(), expected);
+        assert_eq!(take(), [41]);
+    }
+
+    /// A voter answering in place of the unreachable leader becomes the cached leader; a
+    /// NotLeader hint naming the unreachable store backs off before the next attempt.
+    #[tokio::test(start_paused = true)]
+    async fn scanner_backs_off_on_hint_to_unreachable_leader() {
+        let fixture = DeadLeaderFixture::new();
+        let data = scan_data();
+        let accesses = Arc::new(Mutex::new(Vec::new()));
+        let accesses_c = accesses.clone();
+        let stale_hints = Arc::new(AtomicUsize::new(2));
+        let client = MockKvClient::with_dispatch_hook(move |req: &dyn Any| {
+            let store_id = scan_target_store(req);
+            accesses_c.lock().unwrap().push(store_id);
+            assert_ne!(store_id, 41, "the unreachable leader is not tried");
+            if stale_hints
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Ok(Box::new(scan_not_leader(41, 1)) as Box<dyn Any>);
+            }
+            let scan = req.downcast_ref::<kvrpcpb::ScanRequest>().unwrap();
+            Ok(Box::new(mock_scan_response(&data, scan)) as Box<dyn Any>)
+        });
+        let pd_client = Arc::new(fixture.pd_client(client));
+        assert_eq!(
+            pd_client.store_liveness().unwrap().check(41).await,
+            Liveness::Unreachable
+        );
+
+        let start = tokio::time::Instant::now();
+        let pairs = scan_all(&pd_client, crate::Backoff::no_jitter_backoff(100, 100, 10))
+            .await
+            .unwrap();
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(*accesses.lock().unwrap(), [44, 44, 44]);
+        assert_eq!(*fixture.leader_updates.lock().unwrap(), [41, 41, 44]);
+        assert!(
+            start.elapsed() >= Duration::from_millis(200),
+            "{:?}",
+            start.elapsed()
+        );
     }
 }

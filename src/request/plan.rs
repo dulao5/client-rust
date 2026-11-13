@@ -514,13 +514,71 @@ fn region_request_candidates(
 /// `replicaSelector.onSendFailure` → `checkLiveness`, internal/locate/region_request.go:1663,
 /// replica_selector.go:616): an unreachable store is skipped by later rounds until its
 /// health-check loop sees it back.
-async fn check_store_liveness<PdC: PdClient>(pd_client: &Arc<PdC>, store_id: StoreId) {
+pub(crate) async fn check_store_liveness<PdC: PdClient>(pd_client: &Arc<PdC>, store_id: StoreId) {
     if let Some(store_liveness) = pd_client.store_liveness() {
         let liveness = store_liveness.check(store_id).await;
         debug!(
             "store {} liveness after a send failure: {:?}",
             store_id, liveness
         );
+    }
+}
+
+/// The target of a single-target leader read (a coprocessor task, a scanner page), which has
+/// one target per attempt instead of `RetryableMultiRegion`'s round over the peers.
+///
+/// With the cached leader's store reachable (or liveness not tracked, or no leader cached),
+/// `region` itself. Otherwise the first of [`region_request_candidates`]: a voter on a store
+/// not known to be unreachable, as the leader of the returned region, so the request is sent
+/// to it as a normal leader request — client-go `nextForReplicaReadLeader` falls back from a
+/// non-candidate leader (`isLeaderCandidate`) to `ReplicaSelectMixedStrategy`
+/// (internal/locate/replica_selector.go:128-165), which sends a leader read to a follower to
+/// wake the Raft group or reach the new leader. `None`: every peer is on an unreachable store
+/// (client-go's selector is exhausted and invalidates the region, :295-302).
+pub(crate) fn liveness_target<PdC: PdClient>(
+    pd_client: &PdC,
+    region: &RegionWithLeader,
+) -> Option<RegionWithLeader> {
+    let (Some(store_liveness), Some(leader)) = (pd_client.store_liveness(), &region.leader) else {
+        return Some(region.clone());
+    };
+    if store_liveness.get(leader.store_id) == Liveness::Reachable {
+        return Some(region.clone());
+    }
+    let peer = region_request_candidates(region, false, |store_id| store_liveness.get(store_id))
+        .first()
+        .map(|peer| (*peer).clone())?;
+    debug!(
+        "region {:?}: leader store {} is not reachable, sending to store {}",
+        region.ver_id(),
+        leader.store_id,
+        peer.store_id
+    );
+    let mut target = region.clone();
+    target.leader = Some(peer);
+    Some(target)
+}
+
+/// Whether `error` is a NotLeader whose leader hint names a store known to be unreachable.
+///
+/// A follower of a hibernated Region can still name the dead leader. client-go updates the
+/// leader and retries at once (`onNotLeader`, internal/locate/replica_selector.go:474), and its
+/// per-request selector then skips that leader and every replica already tried. The
+/// single-target paths keep no such state, so they back off instead of retrying at once,
+/// which would loop between the dead leader's hint and the same follower.
+pub(crate) fn not_leader_hint_is_unreachable<PdC: PdClient>(
+    pd_client: &PdC,
+    error: &errorpb::Error,
+) -> bool {
+    let hint = error
+        .not_leader
+        .as_ref()
+        .and_then(|not_leader| not_leader.leader.as_ref());
+    match (pd_client.store_liveness(), hint) {
+        (Some(store_liveness), Some(leader)) => {
+            store_liveness.get(leader.store_id) == Liveness::Unreachable
+        }
+        _ => false,
     }
 }
 
@@ -2641,5 +2699,70 @@ mod test {
             }
             other => panic!("want MultipleRegionErrors, got {other:?}"),
         }
+    }
+
+    /// `liveness_target` picks the leader while its store is reachable, the first voter on a
+    /// store not known to be unreachable otherwise (an unknown leader comes after the
+    /// voters), and nothing when every store is unreachable.
+    #[tokio::test(start_paused = true)]
+    async fn test_liveness_target() {
+        use crate::mock::MockKvClient;
+        use crate::store::StoreLiveness;
+
+        let states = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let probe_states = states.clone();
+        let store_liveness = StoreLiveness::new(Arc::new(move |store_id| {
+            let state = probe_states
+                .lock()
+                .unwrap()
+                .get(&store_id)
+                .copied()
+                .unwrap_or(Liveness::Reachable);
+            future::ready(Some(state)).boxed()
+        }));
+        let pd = MockPdClient::new(MockKvClient::default()).with_store_liveness(store_liveness);
+        let liveness = pd.store_liveness().unwrap();
+        let mut region = RegionWithLeader::default();
+        region.region.region_epoch = Some(Default::default());
+        region.region.peers = [41, 44, 45]
+            .iter()
+            .map(|store_id| metapb::Peer {
+                id: *store_id,
+                store_id: *store_id,
+                ..Default::default()
+            })
+            .collect();
+        region.leader = Some(region.region.peers[0].clone());
+        let target_store = |region: &RegionWithLeader| {
+            liveness_target(&pd, region).map(|target| target.get_store_id().unwrap())
+        };
+
+        assert_eq!(target_store(&region), Some(41));
+
+        states.lock().unwrap().insert(41, Liveness::Unknown);
+        liveness.check(41).await;
+        assert_eq!(liveness.get(41), Liveness::Unknown);
+        assert_eq!(target_store(&region), Some(44));
+
+        for store_id in [41, 44, 45] {
+            states
+                .lock()
+                .unwrap()
+                .insert(store_id, Liveness::Unreachable);
+        }
+        liveness.check(44).await;
+        liveness.check(45).await;
+        // 41 stays unknown (its loop has not ticked): it is the last candidate.
+        assert_eq!(target_store(&region), Some(41));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(liveness.get(41), Liveness::Unreachable);
+        assert_eq!(target_store(&region), None);
+
+        // Without liveness tracking the cached leader is always the target.
+        let untracked = MockPdClient::new(MockKvClient::default());
+        assert_eq!(
+            liveness_target(&untracked, &region).and_then(|t| t.leader),
+            region.leader
+        );
     }
 }
