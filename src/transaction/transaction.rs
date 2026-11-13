@@ -3065,4 +3065,66 @@ mod tests {
         );
         txn.rollback().await.unwrap();
     }
+
+    fn deadline_busy() -> crate::proto::errorpb::Error {
+        crate::proto::errorpb::Error {
+            server_is_busy: Some(crate::proto::errorpb::ServerIsBusy {
+                reason: "deadline is exceeded".to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// #14 review: TiKV answers an attempt whose `tikv_client_read_timeout` deadline expired
+    /// with ServerIsBusy "deadline is exceeded". client-go retries at once with the default
+    /// timeout (`onReadReqConfigurableTimeout`, region_request.go:1941-1946), not after a
+    /// 2-10 s serverBusy backoff; without a read timeout the backoff stays.
+    #[rstest::rstest]
+    #[case::with_read_timeout(Some(Duration::from_millis(100)), vec![100, 0], false)]
+    #[case::without(None, vec![0, 0], true)]
+    #[tokio::test(start_paused = true)]
+    async fn test_deadline_exceeded_after_read_timeout_retries_at_once(
+        #[case] read_timeout: Option<Duration>,
+        #[case] expected: Vec<u64>,
+        #[case] backs_off: bool,
+    ) {
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let deadlines_cloned = deadlines.clone();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                let req = req.downcast_ref::<kvrpcpb::GetRequest>().unwrap();
+                let mut deadlines = deadlines_cloned.lock().unwrap();
+                deadlines.push(deadline_ms(&req.context));
+                let resp = if deadlines.len() == 1 {
+                    kvrpcpb::GetResponse {
+                        region_error: Some(deadline_busy()),
+                        ..Default::default()
+                    }
+                } else {
+                    kvrpcpb::GetResponse {
+                        value: b"v".to_vec(),
+                        ..Default::default()
+                    }
+                };
+                Ok(Box::new(resp) as Box<dyn Any>)
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(100),
+            pd_client,
+            go_budget().read_timeout(read_timeout),
+            Keyspace::Disable,
+        );
+        let start = tokio::time::Instant::now();
+        assert_eq!(txn.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
+        assert_eq!(*deadlines.lock().unwrap(), expected);
+        assert_eq!(
+            start.elapsed() >= Duration::from_secs(1),
+            backs_off,
+            "{:?}",
+            start.elapsed()
+        );
+        txn.rollback().await.unwrap();
+    }
 }

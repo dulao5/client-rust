@@ -676,6 +676,24 @@ async fn handle_task_once<PdC: PdClient>(
             task.region.ver_id(),
             region_error
         );
+        // TiKV gave up at the deadline of a task sent with `tikv_client_read_timeout`: retry
+        // at once with the default timeout instead of backing off as serverBusy (client-go
+        // `onReadReqConfigurableTimeout`, internal/locate/region_request.go:1941-1946).
+        if region_error
+            .server_is_busy
+            .as_ref()
+            .is_some_and(|busy| busy.reason.contains("deadline is exceeded"))
+            && task
+                .read_timeout
+                .is_some_and(|t| t < crate::store::READ_TIMEOUT_SHORT)
+        {
+            let mut task = task;
+            task.read_timeout = None;
+            return Ok(TaskOutcome {
+                response: None,
+                remains: vec![task],
+            });
+        }
         let backoff_type = metrics::backoff_type_for_region_error(&region_error);
         let Some(delay) = region_backoff.next_delay_for(backoff_type) else {
             warn!(
@@ -1249,6 +1267,46 @@ mod tests {
         let responses = run(pd, req).await.unwrap();
         assert_eq!(datas(&responses), vec!["1|[1]-[3]"]);
         assert_eq!(*deadlines.lock().unwrap(), [100, 0]);
+    }
+
+    /// #14 review: a task sent with the read timeout that TiKV gives up on ("deadline is
+    /// exceeded") is retried at once with the default timeout, not after a serverBusy backoff.
+    #[tokio::test(start_paused = true)]
+    async fn test_deadline_exceeded_after_read_timeout_retries_at_once() {
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let deadlines_c = deadlines.clone();
+        let pd = mock_pd(cop_hook(move |req| {
+            let ms = req
+                .context
+                .as_ref()
+                .map_or(0, |c| c.max_execution_duration_ms);
+            let mut deadlines = deadlines_c.lock().unwrap();
+            deadlines.push(ms);
+            if deadlines.len() == 1 {
+                return region_error(errorpb::Error {
+                    server_is_busy: Some(errorpb::ServerIsBusy {
+                        reason: "deadline is exceeded".to_owned(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            }
+            echo(req)
+        }));
+        let req = request(vec![range(&[1], &[3])]).read_timeout(Some(Duration::from_millis(100)));
+        let start = tokio::time::Instant::now();
+        // client-go's budget, under which a serverBusy backoff is 1-2 s.
+        let budget = Backoff::time_budget(20_000);
+        let responses = run_with_retry(pd, req, RetryOptions::new(budget.clone(), budget))
+            .await
+            .unwrap();
+        assert_eq!(datas(&responses), vec!["1|[1]-[3]"]);
+        assert_eq!(*deadlines.lock().unwrap(), [100, 0]);
+        assert!(
+            start.elapsed() < Duration::from_millis(10),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]

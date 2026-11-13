@@ -21,6 +21,7 @@ pub use self::errors::HasRegionErrors;
 pub(crate) use self::request::context_store_id;
 pub(crate) use self::request::exec_details_wall_time_ns;
 pub use self::request::Request;
+pub(crate) use self::request::READ_TIMEOUT_SHORT;
 use crate::pd::PdClient;
 use crate::proto::kvrpcpb;
 use crate::region::RegionWithLeader;
