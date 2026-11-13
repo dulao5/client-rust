@@ -109,7 +109,9 @@ macro_rules! retry_core {
                 // failures (a broken TSO stream) used up all attempts in milliseconds and
                 // reached the caller (tidb-rs weekly build, wide_rows). client-go's PD client
                 // retries with a backoff too.
-                sleep(retry_backoff(attempt)).await;
+                if attempt + 1 < LEADER_CHANGE_RETRY {
+                    sleep(retry_backoff(attempt)).await;
+                }
             }
 
             last_err?;

@@ -50,6 +50,16 @@ const MAX_STREAM_FAILURES: u32 = 3;
 /// Backoff between two TSO streams: doubled per consecutive failure, capped.
 const STREAM_RETRY_BASE: Duration = Duration::from_millis(10);
 const STREAM_RETRY_CAP: Duration = Duration::from_secs(1);
+/// A batch PD has not answered within this time breaks the stream (client-go PD client:
+/// `deadlineWatcher.Start(ctx, option.Timeout, cancel)` per batch, clients/tso/dispatcher.go:324;
+/// `option.Timeout` defaults to 3 s, opt/option.go:27, and TiDB passes its `pd-server-timeout`,
+/// also 3 s by default).
+const TSO_BATCH_DEADLINE: Duration = Duration::from_secs(3);
+/// The longest `get_timestamp` waits, a backstop so that a request never hangs: longer than the
+/// oracle's own recovery (MAX_STREAM_FAILURES + 1 streams of TSO_BATCH_DEADLINE each, plus their
+/// backoffs, about 12.2 s), after which `RetryClient` reconnects. client-go bounds the wait by
+/// the statement's context instead.
+const TSO_WAIT_LIMIT: Duration = Duration::from_secs(15);
 
 type TimestampRequest = oneshot::Sender<Timestamp>;
 
@@ -82,7 +92,13 @@ impl TimestampOracle {
             .send(request)
             .await
             .map_err(|_| internal_err!("TimestampRequest channel is closed"))?;
-        Ok(response.await?)
+        match tokio::time::timeout(TSO_WAIT_LIMIT, response).await {
+            Ok(ts) => Ok(ts?),
+            Err(_) => Err(internal_err!(
+                "no timestamp from PD within {:?}",
+                TSO_WAIT_LIMIT
+            )),
+        }
     }
 }
 
@@ -103,6 +119,23 @@ struct Shared {
     generation: AtomicU64,
     /// Every `TimestampOracle` is gone: no request will come any more.
     closed: AtomicBool,
+    /// Test hook: runs in `poll_next` between the first generation check and taking the
+    /// `pending_requests` lock (the window of #17 review item 1).
+    #[cfg(test)]
+    before_lock: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Shared {
+    /// Stop taking requests for good and fail the ones still buffered in the channel: the
+    /// oracle gives up or is dropped. Closing explicitly matters because tonic may keep an old
+    /// request stream (and with it `Shared` and the receiver) alive: new requests would then
+    /// be accepted and never answered (#17 review item 2).
+    fn close_requests(&self) {
+        let mut rx = self.request_rx.lock().unwrap_or_else(|e| e.into_inner());
+        rx.close();
+        while rx.try_recv().is_ok() {}
+        self.retry.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
 }
 
 async fn run_tso(
@@ -117,6 +150,8 @@ async fn run_tso(
         sending_future_waker: AtomicWaker::new(),
         generation: AtomicU64::new(0),
         closed: AtomicBool::new(false),
+        #[cfg(test)]
+        before_lock: std::sync::Mutex::new(None),
     });
     let mut failures = 0u32;
     loop {
@@ -131,7 +166,23 @@ async fn run_tso(
             Ok(responses) => {
                 let mut responses = responses.into_inner();
                 loop {
-                    match responses.next().await {
+                    // The deadline of the oldest unanswered batch (TSO_BATCH_DEADLINE).
+                    let oldest = shared.pending_requests.lock().await.front().map(|g| g.sent);
+                    let wait = oldest.map_or(TSO_BATCH_DEADLINE, |sent| {
+                        TSO_BATCH_DEADLINE.saturating_sub(sent.elapsed())
+                    });
+                    let next = match tokio::time::timeout(wait, responses.next()).await {
+                        Ok(next) => next,
+                        Err(_) if oldest.is_some() => {
+                            warn!(
+                                "TSO stream: no answer within {TSO_BATCH_DEADLINE:?}; reopening it"
+                            );
+                            break;
+                        }
+                        // Nothing was pending: look again.
+                        Err(_) => continue,
+                    };
+                    match next {
                         Some(Ok(resp)) => {
                             let allocated = {
                                 let mut pending = shared.pending_requests.lock().await;
@@ -169,22 +220,22 @@ async fn run_tso(
                 }
             }
             if shared.closed.load(Ordering::Acquire) && retry.is_empty() {
+                drop(retry);
                 info!("TSO stream terminated: the oracle is dropped");
+                shared.close_requests();
                 return;
             }
         }
 
+        // A stream that answered something resets the count (to 1: this break is one failure,
+        // so the first backoff is 20 ms).
         failures = if answered { 1 } else { failures + 1 };
         if !answered && failures > MAX_STREAM_FAILURES {
             // Give up on this connection: the waiting requests fail (their senders are dropped)
             // and so do new ones (the channel closes when this task ends); `RetryClient`
             // reconnects to PD and builds a new oracle.
             warn!("TSO stream failed {failures} times in a row; giving up on this PD connection");
-            shared
-                .retry
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
+            shared.close_requests();
             return;
         }
         let backoff = STREAM_RETRY_BASE
@@ -220,6 +271,11 @@ impl Stream for TsoRequestStream {
             return Poll::Ready(None);
         }
 
+        #[cfg(test)]
+        if let Some(hook) = shared.before_lock.lock().unwrap().take() {
+            hook();
+        }
+
         let pending_requests = shared.pending_requests.lock();
         pin_mut!(pending_requests);
         let mut pending_requests = if let Poll::Ready(pending_requests) = pending_requests.poll(cx)
@@ -229,6 +285,14 @@ impl Stream for TsoRequestStream {
             shared.sending_future_waker.register(cx.waker());
             return Poll::Pending;
         };
+        // Invariant: a group is only pushed into `pending_requests` under its lock, by the
+        // stream of the current generation. `run_tso` retires a stream (bumps the generation)
+        // and then drains under the same lock, so checking again here closes the window
+        // between the check above and the lock: a retired stream can no longer push a group
+        // that PD will never answer on the new stream (#17 review item 1).
+        if shared.generation.load(Ordering::Acquire) != this.generation {
+            return Poll::Ready(None);
+        }
         let mut requests = Vec::new();
 
         {
@@ -358,6 +422,8 @@ mod tests {
         next_logical: Arc<AtomicU64>,
         answers: Option<usize>,
         failing_streams: usize,
+        /// The first streams that take requests and never answer.
+        silent_streams: usize,
     }
 
     impl NamedService for MockPd {
@@ -366,6 +432,7 @@ mod tests {
 
     struct Tso {
         fail_after: Option<usize>,
+        silent: bool,
         next_logical: Arc<AtomicU64>,
     }
 
@@ -378,6 +445,16 @@ mod tests {
         fn call(&mut self, req: tonic::Request<tonic::Streaming<TsoRequest>>) -> Self::Future {
             let next = self.next_logical.clone();
             let fail_after = self.fail_after;
+            if self.silent {
+                // Read the requests, answer nothing, keep the stream open.
+                let mut inbound = req.into_inner();
+                let out = stream::once(async move {
+                    while inbound.next().await.is_some() {}
+                    futures::future::pending::<()>().await;
+                    unreachable!()
+                });
+                return future::ready(Ok(tonic::Response::new(out.boxed())));
+            }
             let out = stream::unfold(
                 (req.into_inner(), 0usize, false),
                 move |(mut inbound, answered, done)| {
@@ -436,6 +513,7 @@ mod tests {
                 } else {
                     None
                 },
+                silent: n < self.silent_streams,
                 next_logical: self.next_logical.clone(),
             };
             Box::pin(async move {
@@ -462,6 +540,62 @@ mod tests {
         PdClient::new(channel)
     }
 
+    fn shared(rx: mpsc::Receiver<TimestampRequest>) -> Arc<Shared> {
+        Arc::new(Shared {
+            request_rx: std::sync::Mutex::new(rx),
+            retry: std::sync::Mutex::new(VecDeque::new()),
+            pending_requests: Mutex::new(VecDeque::new()),
+            sending_future_waker: AtomicWaker::new(),
+            generation: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            before_lock: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// #17 review item 1: `run_tso` retires the stream (bumps the generation) between the
+    /// stream's first generation check and its taking the `pending_requests` lock. The retired
+    /// stream must not take the request and push a group that PD will never answer on the new
+    /// stream.
+    #[tokio::test]
+    async fn retired_stream_takes_nothing_after_the_lock() {
+        let (tx, rx) = mpsc::channel(MAX_BATCH_SIZE);
+        let shared = shared(rx);
+        let (request, _response) = oneshot::channel();
+        tx.send(request).await.unwrap();
+        let retire = shared.clone();
+        *shared.before_lock.lock().unwrap() = Some(Box::new(move || {
+            retire.generation.fetch_add(1, Ordering::AcqRel);
+        }));
+        let mut old = TsoRequestStream {
+            cluster_id: 1,
+            generation: 0,
+            shared: shared.clone(),
+        };
+        assert_eq!(futures::poll!(old.next()), Poll::Ready(None));
+        assert!(shared.pending_requests.lock().await.is_empty());
+        // The request is still in the channel, for the new stream.
+        assert!(shared.request_rx.lock().unwrap().try_recv().is_ok());
+    }
+
+    /// #17 review item 2: giving up closes the request channel even while an old request
+    /// stream (holding `Shared`) is alive: buffered requests fail and new ones fail at once.
+    #[tokio::test]
+    async fn giving_up_closes_the_channel_despite_a_live_stream() {
+        let (tx, rx) = mpsc::channel(MAX_BATCH_SIZE);
+        let shared = shared(rx);
+        let _old = TsoRequestStream {
+            cluster_id: 1,
+            generation: 0,
+            shared: shared.clone(),
+        };
+        let (buffered, buffered_rx) = oneshot::channel();
+        tx.send(buffered).await.unwrap();
+        shared.close_requests();
+        assert!(buffered_rx.await.is_err(), "the buffered request fails");
+        let (late, _) = oneshot::channel();
+        assert!(tx.send(late).await.is_err(), "a new request fails at once");
+    }
+
     /// The TSO stream breaks after two batches, with requests in flight: the oracle reopens it
     /// and sends them again, so every concurrent request gets a timestamp, all distinct (as
     /// client-go's PD client: `tsoDispatcher` reconnects and retries).
@@ -473,6 +607,7 @@ mod tests {
             next_logical: Arc::new(AtomicU64::new(0)),
             answers: Some(2),
             failing_streams: 2,
+            silent_streams: 0,
         })
         .await;
         let oracle = TimestampOracle::new(1, &client).unwrap();
@@ -490,6 +625,30 @@ mod tests {
         );
     }
 
+    /// The first stream takes the request and never answers: after TSO_BATCH_DEADLINE the oracle
+    /// gives up on it and sends the request again on a new stream (client-go's per-batch
+    /// deadline, clients/tso/dispatcher.go:324).
+    #[tokio::test]
+    async fn silent_tso_stream_hits_the_batch_deadline() {
+        let streams = Arc::new(AtomicUsize::new(0));
+        let client = start(MockPd {
+            streams: streams.clone(),
+            next_logical: Arc::new(AtomicU64::new(0)),
+            answers: None,
+            failing_streams: 0,
+            silent_streams: 1,
+        })
+        .await;
+        let oracle = TimestampOracle::new(1, &client).unwrap();
+        let started = std::time::Instant::now();
+        oracle
+            .get_timestamp()
+            .await
+            .expect("answered on the second stream");
+        assert!(started.elapsed() >= TSO_BATCH_DEADLINE);
+        assert_eq!(streams.load(Ordering::SeqCst), 2);
+    }
+
     /// Every stream fails at once: the oracle gives up after MAX_STREAM_FAILURES (so that the
     /// caller's `RetryClient` reconnects) instead of retrying forever; requests fail, not hang.
     #[tokio::test]
@@ -500,6 +659,7 @@ mod tests {
             next_logical: Arc::new(AtomicU64::new(0)),
             answers: Some(0),
             failing_streams: usize::MAX,
+            silent_streams: 0,
         })
         .await;
         let oracle = TimestampOracle::new(1, &client).unwrap();
