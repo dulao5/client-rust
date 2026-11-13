@@ -26,6 +26,7 @@ use crate::store::KvConnect;
 use crate::store::RegionStore;
 use crate::store::TikvConnect;
 use crate::store::{KvClient, Store};
+use crate::transaction::LockResolverState;
 use crate::BoundRange;
 use crate::Config;
 use crate::Key;
@@ -81,6 +82,15 @@ pub trait PdClient: Send + Sync + 'static {
     }
 
     async fn all_stores(&self) -> Result<Vec<Store>>;
+
+    /// The lock-resolution state of this cluster client: client-go keeps it per `KVStore` in
+    /// its `LockResolver` (resolved-status cache, in-flight region resolves). It lives on the
+    /// PD client only because that is what the lock-resolution paths (the `ResolveLock` plan,
+    /// the coprocessor, snapshot reads) are handed; it has nothing to do with PD. `None`: no
+    /// sharing, every resolution starts from scratch (test doubles).
+    fn lock_resolver_state(&self) -> Option<&LockResolverState> {
+        None
+    }
 
     fn group_keys_by_region<K, K2>(
         self: Arc<Self>,
@@ -217,6 +227,8 @@ pub struct PdRpcClient<KvC: KvConnect + Send + Sync + 'static = TikvConnect, Cl 
     kv_client_cache: Arc<RwLock<HashMap<String, KvC::KvClient>>>,
     enable_codec: bool,
     region_cache: RegionCache<RetryClient<Cl>>,
+    /// See [`PdClient::lock_resolver_state`].
+    lock_resolver: LockResolverState,
 }
 
 #[async_trait]
@@ -245,6 +257,10 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
     async fn region_for_id(&self, id: RegionId) -> Result<RegionWithLeader> {
         let region = self.region_cache.get_region_by_id(id).await?;
         Self::decode_region(region, self.enable_codec)
+    }
+
+    fn lock_resolver_state(&self) -> Option<&LockResolverState> {
+        Some(&self.lock_resolver)
     }
 
     async fn all_stores(&self) -> Result<Vec<Store>> {
@@ -338,6 +354,7 @@ impl<KvC: KvConnect + Send + Sync + 'static, Cl> PdRpcClient<KvC, Cl> {
             kv_connect: kv_connect(security_mgr),
             enable_codec,
             region_cache: RegionCache::new(pd),
+            lock_resolver: LockResolverState::default(),
         })
     }
 
