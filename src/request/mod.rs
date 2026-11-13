@@ -78,6 +78,26 @@ impl RetryOptions {
         }
     }
 
+    /// The options of one read (a point get, a BatchGet, a scan batch, a coprocessor task),
+    /// taken from these at its start. A [`Backoff::time_budget`] region backoff is
+    /// [started](Backoff::start) here: client-go gives each read a new `Backoffer`
+    /// (`NewBackofferWithVars`) that its region retries, its lock resolution and its lock
+    /// waits all draw from. A time-budget lock backoff therefore shares the region one (its
+    /// own `max_sleep_ms` is not used); any other lock backoff stays separate, as before.
+    pub fn for_read(&self) -> RetryOptions {
+        let region_backoff = self.region_backoff.start();
+        let lock_backoff = if region_backoff.is_time_budget() && self.lock_backoff.is_time_budget()
+        {
+            region_backoff.clone()
+        } else {
+            self.lock_backoff.start()
+        };
+        RetryOptions {
+            region_backoff,
+            lock_backoff,
+        }
+    }
+
     pub const fn none() -> RetryOptions {
         RetryOptions {
             region_backoff: Backoff::no_backoff(),

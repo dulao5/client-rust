@@ -18,7 +18,6 @@ use tokio::time::sleep;
 
 use crate::backoff::Backoff;
 use crate::backoff::DEFAULT_REGION_BACKOFF;
-use crate::backoff::OPTIMISTIC_BACKOFF;
 use crate::kv::HexRepr;
 use crate::pd::LowResolutionTs;
 use crate::pd::PdClient;
@@ -257,6 +256,14 @@ impl LockBackoff {
     /// Take up to `cap` of sleep from the current step (opening the next one if needed),
     /// or `None` when the budget is spent.
     fn charge(&mut self, cap: Duration) -> Option<Duration> {
+        if self.backoff.is_time_budget() {
+            // client-go `BackoffWithMaxSleepTxnLockFast(msBeforeExpired)`: the `txnLockFast`
+            // curve, capped, and the capped sleep charged to the read's shared budget
+            // (backoff.go:127). No steps to keep: the budget is time.
+            return self
+                .backoff
+                .next_delay_capped(BackoffType::TikvLockFast, Some(cap));
+        }
         let left = match self.step_left {
             Some(left) => left,
             None => self.backoff.next_delay_duration()?,
@@ -795,7 +802,7 @@ async fn resolve_lock_with_retry(
                 Ok(plan_builder) => plan_builder,
                 Err(Error::LeaderNotFound { region }) => {
                     pd_client.invalidate_region_cache(region.clone()).await;
-                    match backoff.next_delay_duration() {
+                    match backoff.next_delay_for(BackoffType::RegionScheduling) {
                         Some(duration) => {
                             metrics::backoff(BackoffType::RegionScheduling, duration);
                             sleep(duration).await;
@@ -825,19 +832,21 @@ async fn resolve_lock_with_retry(
             // the variant now says which kind it is rather than requiring a type test on
             // a popped element.
             Err(Error::MultipleRegionErrors(mut errors)) => match errors.pop() {
-                Some(Error::RegionError(e)) => match backoff.next_delay_duration() {
-                    Some(duration) => {
-                        let backoff_type = metrics::backoff_type_for_region_error(&e);
-                        let region_error_resolved =
-                            handle_region_error(pd_client.clone(), *e, store.clone()).await?;
-                        if !region_error_resolved {
-                            metrics::backoff(backoff_type, duration);
-                            sleep(duration).await;
+                Some(Error::RegionError(e)) => {
+                    match backoff.next_delay_for(metrics::backoff_type_for_region_error(&e)) {
+                        Some(duration) => {
+                            let backoff_type = metrics::backoff_type_for_region_error(&e);
+                            let region_error_resolved =
+                                handle_region_error(pd_client.clone(), *e, store.clone()).await?;
+                            if !region_error_resolved {
+                                metrics::backoff(backoff_type, duration);
+                                sleep(duration).await;
+                            }
+                            continue;
                         }
-                        continue;
+                        None => return Err(Error::RegionError(e)),
                     }
-                    None => return Err(Error::RegionError(e)),
-                },
+                }
                 Some(e) => return Err(e),
                 None => unreachable!(),
             },
@@ -857,7 +866,7 @@ async fn resolve_lock_with_retry(
                 Some(e) => return Err(e),
                 None => unreachable!(),
             },
-            Err(e) if is_grpc_error(&e) => match backoff.next_delay_duration() {
+            Err(e) if is_grpc_error(&e) => match backoff.next_delay_for(BackoffType::TikvRpc) {
                 Some(duration) => {
                     pd_client.invalidate_region_cache(ver_id.clone()).await;
                     if let Ok(store_id) = store.region_with_leader.get_store_id() {
@@ -1128,7 +1137,10 @@ impl LockResolver {
     ) -> Result<LockAction> {
         let status = match self
             .get_txn_status_from_lock(
-                OPTIMISTIC_BACKOFF,
+                // client-go: the reader's `bo` with `BoTxnNotFound` (lock_resolver.go
+                // getTxnStatusFromLock). With the default `region_backoff` this is
+                // `DEFAULT_REGION_BACKOFF`, the same 2/500 ms × 10 as `OPTIMISTIC_BACKOFF`.
+                self.region_backoff.clone(),
                 lock,
                 caller_start_ts,
                 current_ts,
@@ -1199,7 +1211,7 @@ impl LockResolver {
             // this time letting TiKV roll back the expired primary.
             let status = self
                 .get_txn_status_from_lock(
-                    OPTIMISTIC_BACKOFF,
+                    self.region_backoff.clone(),
                     lock,
                     caller_start_ts,
                     current_ts,
@@ -1557,7 +1569,7 @@ impl LockResolver {
                         return Ok(Arc::new(status));
                     }
 
-                    if let Some(duration) = backoff.next_delay_duration() {
+                    if let Some(duration) = backoff.next_delay_for(BackoffType::TxnNotFound) {
                         metrics::backoff(BackoffType::TxnNotFound, duration);
                         sleep(duration).await;
                         continue;

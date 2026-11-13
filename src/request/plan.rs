@@ -59,6 +59,17 @@ pub trait Plan: Sized + Clone + Sync + Send + 'static {
 
     /// Execute the plan.
     async fn execute(&self) -> Result<Self::Result>;
+
+    /// The name of the request this plan sends (e.g. `kv_get`), for logs; empty if unknown.
+    fn label(&self) -> &'static str {
+        ""
+    }
+
+    /// Make the lock resolution inside this plan draw from `budget`, a
+    /// [`Backoff::time_budget`] forked for one region of a multi-region request, so that a
+    /// region's retries, lock resolution and lock waits share one budget as client-go's
+    /// per-batch `bo` does. Plans without lock resolution ignore it.
+    fn use_budget(&mut self, _budget: &Backoff) {}
 }
 
 /// The simplest plan which just dispatches a request to a specific kv server.
@@ -74,6 +85,10 @@ pub struct Dispatch<Req: KvRequest> {
 #[async_trait]
 impl<Req: KvRequest> Plan for Dispatch<Req> {
     type Result = Req::Response;
+
+    fn label(&self) -> &'static str {
+        self.request.label()
+    }
 
     async fn execute(&self) -> Result<Self::Result> {
         let stats = tikv_stats(self.request.label());
@@ -328,6 +343,18 @@ pub(crate) enum GrpcErrorAction {
     Return,
 }
 
+/// What one attempt at a region decided (see `RetryableMultiRegion::single_shard_handler`).
+enum ShardStep<P, R> {
+    /// The final answer for the region.
+    Done(Result<R>),
+    /// Retry the same region, after any backoff already slept.
+    Again {
+        plan: P,
+        backoff: Backoff,
+        candidate_state: CandidateState,
+    },
+}
+
 pub(crate) fn grpc_error_action(error: &Error) -> GrpcErrorAction {
     match error {
         // A transport setup error means this Store cannot currently be used.
@@ -413,9 +440,20 @@ where
                     return Err(e);
                 }
             };
-            let clone = current_plan.clone_then_apply_shard(shard);
+            let mut clone = current_plan.clone_then_apply_shard(shard);
             let shard_context = context.clone();
-            let backoff = backoff.clone();
+            // Several regions at once: each gets its own copy of the budget, as client-go's
+            // `bo.Fork()` + `Clone()` per batch (`batchGetKeysByRegions`,
+            // txnsnapshot/snapshot.go:496-503); a single region keeps the budget itself
+            // (:489-490).
+            let backoff = if shards_len > 1 {
+                backoff.fork()
+            } else {
+                backoff.clone()
+            };
+            if backoff.is_time_budget() {
+                clone.use_budget(&backoff);
+            }
             join_set.spawn(async move {
                 (
                     idx,
@@ -679,37 +717,86 @@ where
         }
     }
 
-    async fn retry_same_region(
-        context: RetryContext<PdC>,
+    /// Back off as `backoff_type` before retrying the same region. A ServerIsBusy from the
+    /// leader backs off as client-go's `BoTiKVServerBusy` (`replicaSelector.onServerIsBusy`,
+    /// internal/locate/replica_selector.go:562): 2-10 s, not charged to the budget.
+    async fn backoff_same_region(
         plan: P,
-        region: RegionWithLeader,
         mut backoff: Backoff,
         candidate_state: CandidateState,
         error: Error,
-    ) -> Result<<Self as Plan>::Result> {
-        match backoff.next_delay_duration() {
+        backoff_type: BackoffType,
+    ) -> ShardStep<P, <Self as Plan>::Result> {
+        match backoff.next_delay_for(backoff_type) {
             Some(duration) => {
-                metrics::backoff(BackoffType::TikvRpc, duration);
+                metrics::backoff(backoff_type, duration);
                 sleep(duration).await;
-                Self::single_shard_handler(context, plan, region, backoff, candidate_state).await
+                ShardStep::Again {
+                    plan,
+                    backoff,
+                    candidate_state,
+                }
             }
-            None => Err(error),
+            None => ShardStep::Done(Err(error)),
         }
     }
 
-    #[async_recursion]
+    /// Send to one region until it answers for good, retrying the same region in a loop.
+    ///
+    /// The retries of the same region (ServerIsBusy, a failed follower probe) used to call
+    /// this function again and await it, nesting one more level of futures on the task's
+    /// stack per retry: 20 ServerIsBusy in a row overflowed a test thread's 2 MiB stack
+    /// (debug build), and client-go waits out a busy TiKV for minutes (P0-1b). A loop keeps
+    /// the depth constant and stays on the same task, so task-bound context (statement
+    /// cancellation, CPU / resource-group accounting) is kept. Retries that re-shard
+    /// (`single_plan_handler`) already run in tasks of their own.
     async fn single_shard_handler(
+        context: RetryContext<PdC>,
+        mut plan: P,
+        region: RegionWithLeader,
+        mut backoff: Backoff,
+        mut candidate_state: CandidateState,
+    ) -> Result<<Self as Plan>::Result> {
+        loop {
+            match Self::single_shard_attempt(
+                context.clone(),
+                plan,
+                region.clone(),
+                backoff,
+                candidate_state,
+            )
+            .await
+            {
+                ShardStep::Done(result) => return result,
+                ShardStep::Again {
+                    plan: p,
+                    backoff: b,
+                    candidate_state: c,
+                } => {
+                    plan = p;
+                    backoff = b;
+                    candidate_state = c;
+                }
+            }
+        }
+    }
+
+    /// One attempt of [`single_shard_handler`](Self::single_shard_handler).
+    #[async_recursion]
+    async fn single_shard_attempt(
         context: RetryContext<PdC>,
         mut plan: P,
         region: RegionWithLeader,
         backoff: Backoff,
         mut candidate_state: CandidateState,
-    ) -> Result<<Self as Plan>::Result> {
+    ) -> ShardStep<P, <Self as Plan>::Result> {
         let region_ver_id = region.ver_id();
         let store_id = region.get_store_id().ok();
         debug!(
-            "single_shard_handler, region: {:?}, store: {:?}",
-            region_ver_id, store_id
+            "single_shard_handler {}, region: {:?}, store: {:?}",
+            plan.label(),
+            region_ver_id,
+            store_id
         );
 
         let followers_only = candidate_state.take_follower_probe();
@@ -725,13 +812,12 @@ where
         {
             CandidateRoundResult::Response(response) => *response,
             CandidateRoundResult::MapRegionToStoreError(error) if followers_only => {
-                return Self::retry_same_region(
-                    context,
+                return Self::backoff_same_region(
                     plan,
-                    region,
                     backoff,
                     candidate_state,
                     error,
+                    BackoffType::TikvRpc,
                 )
                 .await;
             }
@@ -739,16 +825,12 @@ where
                 // Every candidate failed before dispatch while mapping its Store.
                 // The cached peer list may have been replaced completely, so
                 // reload the Region instead of retrying the same stale peers.
-                return Self::retry_after_routing_error(
-                    context,
-                    plan,
-                    region_ver_id,
-                    backoff,
-                    error,
-                )
-                .await;
+                return ShardStep::Done(
+                    Self::retry_after_routing_error(context, plan, region_ver_id, backoff, error)
+                        .await,
+                );
             }
-            CandidateRoundResult::OtherError(error) => return Err(error),
+            CandidateRoundResult::OtherError(error) => return ShardStep::Done(Err(error)),
             CandidateRoundResult::RoutingError {
                 error: Error::LeaderNotFound { .. },
                 ..
@@ -757,17 +839,19 @@ where
                 // and restore the cached leader without charging another
                 // backoff: the one-shot probe cannot fire again in this
                 // request, so the next leader error follows the normal path.
-                return Self::single_shard_handler(context, plan, region, backoff, candidate_state)
-                    .await;
+                return ShardStep::Again {
+                    plan,
+                    backoff,
+                    candidate_state,
+                };
             }
             CandidateRoundResult::RoutingError { error, .. } if followers_only => {
-                return Self::retry_same_region(
-                    context,
+                return Self::backoff_same_region(
                     plan,
-                    region,
                     backoff,
                     candidate_state,
                     error,
+                    BackoffType::TikvRpc,
                 )
                 .await;
             }
@@ -775,20 +859,18 @@ where
                 error,
                 invalidate_region: false,
             } => {
-                return Self::retry_after_error(context, plan, backoff, error).await;
+                return ShardStep::Done(
+                    Self::retry_after_error(context, plan, backoff, error).await,
+                );
             }
             CandidateRoundResult::RoutingError {
                 error,
                 invalidate_region: true,
             } => {
-                return Self::retry_after_routing_error(
-                    context,
-                    plan,
-                    region_ver_id,
-                    backoff,
-                    error,
-                )
-                .await;
+                return ShardStep::Done(
+                    Self::retry_after_routing_error(context, plan, region_ver_id, backoff, error)
+                        .await,
+                );
             }
         };
 
@@ -812,7 +894,7 @@ where
         candidate_state: CandidateState,
         followers_only: bool,
         response: CandidateResponse<P::Result>,
-    ) -> Result<<Self as Plan>::Result> {
+    ) -> ShardStep<P, <Self as Plan>::Result> {
         let region_ver_id = region.ver_id();
         let fallback_leader = response.accepted_fallback_leader();
         Self::update_leader_after_fallback(&context.pd_client, &region_ver_id, fallback_leader)
@@ -827,10 +909,10 @@ where
 
         if let Some(error) = key_errors {
             debug!("single_shard_handler:execute: key errors: {:?}", error);
-            return Ok(vec![Err(Error::MultipleKeyErrors(error))]);
+            return ShardStep::Done(Ok(vec![Err(Error::MultipleKeyErrors(error))]));
         }
         let Some(error) = region_error else {
-            return Ok(vec![Ok(response)]);
+            return ShardStep::Done(Ok(vec![Ok(response)]));
         };
 
         if let Some(server_is_busy) = error.server_is_busy.as_ref() {
@@ -839,13 +921,12 @@ where
                 if let Some(peer) = region_store.region_with_leader.leader.as_ref() {
                     candidate_state.record_leader_busy(peer.id, server_is_busy.estimated_wait_ms);
                 }
-                return Self::retry_same_region(
-                    context,
+                return Self::backoff_same_region(
                     plan,
-                    region,
                     backoff,
                     candidate_state,
                     Error::RegionError(Box::new(error)),
+                    BackoffType::ServerBusy,
                 )
                 .await;
             }
@@ -853,20 +934,28 @@ where
             if followers_only {
                 // The one-shot probe was inconclusive. Restore the cached
                 // leader and resume the normal ServerIsBusy backoff path.
-                return Self::retry_same_region(
-                    context,
+                return Self::backoff_same_region(
                     plan,
-                    region,
                     backoff,
                     candidate_state,
                     Error::RegionError(Box::new(error)),
+                    BackoffType::ServerBusy,
                 )
                 .await;
             }
         }
 
-        Self::handle_region_response(context, plan, region.ver_id(), region_store, backoff, error)
-            .await
+        ShardStep::Done(
+            Self::handle_region_response(
+                context,
+                plan,
+                region.ver_id(),
+                region_store,
+                backoff,
+                error,
+            )
+            .await,
+        )
     }
 
     async fn handle_region_response(
@@ -878,8 +967,10 @@ where
         error: errorpb::Error,
     ) -> Result<<Self as Plan>::Result> {
         debug!(
-            "single_shard_handler:execute: region error: {:?}, region: {:?}",
-            error, region_ver_id
+            "single_shard_handler:execute {}: region error: {:?}, region: {:?}",
+            plan.label(),
+            error,
+            region_ver_id
         );
         // For CAS and commit points, an unknown apply outcome must surface on
         // first sight: replaying could contradict its own effect, and a later
@@ -888,9 +979,13 @@ where
             return Err(Error::RegionError(Box::new(error)));
         }
 
-        match backoff.next_delay_duration() {
+        // A resolved region error (e.g. NotLeader naming the new leader) is retried at once
+        // but its step is still charged: client-go does not back off there and relies on the
+        // replica selector's per-replica limits, which this crate does not port; charging
+        // keeps such retries bounded.
+        let backoff_type = metrics::backoff_type_for_region_error(&error);
+        match backoff.next_delay_for(backoff_type) {
             Some(duration) => {
-                let backoff_type = metrics::backoff_type_for_region_error(&error);
                 let region_error_resolved =
                     handle_region_error(context.pd_client.clone(), error, region_store).await?;
                 if !region_error_resolved {
@@ -901,7 +996,8 @@ where
             }
             None => {
                 warn!(
-                    "giving up after exhausting retries on region error, region: {:?}",
+                    "{}: giving up after exhausting retries on region error, region: {:?}",
+                    plan.label(),
                     region_ver_id
                 );
                 Err(Error::RegionError(Box::new(error)))
@@ -916,7 +1012,7 @@ where
         backoff: Backoff,
         error: Error,
     ) -> Result<<Self as Plan>::Result> {
-        debug!("retry_after_routing_error: {:?}", error);
+        debug!("retry_after_routing_error {}: {:?}", plan.label(), error);
         context.pd_client.invalidate_region_cache(region).await;
         Self::retry_after_error(context, plan, backoff, error).await
     }
@@ -927,13 +1023,13 @@ where
         mut backoff: Backoff,
         error: Error,
     ) -> Result<<Self as Plan>::Result> {
-        match backoff.next_delay_duration() {
+        let t = if is_grpc_error(&error) {
+            BackoffType::TikvRpc
+        } else {
+            BackoffType::RegionMiss
+        };
+        match backoff.next_delay_for(t) {
             Some(duration) => {
-                let t = if is_grpc_error(&error) {
-                    BackoffType::TikvRpc
-                } else {
-                    BackoffType::RegionMiss
-                };
                 metrics::backoff(t, duration);
                 sleep(duration).await;
                 Self::single_plan_handler(context, plan, backoff).await
@@ -1168,7 +1264,7 @@ where
                         return Ok(resp);
                     }
                 }
-                Err(e) if is_grpc_error(&e) => match backoff.next_delay_duration() {
+                Err(e) if is_grpc_error(&e) => match backoff.next_delay_for(BackoffType::TikvRpc) {
                     Some(duration) => {
                         metrics::backoff(BackoffType::TikvRpc, duration);
                         sleep(duration).await;
@@ -1270,6 +1366,14 @@ impl<P: Plan, Pr: Process<P::Result>> Plan for ProcessResponse<P, Pr> {
     async fn execute(&self) -> Result<Self::Result> {
         self.processor.process(self.inner.execute().await)
     }
+
+    fn label(&self) -> &'static str {
+        self.inner.label()
+    }
+
+    fn use_budget(&mut self, budget: &Backoff) {
+        self.inner.use_budget(budget)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1316,6 +1420,19 @@ where
     P::Result: HasLocks,
 {
     type Result = P::Result;
+
+    fn label(&self) -> &'static str {
+        self.inner.label()
+    }
+
+    fn use_budget(&mut self, budget: &Backoff) {
+        if self.backoff.is_time_budget() {
+            self.backoff = budget.clone();
+        }
+        if self.region_backoff.is_time_budget() {
+            self.region_backoff = budget.clone();
+        }
+    }
 
     async fn execute(&self) -> Result<Self::Result> {
         let mut result = self.inner.execute().await?;
@@ -1571,6 +1688,14 @@ where
 {
     type Result = P::Result;
 
+    fn label(&self) -> &'static str {
+        self.inner.label()
+    }
+
+    fn use_budget(&mut self, budget: &Backoff) {
+        self.inner.use_budget(budget)
+    }
+
     async fn execute(&self) -> Result<Self::Result> {
         let mut result = self.inner.execute().await?;
         // Each branch names what it found. Previously both produced one
@@ -1637,6 +1762,14 @@ where
     P: Plan + Shardable,
 {
     type Result = ResponseWithShard<P::Result, P::Shard>;
+
+    fn label(&self) -> &'static str {
+        self.inner.label()
+    }
+
+    fn use_budget(&mut self, budget: &Backoff) {
+        self.inner.use_budget(budget)
+    }
 
     async fn execute(&self) -> Result<Self::Result> {
         let res = self.inner.execute().await?;

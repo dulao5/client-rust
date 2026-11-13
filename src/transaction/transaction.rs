@@ -154,7 +154,9 @@ impl<PdC: PdClient> Transaction<PdC> {
         let timestamp = self.timestamp.clone();
         let rpc = self.rpc.clone();
         let key = key.into().encode_keyspace(self.keyspace, KeyMode::Txn);
-        let retry_options = self.options.retry_options.clone();
+        // One budget for this read (client-go `NewBackofferWithVars(.., getMaxBackoff, ..)`,
+        // snapshot.go:750).
+        let retry_options = self.options.retry_options.for_read();
         let keyspace = self.keyspace;
         let hints = self.lock_hints.clone();
 
@@ -314,7 +316,8 @@ impl<PdC: PdClient> Transaction<PdC> {
         let keys = keys
             .into_iter()
             .map(move |k| k.into().encode_keyspace(keyspace, KeyMode::Txn));
-        let retry_options = self.options.retry_options.clone();
+        // client-go `batchGetMaxBackoff` (snapshot.go:183); regions are forked from it.
+        let retry_options = self.options.retry_options.for_read();
         let hints = self.lock_hints.clone();
 
         // client-go `KVSnapshot.batchGetSingleRegion` (txnsnapshot/snapshot.go:591): ForRead
@@ -901,7 +904,7 @@ impl<PdC: PdClient> Transaction<PdC> {
         self.check_allow_operation().await?;
         let timestamp = self.timestamp.clone();
         let rpc = self.rpc.clone();
-        let retry_options = self.options.retry_options.clone();
+        let retry_options = self.options.retry_options.for_read();
         let keyspace = self.keyspace;
         let range = range.into().encode_keyspace(self.keyspace, KeyMode::Txn);
 
@@ -2545,6 +2548,270 @@ mod tests {
         assert_eq!(txn.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
         assert_eq!(checks.load(Ordering::SeqCst), 16);
         assert_eq!(gets.load(Ordering::SeqCst), 2);
+        txn.rollback().await.unwrap();
+    }
+
+    /// client-go's budget for a read: `Backoff::time_budget(20 000)` for both region errors
+    /// and lock waits, as tidb-rs sets it (P0-1b).
+    fn go_budget() -> TransactionOptions {
+        let budget = crate::Backoff::time_budget(20_000);
+        TransactionOptions::new_optimistic()
+            .retry_options(crate::RetryOptions::new(budget.clone(), budget))
+    }
+
+    /// P0-1b: ServerIsBusy is waited for as client-go does (2–10 s steps, not charged to the
+    /// 20 s budget, config/retry/config.go:144). 60 in a row take minutes and would exhaust
+    /// any attempt-counted budget; the read still succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn test_point_get_waits_out_server_busy() {
+        let gets = Arc::new(AtomicUsize::new(0));
+        let gets_cloned = gets.clone();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                assert!(req.downcast_ref::<kvrpcpb::GetRequest>().is_some());
+                let resp = if gets_cloned.fetch_add(1, Ordering::SeqCst) < 60 {
+                    kvrpcpb::GetResponse {
+                        region_error: Some(crate::proto::errorpb::Error {
+                            server_is_busy: Some(crate::proto::errorpb::ServerIsBusy {
+                                reason: "busy".to_owned(),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }
+                } else {
+                    kvrpcpb::GetResponse {
+                        value: b"v".to_vec(),
+                        ..Default::default()
+                    }
+                };
+                Ok(Box::new(resp) as Box<dyn Any>)
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(100),
+            pd_client,
+            go_budget(),
+            Keyspace::Disable,
+        );
+        let start = tokio::time::Instant::now();
+        assert_eq!(txn.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
+        assert_eq!(gets.load(Ordering::SeqCst), 61);
+        // 2 + 4 + 8 s steps, then 10 s ones, each at least half (equal jitter).
+        assert!(
+            start.elapsed() > Duration::from_secs(200),
+            "{:?}",
+            start.elapsed()
+        );
+        txn.rollback().await.unwrap();
+    }
+
+    /// P0-1b: a read and its lock resolution draw from one budget, as client-go's `bo`. Here
+    /// the read spends most of it on region errors, then meets a lock whose CheckTxnStatus
+    /// keeps failing: the read gives up once the shared 20 s are spent, instead of the
+    /// resolution starting a budget of its own (Lucky's "budgets multiply" on client-rust#11).
+    #[tokio::test(start_paused = true)]
+    async fn test_point_get_and_its_lock_resolution_share_the_budget() {
+        let gets = Arc::new(AtomicUsize::new(0));
+        let gets_cloned = gets.clone();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.downcast_ref::<kvrpcpb::GetRequest>().is_some() {
+                    // 30 region errors: 510 ms + 22 × 500 ms (11.5 s) of the 20 s.
+                    let resp = if gets_cloned.fetch_add(1, Ordering::SeqCst) < 30 {
+                        kvrpcpb::GetResponse {
+                            region_error: Some(crate::proto::errorpb::Error {
+                                region_not_found: Some(Default::default()),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }
+                    } else {
+                        kvrpcpb::GetResponse {
+                            error: Some(kvrpcpb::KeyError {
+                                locked: Some(kvrpcpb::LockInfo {
+                                    key: b"k".to_vec(),
+                                    primary_lock: b"k".to_vec(),
+                                    lock_version: 50,
+                                    lock_ttl: 3000,
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }
+                    };
+                    Ok(Box::new(resp) as Box<dyn Any>)
+                } else if req
+                    .downcast_ref::<kvrpcpb::CheckTxnStatusRequest>()
+                    .is_some()
+                {
+                    Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        region_error: Some(stale_command()),
+                        ..Default::default()
+                    }) as Box<dyn Any>)
+                } else {
+                    panic!("unexpected request");
+                }
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(100),
+            pd_client,
+            go_budget(),
+            Keyspace::Disable,
+        );
+        let start = tokio::time::Instant::now();
+        assert!(txn.get(b"k".to_vec()).await.is_err());
+        // The budget's 20 s plus at most one last staleCommand step (1 s); a separate budget
+        // for the resolution would have added another 20 s.
+        assert!(
+            start.elapsed() < Duration::from_secs(21),
+            "{:?}",
+            start.elapsed()
+        );
+        txn.rollback().await.unwrap();
+    }
+
+    /// Retries of the same region (here ServerIsBusy) run in a loop on the same task: 400 in a
+    /// row on the default test thread stack. They used to recurse, one more level of futures
+    /// per retry, and 20 already overflowed the stack (P0-1b).
+    #[tokio::test(start_paused = true)]
+    async fn test_same_region_retries_do_not_grow_the_stack() {
+        let gets = Arc::new(AtomicUsize::new(0));
+        let gets_cloned = gets.clone();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |_: &dyn Any| {
+                let resp = if gets_cloned.fetch_add(1, Ordering::SeqCst) < 400 {
+                    kvrpcpb::GetResponse {
+                        region_error: Some(crate::proto::errorpb::Error {
+                            server_is_busy: Some(Default::default()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }
+                } else {
+                    kvrpcpb::GetResponse {
+                        value: b"v".to_vec(),
+                        ..Default::default()
+                    }
+                };
+                Ok(Box::new(resp) as Box<dyn Any>)
+            },
+        )));
+        let options = TransactionOptions::new_optimistic().retry_options(crate::RetryOptions::new(
+            crate::Backoff::no_jitter_backoff(1, 1, 1000),
+            crate::Backoff::no_jitter_backoff(1, 1, 16),
+        ));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(100),
+            pd_client,
+            options,
+            Keyspace::Disable,
+        );
+        assert_eq!(txn.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
+        assert_eq!(gets.load(Ordering::SeqCst), 401);
+        txn.rollback().await.unwrap();
+    }
+
+    /// P0-1b: the regions of a BatchGet each get a copy of the read's budget (client-go's
+    /// `bo.Fork()` + `Clone()` per batch, txnsnapshot/snapshot.go:496-503), and a region's
+    /// lock resolution draws from that region's copy. Here each of two regions meets a lock
+    /// whose CheckTxnStatus fails with 22 region errors (about 13 s of backoff) before
+    /// answering: 26 s in total, but 13 s per region, so the read succeeds as it does in
+    /// client-go. Charging both resolutions to one shared budget would fail it.
+    #[tokio::test(start_paused = true)]
+    async fn test_batch_get_regions_resolve_on_their_own_budget() {
+        use std::collections::HashMap;
+        let checks: Arc<Mutex<HashMap<Vec<u8>, usize>>> = Default::default();
+        let checks_cloned = checks.clone();
+        let locked: Arc<Mutex<HashMap<Vec<u8>, bool>>> = Default::default();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if let Some(req) = req.downcast_ref::<kvrpcpb::BatchGetRequest>() {
+                    let mut locked = locked.lock().unwrap();
+                    let pairs = req
+                        .keys
+                        .iter()
+                        .map(|key| {
+                            if locked.insert(key.clone(), true).is_none() {
+                                kvrpcpb::KvPair {
+                                    key: key.clone(),
+                                    error: Some(kvrpcpb::KeyError {
+                                        locked: Some(kvrpcpb::LockInfo {
+                                            key: key.clone(),
+                                            primary_lock: key.clone(),
+                                            lock_version: 50,
+                                            lock_ttl: 3000,
+                                            ..Default::default()
+                                        }),
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                }
+                            } else {
+                                kvrpcpb::KvPair {
+                                    key: key.clone(),
+                                    value: b"v".to_vec(),
+                                    ..Default::default()
+                                }
+                            }
+                        })
+                        .collect();
+                    Ok(Box::new(kvrpcpb::BatchGetResponse {
+                        pairs,
+                        ..Default::default()
+                    }) as Box<dyn Any>)
+                } else if let Some(req) = req.downcast_ref::<kvrpcpb::CheckTxnStatusRequest>() {
+                    let mut checks = checks_cloned.lock().unwrap();
+                    let n = checks.entry(req.primary_key.clone()).or_default();
+                    *n += 1;
+                    let resp = if *n <= 22 {
+                        kvrpcpb::CheckTxnStatusResponse {
+                            region_error: Some(stale_command()),
+                            ..Default::default()
+                        }
+                    } else {
+                        kvrpcpb::CheckTxnStatusResponse {
+                            commit_version: 60,
+                            action: kvrpcpb::Action::NoAction as i32,
+                            ..Default::default()
+                        }
+                    };
+                    Ok(Box::new(resp) as Box<dyn Any>)
+                } else if req.downcast_ref::<kvrpcpb::ResolveLockRequest>().is_some() {
+                    Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>)
+                } else {
+                    panic!("unexpected request");
+                }
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(100),
+            pd_client,
+            go_budget(),
+            Keyspace::Disable,
+        );
+        // Keys 5 and 20 are in the mock's first and second region.
+        let start = tokio::time::Instant::now();
+        let got: Vec<_> = txn
+            .batch_get(vec![vec![5u8], vec![20u8]])
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(got.len(), 2);
+        {
+            let checks = checks.lock().unwrap();
+            assert_eq!(checks.get(&vec![5u8]), Some(&23));
+            assert_eq!(checks.get(&vec![20u8]), Some(&23));
+        }
+        // The two regions back off in parallel: about 13 s, not 26.
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            start.elapsed()
+        );
         txn.rollback().await.unwrap();
     }
 }

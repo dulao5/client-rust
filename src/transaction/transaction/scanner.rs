@@ -11,6 +11,8 @@ use tokio::time::sleep;
 use super::Transaction;
 use super::TransactionStatus;
 use crate::backoff::Backoff;
+use crate::metrics;
+use crate::metrics::BackoffType;
 use crate::pd::PdClient;
 use crate::pd::PdRpcClient;
 use crate::proto::pdpb::Timestamp;
@@ -321,7 +323,10 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
     async fn fetch_remote_page(&mut self) -> Result<Vec<KvPair>> {
         self.check_allow_operation()?;
         let keyspace = self.keyspace;
-        let mut region_backoff = self.retry_options.region_backoff.clone();
+        // One budget per page, as client-go's `Scanner.getData` (`scannerNextMaxBackoff`,
+        // txnsnapshot/scan.go:115), shared by the page's retries and lock resolution.
+        let retry_options = self.retry_options.for_read();
+        let mut region_backoff = retry_options.region_backoff.clone();
 
         loop {
             let range: BoundRange = (self.next_start.clone(), self.end.clone()).into();
@@ -385,10 +390,10 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
                 Ok(builder) => builder
                     .resolve_lock(
                         self.timestamp.clone(),
-                        self.retry_options.lock_backoff.clone(),
+                        retry_options.lock_backoff.clone(),
                         keyspace,
                     )
-                    .lock_region_backoff(self.retry_options.region_backoff.clone())
+                    .lock_region_backoff(retry_options.region_backoff.clone())
                     .plan(),
                 Err(error) => {
                     self.retry_region_client_error(&region, &mut region_backoff, error)
@@ -408,12 +413,14 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
             };
 
             if let Some(region_error) = response.region_error() {
-                let Some(delay) = region_backoff.next_delay_duration() else {
+                let backoff_type = metrics::backoff_type_for_region_error(&region_error);
+                let Some(delay) = region_backoff.next_delay_for(backoff_type) else {
                     return Err(Error::RegionError(Box::new(region_error)));
                 };
                 let retry_immediately =
                     handle_region_error(self.pd_client.clone(), region_error, region_store).await?;
                 if !retry_immediately {
+                    metrics::backoff(backoff_type, delay);
                     sleep(delay).await;
                 }
                 continue;
@@ -463,9 +470,15 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
                 self.pd_client.invalidate_store_cache(store_id).await;
             }
         }
-        let Some(delay) = backoff.next_delay_duration() else {
+        let t = if is_grpc_error(&error) {
+            BackoffType::TikvRpc
+        } else {
+            BackoffType::RegionMiss
+        };
+        let Some(delay) = backoff.next_delay_for(t) else {
             return Err(error);
         };
+        metrics::backoff(t, delay);
         sleep(delay).await;
         Ok(())
     }
