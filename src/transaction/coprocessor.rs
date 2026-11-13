@@ -58,6 +58,7 @@ use crate::request::RetryOptions;
 use crate::stats::tikv_stats;
 use crate::store::Request;
 use crate::timestamp::TimestampExt;
+use crate::transaction::expand_shared_lock;
 use crate::transaction::lock_backoff_sleep;
 use crate::transaction::resolve_locks_for_read;
 use crate::transaction::ReadLockHints;
@@ -665,8 +666,9 @@ async fn handle_task_once<PdC: PdClient>(
         );
         // TiDB `copIteratorWorker.handleLockErr` (store/copr/coprocessor.go:1832): ForRead
         // through the request's `ClientHelper`.
+        // A shared lock wrapper is resolved through its members (coprocessor.go:1824-1831).
         let read = resolve_locks_for_read(
-            vec![lock],
+            expand_shared_lock(lock),
             ctx.timestamp.clone(),
             ctx.pd_client.clone(),
             ctx.keyspace,
@@ -1465,6 +1467,63 @@ mod tests {
                 (vec![], vec![]),
             ]
         );
+    }
+
+    /// R4 (#101): a shared lock wrapper met by a coprocessor request is resolved through its
+    /// members (TiDB `handleLockErr`, store/copr/coprocessor.go:1824): each member's
+    /// transaction is checked, and the retry carries them in the lock hints. TiKV v8.5.8
+    /// does not return wrappers to reads (it ignores shared locks), so this is the mock's.
+    #[tokio::test]
+    async fn test_shared_lock_wrapper_resolved_through_members() {
+        let member = |txn: u64| kvrpcpb::LockInfo {
+            key: vec![2],
+            primary_lock: vec![txn as u8],
+            lock_version: txn,
+            lock_ttl: 3000,
+            lock_type: kvrpcpb::Op::Lock as i32,
+            ..Default::default()
+        };
+        let checked = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let checked_captured = checked.clone();
+        let contexts = Arc::new(Mutex::new(Vec::<Vec<u64>>::new()));
+        let contexts_captured = contexts.clone();
+        let pd = mock_pd(move |req: &dyn Any| {
+            if let Some(req) = req.downcast_ref::<coprocessor::Request>() {
+                let ctx = req.context.as_ref().unwrap();
+                contexts_captured
+                    .lock()
+                    .unwrap()
+                    .push(ctx.resolved_locks.clone());
+                if ctx.resolved_locks.is_empty() {
+                    return Ok(Box::new(coprocessor::Response {
+                        locked: Some(kvrpcpb::LockInfo {
+                            key: vec![2],
+                            lock_type: kvrpcpb::Op::SharedLock as i32,
+                            shared_lock_infos: vec![member(5), member(6)],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                echo(req)
+            } else if let Some(req) = req.downcast_ref::<kvrpcpb::CheckTxnStatusRequest>() {
+                checked_captured.lock().unwrap().push(req.lock_ts);
+                Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                    commit_version: COMMIT_TS,
+                    ..Default::default()
+                }))
+            } else if req.is::<kvrpcpb::ResolveLockRequest>() {
+                Ok(Box::new(kvrpcpb::ResolveLockResponse::default()))
+            } else {
+                panic!("unexpected request");
+            }
+        });
+        let responses = run(pd, request(vec![range(&[1], &[3])])).await.unwrap();
+        assert_eq!(datas(&responses), vec!["1|[1]-[3]"]);
+        // Both members' transactions were checked (never transaction 0, the wrapper's).
+        assert_eq!(*checked.lock().unwrap(), vec![5, 6]);
+        // Committed after the read (timestamp 0): both ignored on the retry.
+        assert_eq!(*contexts.lock().unwrap(), vec![vec![], vec![5, 6]]);
     }
 
     /// Simulates TiKV paging over one row per key byte: a page returns at most `paging_size`

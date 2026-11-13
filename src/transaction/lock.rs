@@ -49,33 +49,52 @@ pub(crate) fn format_key_for_log(key: &[u8]) -> String {
     format!("len={}, prefix={}", key.len(), HexRepr(&key[..prefix_len]))
 }
 
-/// Refuse to resolve SHARED locks — loudly, before any of them can be mis-handled.
+/// Refuse to resolve a SHARED lock wrapper, as client-go does (`resolveLocks` /
+/// `BatchResolveLocks`: "misuse ... trying to resolve a shared lock directly",
+/// txnlock/lock_resolver.go:291, :605; `Lock.IsShared` is `Op_SharedLock`, :207).
 ///
-/// The contract (`kvrpcpb.LockInfo.shared_lock_infos`) is explicit: a shared lock's
-/// real holders live ONLY in `shared_lock_infos` — "DO NOT read from the wrapper
-/// LockInfo", whose own `key`/`lock_version` are unset. This client does not implement
-/// shared-lock resolution yet, and every partial handling is worse than none:
-/// resolving the wrapper checks transaction 0; filtering on wrapper fields silently
-/// drops the members; and the pessimistic-lock special cases in this resolver do not
-/// know `SharedPessimisticLock`. Until support lands, an explicit error is the only
-/// answer that cannot roll back a live transaction or skip a dead one.
+/// The contract (`kvrpcpb.LockInfo.shared_lock_infos`) is explicit: a shared lock's real
+/// holders live ONLY in `shared_lock_infos` — "DO NOT read from the wrapper LockInfo",
+/// whose own `lock_version` is unset; resolving the wrapper would check transaction 0.
+/// The one reader that expands a wrapper into its members is the coprocessor
+/// ([`expand_shared_lock`], as TiDB's `copIteratorWorker.handleLockErr`); snapshot reads and
+/// GC refuse it, as client-go. The members themselves are ordinary prewrite or pessimistic
+/// locks (`SharedPessimisticLock` counts as pessimistic, [`is_pessimistic`]) and are not
+/// refused.
 ///
-/// Servers that predate shared locks never produce them, so this is a no-op there.
+/// TiKV v8.5.8 never returns a wrapper to a read: `check_ts_conflict` ignores shared locks
+/// (components/txn_types/src/lock.rs:370-373, :431-434). Wrappers appear on write paths,
+/// in `scan_lock`, and in a `PrimaryMismatch` from `CheckTxnStatus`.
 pub(crate) fn reject_shared_locks(locks: &[kvrpcpb::LockInfo]) -> Result<()> {
-    let shared = |l: &kvrpcpb::LockInfo| {
-        !l.shared_lock_infos.is_empty()
-            || l.lock_type == kvrpcpb::Op::SharedLock as i32
-            || l.lock_type == kvrpcpb::Op::SharedPessimisticLock as i32
+    let wrapper = |l: &kvrpcpb::LockInfo| {
+        !l.shared_lock_infos.is_empty() || l.lock_type == kvrpcpb::Op::SharedLock as i32
     };
-    if locks.iter().any(shared) {
+    if locks.iter().any(wrapper) {
         return Err(Error::StringError(
-            "shared locks (SharedLock/SharedPessimisticLock) are not supported by this \
-             client yet; refusing to resolve them — resolving the wrapper would target \
-             the wrong transaction"
+            "misuse of resolve locks: trying to resolve a shared lock directly; its member \
+             locks must be extracted and resolved one by one"
                 .to_owned(),
         ));
     }
     Ok(())
+}
+
+/// The locks to resolve for a lock met by a coprocessor request: the members of a shared
+/// lock wrapper, or the lock itself (TiDB `copIteratorWorker.handleLockErr`,
+/// store/copr/coprocessor.go:1824-1831).
+pub(crate) fn expand_shared_lock(lock: kvrpcpb::LockInfo) -> Vec<kvrpcpb::LockInfo> {
+    if lock.shared_lock_infos.is_empty() {
+        vec![lock]
+    } else {
+        lock.shared_lock_infos
+    }
+}
+
+/// client-go `Lock.IsPessimistic` (txnlock/lock_resolver.go:201): a pessimistic lock, or the
+/// pessimistic member of a shared lock.
+pub(crate) fn is_pessimistic(lock: &kvrpcpb::LockInfo) -> bool {
+    lock.lock_type == kvrpcpb::Op::PessimisticLock as i32
+        || lock.lock_type == kvrpcpb::Op::SharedPessimisticLock as i32
 }
 
 /// _Resolves_ the given locks. Returns locks still live. When there is no live locks, all the given locks are resolved.
@@ -741,8 +760,7 @@ impl LockResolver {
         {
             Ok(status) => status,
             Err(Error::KeyError(key_err))
-                if key_err.primary_mismatch.is_some()
-                    && lock.lock_type == kvrpcpb::Op::PessimisticLock as i32 =>
+                if key_err.primary_mismatch.is_some() && is_pessimistic(lock) =>
             {
                 // The encountered pessimistic lock points at a stale primary: the transaction
                 // changed its primary after writing this lock (pingcap/tidb#42937). Roll back
@@ -765,7 +783,7 @@ impl LockResolver {
                 primary_lock
             }
             TransactionStatusKind::Locked(..) => return Ok(LockAction::from_status(&status)),
-            _ if lock.lock_type == kvrpcpb::Op::PessimisticLock as i32 => {
+            _ if is_pessimistic(lock) => {
                 // The primary named by this pessimistic lock is gone, but that does not settle
                 // the transaction's fate: when resolving a pessimistic lock TiKV deliberately
                 // writes no rollback record (`LockNotExistDoNothing`,
@@ -859,6 +877,7 @@ impl LockResolver {
                 continue;
             }
 
+            let l_is_pessimistic = is_pessimistic(&l);
             // Use currentTS = math.MaxUint64 means rollback the txn, no matter the lock is expired or not!
             let mut status = self
                 .check_txn_status(
@@ -870,7 +889,7 @@ impl LockResolver {
                     u64::MAX,
                     true,
                     false,
-                    l.lock_type == kvrpcpb::Op::PessimisticLock as i32,
+                    l_is_pessimistic,
                     l.is_txn_file,
                 )
                 .await?;
@@ -906,7 +925,7 @@ impl LockResolver {
                             u64::MAX,
                             true,
                             true,
-                            l.lock_type == kvrpcpb::Op::PessimisticLock as i32,
+                            l_is_pessimistic,
                             l.is_txn_file,
                         )
                         .await?;
@@ -1119,7 +1138,7 @@ impl LockResolver {
                     current_ts,
                     rollback_if_not_exist,
                     force_sync_commit,
-                    lock.lock_type == kvrpcpb::Op::PessimisticLock as i32,
+                    is_pessimistic(lock),
                     lock.is_txn_file,
                 )
                 .await
@@ -1134,7 +1153,7 @@ impl LockResolver {
                         );
                         rollback_if_not_exist = true;
                         continue;
-                    } else if lock.lock_type == kvrpcpb::Op::PessimisticLock as i32 {
+                    } else if is_pessimistic(lock) {
                         let status = TransactionStatus {
                             kind: TransactionStatusKind::Locked(lock.lock_ttl, lock.clone()),
                             action: kvrpcpb::Action::NoAction,
@@ -1259,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_locks_are_refused_never_misresolved() {
+    fn shared_lock_wrappers_are_refused_members_are_not() {
         let plain = kvrpcpb::LockInfo {
             key: b"k1".to_vec(),
             lock_version: 7,
@@ -1279,12 +1298,32 @@ mod tests {
         };
         assert!(reject_shared_locks(&[plain.clone(), wrapper]).is_err());
 
-        // Also refused when only the op marks it shared (empty member list).
+        // Also refused when only the op marks it a wrapper (empty member list).
         let by_op = kvrpcpb::LockInfo {
-            lock_type: kvrpcpb::Op::SharedPessimisticLock as i32,
+            lock_type: kvrpcpb::Op::SharedLock as i32,
             ..Default::default()
         };
         assert!(reject_shared_locks(&[by_op]).is_err());
+
+        // A member: the pessimistic lock of one holder, resolved like any pessimistic lock
+        // (client-go `IsShared` is only `Op_SharedLock`; `IsPessimistic` covers this one).
+        let member = kvrpcpb::LockInfo {
+            key: b"k2".to_vec(),
+            lock_version: 8,
+            lock_type: kvrpcpb::Op::SharedPessimisticLock as i32,
+            ..Default::default()
+        };
+        assert!(reject_shared_locks(std::slice::from_ref(&member)).is_ok());
+        assert!(is_pessimistic(&member));
+
+        // The coprocessor expands a wrapper into its members.
+        let wrapper = kvrpcpb::LockInfo {
+            lock_type: kvrpcpb::Op::SharedLock as i32,
+            shared_lock_infos: vec![member.clone(), plain.clone()],
+            ..Default::default()
+        };
+        assert_eq!(expand_shared_lock(wrapper), vec![member, plain.clone()]);
+        assert_eq!(expand_shared_lock(plain.clone()), vec![plain]);
     }
 
     /// The read's view of `CheckTxnStatus` (lock_resolver.go:624-639), for a read at 10 meeting
