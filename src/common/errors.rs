@@ -162,6 +162,18 @@ Use the async TransactionClient instead, or create and use SyncTransactionClient
     NestedRuntimeError(String),
 }
 
+impl Error {
+    /// The error itself, or for [`Error::BackoffExhausted`] the last error met before the
+    /// budget ran out: what decides how the failure is classified (e.g. whether a commit's
+    /// outcome is unknown), independently of how it is reported.
+    pub fn root(&self) -> &Error {
+        match self {
+            Error::BackoffExhausted { last, .. } => last.root(),
+            e => e,
+        }
+    }
+}
+
 impl From<ProtoRegionError> for Error {
     fn from(e: ProtoRegionError) -> Error {
         Error::RegionError(Box::new(e))

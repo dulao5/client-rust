@@ -1892,7 +1892,11 @@ impl<PdC: PdClient> Committer<PdC> {
 /// (`errorpb.UndeterminedResult`). Note `Error::GrpcAPI` is the variant every KV RPC
 /// dispatch failure takes since the tonic migration; `Error::Grpc` is only connection
 /// establishment.
+///
+/// A budget that ran out on such an error reports it inside [`Error::BackoffExhausted`]; the
+/// outcome is still unknown, so the last error is what is classified ([`Error::root`]).
 fn is_commit_outcome_unknown(e: &Error) -> bool {
+    let e = e.root();
     crate::request::plan::is_grpc_error(e) || crate::request::plan::is_undetermined_region_error(e)
 }
 
@@ -2884,5 +2888,45 @@ mod tests {
             )
             .plan();
         let _ = plan.execute().await;
+    }
+
+    /// #13 review: an async-commit prewrite whose time budget runs out on gRPC errors still
+    /// reports the outcome as unknown. The budget wraps the gRPC error in
+    /// `BackoffExhausted { kind: TikvRpc, .. }`, and `is_commit_outcome_unknown` looks
+    /// through it; reporting a plain failure could make the caller retry or roll back a
+    /// transaction that may be durable.
+    #[tokio::test(start_paused = true)]
+    async fn test_async_commit_prewrite_out_of_budget_on_grpc_errors_is_undetermined() {
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.downcast_ref::<kvrpcpb::PrewriteRequest>().is_some() {
+                    Err(crate::Error::GrpcAPI(tonic::Status::unavailable(
+                        "store down",
+                    )))
+                } else {
+                    Ok(Box::<kvrpcpb::BatchRollbackResponse>::default() as Box<dyn Any>)
+                }
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(100),
+            pd_client,
+            go_budget().use_async_commit(),
+            Keyspace::Disable,
+        );
+        txn.put(b"k".to_vec(), b"v".to_vec()).await.unwrap();
+        match txn.commit().await {
+            Err(crate::Error::UndeterminedError(e)) => assert!(
+                matches!(
+                    *e,
+                    crate::Error::BackoffExhausted {
+                        kind: crate::metrics::BackoffType::TikvRpc,
+                        ..
+                    }
+                ),
+                "{e:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 }
