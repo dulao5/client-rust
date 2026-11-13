@@ -13,7 +13,11 @@
 
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::pin_mut;
 use futures::prelude::*;
@@ -22,7 +26,7 @@ use futures::task::Context;
 use futures::task::Poll;
 use log::debug;
 use log::info;
-use pin_project::pin_project;
+use log::warn;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
@@ -38,6 +42,14 @@ const MAX_BATCH_SIZE: usize = 64;
 
 /// TODO: This value should be adjustable.
 const MAX_PENDING_COUNT: usize = 1 << 16;
+
+/// Consecutive TSO streams that broke without delivering a single response before the oracle
+/// gives up: its pending requests then fail and the oracle stops, so that the caller's
+/// `RetryClient` reconnects to PD (possibly a new leader) and builds a new oracle.
+const MAX_STREAM_FAILURES: u32 = 3;
+/// Backoff between two TSO streams: doubled per consecutive failure, capped.
+const STREAM_RETRY_BASE: Duration = Duration::from_millis(10);
+const STREAM_RETRY_CAP: Duration = Duration::from_secs(1);
 
 type TimestampRequest = oneshot::Sender<Timestamp>;
 
@@ -74,41 +86,113 @@ impl TimestampOracle {
     }
 }
 
+/// What the TSO streams of one oracle share. A broken stream is replaced by a new one (client-go
+/// PD client's `tsoDispatcher` / `tsoStream`, which reconnects and retries rather than failing
+/// the waiting requests); `generation` retires the old stream, so that it no longer takes
+/// requests if tonic polls it once more.
+struct Shared {
+    request_rx: std::sync::Mutex<mpsc::Receiver<TimestampRequest>>,
+    /// Requests sent on a stream that broke before answering them, sent first on the next.
+    retry: std::sync::Mutex<VecDeque<TimestampRequest>>,
+    /// The `TimestampRequest`s which are waiting for the responses from the PD server.
+    pending_requests: Mutex<VecDeque<RequestGroup>>,
+    /// When there are too many pending requests, the `send_request` future will refuse to fetch
+    /// more requests from the bounded channel. This waker is used to wake up the sending future
+    /// if the queue containing pending requests is no longer full.
+    sending_future_waker: AtomicWaker,
+    generation: AtomicU64,
+    /// Every `TimestampOracle` is gone: no request will come any more.
+    closed: AtomicBool,
+}
+
 async fn run_tso(
     cluster_id: u64,
     mut pd_client: PdClient<Channel>,
     request_rx: mpsc::Receiver<TimestampRequest>,
-) -> Result<()> {
-    // The `TimestampRequest`s which are waiting for the responses from the PD server
-    let pending_requests = Arc::new(Mutex::new(VecDeque::with_capacity(MAX_PENDING_COUNT)));
-
-    // When there are too many pending requests, the `send_request` future will refuse to fetch
-    // more requests from the bounded channel. This waker is used to wake up the sending future
-    // if the queue containing pending requests is no longer full.
-    let sending_future_waker = Arc::new(AtomicWaker::new());
-
-    let request_stream = TsoRequestStream {
-        cluster_id,
-        request_rx,
-        pending_requests: pending_requests.clone(),
-        self_waker: sending_future_waker.clone(),
-    };
-
-    // let send_requests = rpc_sender.send_all(&mut request_stream);
-    let mut responses = pd_client.tso(request_stream).await?.into_inner();
-
-    while let Some(Ok(resp)) = responses.next().await {
-        {
-            let mut pending_requests = pending_requests.lock().await;
-            allocate_timestamps(&resp, &mut pending_requests)?;
+) {
+    let shared = Arc::new(Shared {
+        request_rx: std::sync::Mutex::new(request_rx),
+        retry: std::sync::Mutex::new(VecDeque::new()),
+        pending_requests: Mutex::new(VecDeque::with_capacity(MAX_PENDING_COUNT)),
+        sending_future_waker: AtomicWaker::new(),
+        generation: AtomicU64::new(0),
+        closed: AtomicBool::new(false),
+    });
+    let mut failures = 0u32;
+    loop {
+        let generation = shared.generation.load(Ordering::Acquire);
+        let request_stream = TsoRequestStream {
+            cluster_id,
+            generation,
+            shared: shared.clone(),
+        };
+        let mut answered = false;
+        match pd_client.tso(request_stream).await {
+            Ok(responses) => {
+                let mut responses = responses.into_inner();
+                loop {
+                    match responses.next().await {
+                        Some(Ok(resp)) => {
+                            let allocated = {
+                                let mut pending = shared.pending_requests.lock().await;
+                                allocate_timestamps(&resp, &mut pending)
+                            };
+                            if let Err(e) = allocated {
+                                warn!("TSO stream: {e:?}; reopening it");
+                                break;
+                            }
+                            answered = true;
+                            // Wake up the sending future blocked by too many pending requests.
+                            shared.sending_future_waker.wake();
+                        }
+                        Some(Err(status)) => {
+                            warn!("TSO stream failed: {status}");
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
+            Err(status) => warn!("cannot open a TSO stream: {status}"),
         }
 
-        // Wake up the sending future blocked by too many pending requests or locked.
-        sending_future_waker.wake();
+        // Retire this stream; what it sent and PD did not answer goes out again on the next
+        // one. Sending a request twice is safe: PD only ever hands out larger timestamps.
+        shared.generation.fetch_add(1, Ordering::AcqRel);
+        let unanswered: Vec<RequestGroup> =
+            shared.pending_requests.lock().await.drain(..).collect();
+        {
+            let mut retry = shared.retry.lock().unwrap_or_else(|e| e.into_inner());
+            for group in unanswered.into_iter().rev() {
+                for request in group.requests.into_iter().rev() {
+                    retry.push_front(request);
+                }
+            }
+            if shared.closed.load(Ordering::Acquire) && retry.is_empty() {
+                info!("TSO stream terminated: the oracle is dropped");
+                return;
+            }
+        }
+
+        failures = if answered { 1 } else { failures + 1 };
+        if !answered && failures > MAX_STREAM_FAILURES {
+            // Give up on this connection: the waiting requests fail (their senders are dropped)
+            // and so do new ones (the channel closes when this task ends); `RetryClient`
+            // reconnects to PD and builds a new oracle.
+            warn!("TSO stream failed {failures} times in a row; giving up on this PD connection");
+            shared
+                .retry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            return;
+        }
+        let backoff = STREAM_RETRY_BASE
+            .saturating_mul(1 << failures.min(10))
+            .min(STREAM_RETRY_CAP);
+        info!("reopening the TSO stream in {backoff:?}");
+        tokio::time::sleep(backoff).await;
     }
-    // TODO: distinguish between unexpected stream termination and expected end of test
-    info!("TSO stream terminated");
-    Ok(())
 }
 
 struct RequestGroup {
@@ -119,46 +203,66 @@ struct RequestGroup {
     sent: std::time::Instant,
 }
 
-#[pin_project]
 struct TsoRequestStream {
     cluster_id: u64,
-    #[pin]
-    request_rx: mpsc::Receiver<oneshot::Sender<Timestamp>>,
-    pending_requests: Arc<Mutex<VecDeque<RequestGroup>>>,
-    self_waker: Arc<AtomicWaker>,
+    generation: u64,
+    shared: Arc<Shared>,
 }
 
 impl Stream for TsoRequestStream {
     type Item = TsoRequest;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
+        let this = self.get_mut();
+        let shared = &this.shared;
+        if shared.generation.load(Ordering::Acquire) != this.generation {
+            // A newer stream replaced this one.
+            return Poll::Ready(None);
+        }
 
-        let pending_requests = this.pending_requests.lock();
+        let pending_requests = shared.pending_requests.lock();
         pin_mut!(pending_requests);
         let mut pending_requests = if let Poll::Ready(pending_requests) = pending_requests.poll(cx)
         {
             pending_requests
         } else {
-            this.self_waker.register(cx.waker());
+            shared.sending_future_waker.register(cx.waker());
             return Poll::Pending;
         };
         let mut requests = Vec::new();
 
-        while requests.len() < MAX_BATCH_SIZE && pending_requests.len() < MAX_PENDING_COUNT {
-            match this.request_rx.poll_recv(cx) {
-                Poll::Ready(Some(sender)) => {
-                    requests.push(sender);
+        {
+            let mut retry = shared.retry.lock().unwrap_or_else(|e| e.into_inner());
+            while requests.len() < MAX_BATCH_SIZE {
+                match retry.pop_front() {
+                    Some(r) => requests.push(r),
+                    None => break,
                 }
-                Poll::Ready(None) if requests.is_empty() => return Poll::Ready(None),
-                _ => break,
+            }
+        }
+        {
+            let mut request_rx = shared.request_rx.lock().unwrap_or_else(|e| e.into_inner());
+            while requests.len() < MAX_BATCH_SIZE && pending_requests.len() < MAX_PENDING_COUNT {
+                match request_rx.poll_recv(cx) {
+                    Poll::Ready(Some(sender)) => {
+                        requests.push(sender);
+                    }
+                    Poll::Ready(None) => {
+                        shared.closed.store(true, Ordering::Release);
+                        if requests.is_empty() {
+                            return Poll::Ready(None);
+                        }
+                        break;
+                    }
+                    Poll::Pending => break,
+                }
             }
         }
 
         if !requests.is_empty() {
             let req = TsoRequest {
                 header: Some(RequestHeader {
-                    cluster_id: *this.cluster_id,
+                    cluster_id: this.cluster_id,
                     ..Default::default()
                 }),
                 count: requests.len() as u32,
@@ -176,7 +280,7 @@ impl Stream for TsoRequestStream {
         } else {
             // Set the waker to the context, then the stream can be waked up after the pending queue
             // is no longer full.
-            this.self_waker.register(cx.waker());
+            shared.sending_future_waker.register(cx.waker());
             Poll::Pending
         }
     }
@@ -221,4 +325,193 @@ fn allocate_timestamps(
         return Err(internal_err!("PD gives more TsoResponse than expected"));
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::convert::Infallible;
+    use std::sync::atomic::AtomicUsize;
+    use std::task::Context;
+    use std::task::Poll;
+
+    use futures::stream::BoxStream;
+    use tonic::codegen::http;
+    use tonic::codegen::Body;
+    use tonic::codegen::BoxFuture;
+    use tonic::codegen::Service;
+    use tonic::codegen::StdError;
+    use tonic::server::NamedService;
+    use tonic::server::StreamingService;
+    use tonic::transport::server::TcpIncoming;
+    use tonic::transport::Endpoint;
+    use tonic::transport::Server;
+    use tonic::Status;
+
+    use super::*;
+
+    /// A PD whose TSO streams answer `answers` batches and then fail (`None`: never fail).
+    /// `fail_from_stream`: streams before it behave normally.
+    #[derive(Clone)]
+    struct MockPd {
+        streams: Arc<AtomicUsize>,
+        next_logical: Arc<AtomicU64>,
+        answers: Option<usize>,
+        failing_streams: usize,
+    }
+
+    impl NamedService for MockPd {
+        const NAME: &'static str = "pdpb.PD";
+    }
+
+    struct Tso {
+        fail_after: Option<usize>,
+        next_logical: Arc<AtomicU64>,
+    }
+
+    impl StreamingService<TsoRequest> for Tso {
+        type Response = TsoResponse;
+        type ResponseStream = BoxStream<'static, std::result::Result<TsoResponse, Status>>;
+        type Future =
+            future::Ready<std::result::Result<tonic::Response<Self::ResponseStream>, Status>>;
+
+        fn call(&mut self, req: tonic::Request<tonic::Streaming<TsoRequest>>) -> Self::Future {
+            let next = self.next_logical.clone();
+            let fail_after = self.fail_after;
+            let out = stream::unfold(
+                (req.into_inner(), 0usize, false),
+                move |(mut inbound, answered, done)| {
+                    let next = next.clone();
+                    async move {
+                        if done {
+                            return None;
+                        }
+                        let req = match inbound.next().await {
+                            Some(Ok(req)) => req,
+                            _ => return None,
+                        };
+                        if fail_after == Some(answered) {
+                            // Break the stream with this batch (and whatever follows) unanswered.
+                            let err = Status::unavailable("mock PD: TSO stream broken");
+                            return Some((Err(err), (inbound, answered, true)));
+                        }
+                        let logical =
+                            next.fetch_add(req.count as u64, Ordering::SeqCst) + req.count as u64;
+                        let resp = TsoResponse {
+                            count: req.count,
+                            timestamp: Some(Timestamp {
+                                physical: 1,
+                                logical: logical as i64,
+                                suffix_bits: 0,
+                            }),
+                            ..Default::default()
+                        };
+                        Some((Ok(resp), (inbound, answered + 1, false)))
+                    }
+                },
+            );
+            future::ready(Ok(tonic::Response::new(out.boxed())))
+        }
+    }
+
+    impl<B> Service<http::Request<B>> for MockPd
+    where
+        B: Body + Send + 'static,
+        B::Error: Into<StdError> + Send + 'static,
+    {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<std::result::Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            assert_eq!(req.uri().path(), "/pdpb.PD/Tso");
+            let n = self.streams.fetch_add(1, Ordering::SeqCst);
+            let svc = Tso {
+                fail_after: if n < self.failing_streams {
+                    self.answers
+                } else {
+                    None
+                },
+                next_logical: self.next_logical.clone(),
+            };
+            Box::pin(async move {
+                let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                Ok(grpc.streaming(svc, req).await)
+            })
+        }
+    }
+
+    async fn start(pd: MockPd) -> PdClient<Channel> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = TcpIncoming::from_listener(listener, true, None).unwrap();
+        tokio::spawn(
+            Server::builder()
+                .add_service(pd)
+                .serve_with_incoming(incoming),
+        );
+        let channel = Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        PdClient::new(channel)
+    }
+
+    /// The TSO stream breaks after two batches, with requests in flight: the oracle reopens it
+    /// and sends them again, so every concurrent request gets a timestamp, all distinct (as
+    /// client-go's PD client: `tsoDispatcher` reconnects and retries).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn broken_tso_stream_is_reopened_and_requests_resent() {
+        let streams = Arc::new(AtomicUsize::new(0));
+        let client = start(MockPd {
+            streams: streams.clone(),
+            next_logical: Arc::new(AtomicU64::new(0)),
+            answers: Some(2),
+            failing_streams: 2,
+        })
+        .await;
+        let oracle = TimestampOracle::new(1, &client).unwrap();
+        let handles: Vec<_> = (0..500)
+            .map(|_| tokio::spawn(oracle.clone().get_timestamp()))
+            .collect();
+        let mut seen = HashSet::new();
+        for h in handles {
+            let ts = h.await.unwrap().expect("every request gets a timestamp");
+            assert!(seen.insert((ts.physical, ts.logical)), "duplicate {ts:?}");
+        }
+        assert!(
+            streams.load(Ordering::SeqCst) >= 3,
+            "the stream was reopened"
+        );
+    }
+
+    /// Every stream fails at once: the oracle gives up after MAX_STREAM_FAILURES (so that the
+    /// caller's `RetryClient` reconnects) instead of retrying forever; requests fail, not hang.
+    #[tokio::test]
+    async fn oracle_gives_up_on_a_pd_that_keeps_failing() {
+        let streams = Arc::new(AtomicUsize::new(0));
+        let client = start(MockPd {
+            streams: streams.clone(),
+            next_logical: Arc::new(AtomicU64::new(0)),
+            answers: Some(0),
+            failing_streams: usize::MAX,
+        })
+        .await;
+        let oracle = TimestampOracle::new(1, &client).unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(10), oracle.clone().get_timestamp())
+            .await
+            .expect("does not hang");
+        assert!(res.is_err());
+        assert_eq!(
+            streams.load(Ordering::SeqCst),
+            MAX_STREAM_FAILURES as usize + 1
+        );
+        // The oracle is gone; later requests fail at once and RetryClient reconnects.
+        assert!(oracle.get_timestamp().await.is_err());
+    }
 }
