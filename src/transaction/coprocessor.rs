@@ -1300,7 +1300,11 @@ mod tests {
             if let Some(req) = req.downcast_ref::<coprocessor::Request>() {
                 cop_attempts.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(req.start_ts, 0);
-                if resolved.lock().unwrap().is_empty() {
+                // Like TiKV: a lock of a transaction in the request's lock hints is skipped.
+                let ctx = req.context.as_ref().unwrap();
+                let hinted =
+                    ctx.resolved_locks.contains(&LOCK_TS) || ctx.committed_locks.contains(&LOCK_TS);
+                if !hinted && resolved.lock().unwrap().is_empty() {
                     return Ok(Box::new(coprocessor::Response {
                         locked: Some(lock_info()),
                         ..Default::default()
@@ -1334,6 +1338,16 @@ mod tests {
         })
     }
 
+    /// Wait for the background cleanup (R2) to have resolved the lock.
+    async fn wait_resolved(resolved: &Mutex<Vec<(u64, u64)>>) {
+        for _ in 0..200 {
+            if !resolved.lock().unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     #[tokio::test]
     async fn test_lock_resolved_then_retried() {
         let cop_attempts = Arc::new(AtomicUsize::new(0));
@@ -1341,7 +1355,10 @@ mod tests {
         let pd = lock_hook(0, cop_attempts.clone(), resolved.clone());
         let responses = run(pd, request(vec![range(&[1], &[3])])).await.unwrap();
         assert_eq!(datas(&responses), vec!["1|[1]-[3]"]);
+        // The retry carries the transaction in `resolved_locks` (committed after the read)
+        // and is not blocked; the lock itself is resolved in the background.
         assert_eq!(cop_attempts.load(Ordering::SeqCst), 2);
+        wait_resolved(&resolved).await;
         assert_eq!(*resolved.lock().unwrap(), vec![(LOCK_TS, COMMIT_TS)]);
     }
 
@@ -1352,8 +1369,9 @@ mod tests {
         let pd = lock_hook(2, cop_attempts.clone(), resolved.clone());
         let responses = run(pd, request(vec![range(&[1], &[3])])).await.unwrap();
         assert_eq!(datas(&responses), vec!["1|[1]-[3]"]);
-        // Two rounds meet a live lock, the third resolves it, the fourth reads.
+        // Two rounds meet a live lock, the third finds it committed, the fourth reads.
         assert_eq!(cop_attempts.load(Ordering::SeqCst), 4);
+        wait_resolved(&resolved).await;
         assert_eq!(*resolved.lock().unwrap(), vec![(LOCK_TS, COMMIT_TS)]);
     }
 
@@ -1394,7 +1412,9 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((ctx.resolved_locks.clone(), ctx.committed_locks.clone()));
-                if resolved_captured.lock().unwrap().is_empty() {
+                if !ctx.resolved_locks.contains(&LOCK_TS)
+                    && resolved_captured.lock().unwrap().is_empty()
+                {
                     return Ok(Box::new(coprocessor::Response {
                         locked: Some(lock_info()),
                         ..Default::default()
@@ -1430,6 +1450,8 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(datas(&responses), vec!["1|[1]-[3]"]);
+            // The background cleanup removes the lock before the next request.
+            wait_resolved(&resolved).await;
         }
         assert_eq!(
             *contexts.lock().unwrap(),
