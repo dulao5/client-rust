@@ -105,6 +105,7 @@ pub struct CopRequest {
     paging: Option<(u64, u64)>,
     schema_ver: i64,
     timeout: Duration,
+    read_timeout: Option<Duration>,
     retry_options: Option<RetryOptions>,
 }
 
@@ -137,6 +138,7 @@ impl CopRequest {
             paging: None,
             schema_ver: 0,
             timeout: DEFAULT_COPROCESSOR_TIMEOUT,
+            read_timeout: None,
             retry_options: None,
         }
     }
@@ -179,6 +181,15 @@ impl CopRequest {
     /// Per-RPC timeout. Defaults to [`DEFAULT_COPROCESSOR_TIMEOUT`].
     pub fn timeout(mut self, timeout: Duration) -> CopRequest {
         self.timeout = timeout;
+        self
+    }
+
+    /// TiDB's `tikv_client_read_timeout`: the region tasks the request starts with are sent
+    /// with `timeout` as their RPC timeout and `max_execution_duration_ms`; tasks re-split
+    /// after an error use [`timeout`](Self::timeout) (`ignoreTiKVClientReadTimeout`, TiDB
+    /// store/copr/coprocessor.go:423-425, :1353-1356, :1565). `None` or zero: no read timeout.
+    pub fn read_timeout(mut self, timeout: Option<Duration>) -> CopRequest {
+        self.read_timeout = timeout.filter(|t| !t.is_zero());
         self
     }
 
@@ -300,6 +311,8 @@ struct CopTask {
     ranges: Vec<coprocessor::KeyRange>,
     /// Page size of the next request; 0 disables paging.
     paging_size: u64,
+    /// `tikv_client_read_timeout`, on the tasks the request starts with only.
+    read_timeout: Option<Duration>,
 }
 
 /// What processing one RPC of a task produced.
@@ -339,8 +352,18 @@ impl Request for CoprocessorRpc {
         client: &TikvClient<Channel>,
         _timeout: Duration,
     ) -> Result<Box<dyn std::any::Any>> {
-        let mut req = self.inner.clone().into_request();
-        req.set_timeout(self.timeout);
+        // TiKV gives up at the RPC timeout too (client-go `SendReqCtx`,
+        // internal/locate/region_request.go:1393-1397), unless the request has a deadline.
+        let mut inner = self.inner.clone();
+        let ctx = inner.context.get_or_insert_with(Default::default);
+        let timeout = if ctx.max_execution_duration_ms > 0 {
+            Duration::from_millis(ctx.max_execution_duration_ms)
+        } else {
+            ctx.max_execution_duration_ms = self.timeout.as_millis() as u64;
+            self.timeout
+        };
+        let mut req = inner.into_request();
+        req.set_timeout(timeout);
         let start = std::time::Instant::now();
         let result = client.clone().coprocessor(req).await;
         let wall_ns = result.as_ref().map_or(0, |r| {
@@ -419,7 +442,10 @@ pub(crate) async fn send_coprocessor_request<PdC: PdClient>(
     check_ranges_sorted(&ranges)?;
 
     let (paging_size, max_paging_size) = req.paging.unwrap_or((0, 0));
-    let tasks = split_ranges_by_region(&pd_client, &ranges, paging_size, req.desc).await?;
+    let mut tasks = split_ranges_by_region(&pd_client, &ranges, paging_size, req.desc).await?;
+    for task in &mut tasks {
+        task.read_timeout = req.read_timeout;
+    }
     debug!(
         "coprocessor: tp {}, start_ts {}, {} ranges, {} region tasks, keep_order {}",
         req.tp,
@@ -595,6 +621,12 @@ async fn handle_task_once<PdC: PdClient>(
     };
     rpc.inner.ranges = task.ranges.clone();
     rpc.inner.paging_size = task.paging_size;
+    if let Some(read_timeout) = task.read_timeout {
+        rpc.inner
+            .context
+            .get_or_insert_with(Default::default)
+            .max_execution_duration_ms = read_timeout.as_millis() as u64;
+    }
     rpc.set_leader(&region_store.region_with_leader)?;
     // TiDB's copIterator sends through `ClientHelper.SendReqCtx` (store/copr/coprocessor.go:924),
     // which attaches the request's lock hints to every RPC.
@@ -807,6 +839,7 @@ async fn split_ranges_by_region<PdC: PdClient>(
                     region,
                     ranges: vec![piece],
                     paging_size,
+                    read_timeout: None,
                 }),
             }
             if last_piece {
@@ -1187,6 +1220,35 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    }
+
+    /// P0-2, `tikv_client_read_timeout`: the tasks a request starts with carry the read
+    /// timeout as their deadline; a task re-split after a region error does not (TiDB
+    /// `ignoreTiKVClientReadTimeout`, store/copr/coprocessor.go:1565). Without a read timeout
+    /// the request leaves the deadline to `CoprocessorRpc` (the 60 s RPC timeout).
+    #[tokio::test]
+    async fn test_read_timeout_applies_to_the_first_tasks_only() {
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let deadlines_c = deadlines.clone();
+        let pd = mock_pd(cop_hook(move |req| {
+            let ms = req
+                .context
+                .as_ref()
+                .map_or(0, |c| c.max_execution_duration_ms);
+            let mut deadlines = deadlines_c.lock().unwrap();
+            deadlines.push(ms);
+            if deadlines.len() == 1 {
+                return region_error(errorpb::Error {
+                    region_not_found: Some(Default::default()),
+                    ..Default::default()
+                });
+            }
+            echo(req)
+        }));
+        let req = request(vec![range(&[1], &[3])]).read_timeout(Some(Duration::from_millis(100)));
+        let responses = run(pd, req).await.unwrap();
+        assert_eq!(datas(&responses), vec!["1|[1]-[3]"]);
+        assert_eq!(*deadlines.lock().unwrap(), [100, 0]);
     }
 
     #[tokio::test]

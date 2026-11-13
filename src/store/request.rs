@@ -13,6 +13,24 @@ use crate::store::RegionWithLeader;
 use crate::Error;
 use crate::Result;
 
+/// client-go `ReadTimeoutShort`: the RPC timeout of requests that read or write a few
+/// key-values (internal/client/client.go:87; e.g. Get at txnsnapshot/snapshot.go:844,
+/// prewrite / commit, lock resolution).
+pub const READ_TIMEOUT_SHORT: Duration = Duration::from_secs(30);
+/// client-go `ReadTimeoutMedium`: requests that may scan a region (client.go:88): BatchGet
+/// (snapshot.go:630), Scan (txnsnapshot/scan.go:265), DeleteRange
+/// (txnkv/rangetask/delete_range.go:150).
+pub const READ_TIMEOUT_MEDIUM: Duration = Duration::from_secs(60);
+
+/// client-go's RPC timeout for a request, by its label (see [`READ_TIMEOUT_SHORT`] and
+/// [`READ_TIMEOUT_MEDIUM`]).
+pub fn default_timeout_for(label: &str) -> Duration {
+    match label {
+        "kv_batch_get" | "kv_scan" | "kv_delete_range" => READ_TIMEOUT_MEDIUM,
+        _ => READ_TIMEOUT_SHORT,
+    }
+}
+
 #[async_trait]
 pub trait Request: Any + Sync + Send + 'static {
     async fn dispatch(
@@ -28,6 +46,15 @@ pub trait Request: Any + Sync + Send + 'static {
     /// `ResolvedLocks` / `CommittedLocks`, filled in `ClientHelper.SendReqCtx`). Requests
     /// without a `kvrpcpb::Context` ignore it.
     fn set_lock_hints(&mut self, _resolved: Vec<u64>, _committed: Vec<u64>) {}
+    /// The RPC timeout when the request does not carry its own deadline: client-go's
+    /// `ReadTimeoutShort` / `ReadTimeoutMedium` ([`default_timeout_for`]).
+    fn default_timeout(&self) -> Duration {
+        default_timeout_for(self.label())
+    }
+    /// Set `Context.max_execution_duration_ms` (client-go `req.MaxExecutionDurationMs`), the
+    /// deadline TiKV gives up at. A request with a deadline is also sent with it as its RPC
+    /// timeout. Requests without a `kvrpcpb::Context` ignore it.
+    fn set_max_execution_duration(&mut self, _duration: Duration) {}
 }
 
 /// TiKV's own handling time of a request (ExecDetailsV2 `total_rpc_wall_time_ns`), which
@@ -112,7 +139,20 @@ macro_rules! impl_request {
                 client: &TikvClient<Channel>,
                 timeout: Duration,
             ) -> Result<Box<dyn Any>> {
-                let mut req = self.clone().into_request();
+                // client-go `SendReqCtx` (internal/locate/region_request.go:1393-1397): a
+                // request without a deadline gets the RPC timeout as its
+                // `MaxExecutionDurationMs`, so TiKV gives up on what the client no longer
+                // waits for; a request with one (`tikv_client_read_timeout`) is sent with it
+                // as its timeout.
+                let mut request = self.clone();
+                let ctx = request.context.get_or_insert_with(Default::default);
+                let timeout = if ctx.max_execution_duration_ms > 0 {
+                    Duration::from_millis(ctx.max_execution_duration_ms)
+                } else {
+                    ctx.max_execution_duration_ms = timeout.as_millis() as u64;
+                    timeout
+                };
+                let mut req = request.into_request();
                 req.set_timeout(timeout);
                 let start = std::time::Instant::now();
                 let result = client.clone().$fun(req).await;
@@ -158,6 +198,11 @@ macro_rules! impl_request {
                 let ctx = self.context.get_or_insert(kvrpcpb::Context::default());
                 ctx.resolved_locks = resolved;
                 ctx.committed_locks = committed;
+            }
+
+            fn set_max_execution_duration(&mut self, duration: Duration) {
+                let ctx = self.context.get_or_insert(kvrpcpb::Context::default());
+                ctx.max_execution_duration_ms = duration.as_millis() as u64;
             }
         }
     };

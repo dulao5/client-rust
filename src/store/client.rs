@@ -59,7 +59,7 @@ impl KvConnect for TikvConnect {
                 .await?;
             clients.push(client);
         }
-        Ok(KvRpcClient::with_clients(clients, self.timeout))
+        Ok(KvRpcClient::with_clients(clients))
     }
 }
 
@@ -70,26 +70,26 @@ pub trait KvClient {
 
 /// This client handles requests for a single TiKV node. It converts the data
 /// types and abstractions of the client program into the grpc data types.
-/// Requests are spread round-robin over one or more connections to the node.
+/// Requests are spread round-robin over one or more connections to the node. Each request is
+/// sent with client-go's RPC timeout for its kind ([`Request::default_timeout`]) or its own
+/// deadline.
 #[derive(Clone)]
 pub struct KvRpcClient {
     rpc_clients: Arc<[TikvClient<Channel>]>,
     next: Arc<AtomicUsize>,
-    timeout: Duration,
 }
 
 impl KvRpcClient {
-    pub fn new(rpc_client: TikvClient<Channel>, timeout: Duration) -> Self {
-        Self::with_clients(vec![rpc_client], timeout)
+    pub fn new(rpc_client: TikvClient<Channel>) -> Self {
+        Self::with_clients(vec![rpc_client])
     }
 
     /// A client over several connections to the same node (`rpc_clients` must not be empty).
-    pub fn with_clients(rpc_clients: Vec<TikvClient<Channel>>, timeout: Duration) -> Self {
+    pub fn with_clients(rpc_clients: Vec<TikvClient<Channel>>) -> Self {
         assert!(!rpc_clients.is_empty(), "at least one connection");
         KvRpcClient {
             rpc_clients: rpc_clients.into(),
             next: Arc::new(AtomicUsize::new(0)),
-            timeout,
         }
     }
 
@@ -105,7 +105,9 @@ impl KvRpcClient {
 #[async_trait]
 impl KvClient for KvRpcClient {
     async fn dispatch(&self, request: &dyn Request) -> Result<Box<dyn Any>> {
-        request.dispatch(self.pick(), self.timeout).await
+        request
+            .dispatch(self.pick(), request.default_timeout())
+            .await
     }
 }
 
@@ -129,10 +131,39 @@ mod tests {
     use crate::proto::kvrpcpb;
     use crate::Config;
 
-    /// A TiKV that answers every `KvGet` with a value of `value_len` bytes.
+    /// What the fake TiKV saw of one request: its method, `Context.max_execution_duration_ms`
+    /// and its `grpc-timeout` header.
+    type Seen = Arc<std::sync::Mutex<Vec<(String, u64, Option<String>)>>>;
+
+    /// A TiKV that answers every `KvGet` with a value of `value_len` bytes (and `KvBatchGet`
+    /// with nothing), recording what it saw.
     #[derive(Clone)]
     struct BigGetTikv {
         value_len: usize,
+        seen: Seen,
+    }
+
+    struct KvBatchGet {
+        seen: Seen,
+    }
+
+    impl UnaryService<kvrpcpb::BatchGetRequest> for KvBatchGet {
+        type Response = kvrpcpb::BatchGetResponse;
+        type Future =
+            std::future::Ready<std::result::Result<tonic::Response<Self::Response>, tonic::Status>>;
+
+        fn call(&mut self, req: tonic::Request<kvrpcpb::BatchGetRequest>) -> Self::Future {
+            let ms = req
+                .get_ref()
+                .context
+                .as_ref()
+                .map_or(0, |c| c.max_execution_duration_ms);
+            self.seen
+                .lock()
+                .unwrap()
+                .push(("KvBatchGet".to_owned(), ms, None));
+            std::future::ready(Ok(tonic::Response::new(Default::default())))
+        }
     }
 
     impl NamedService for BigGetTikv {
@@ -141,6 +172,7 @@ mod tests {
 
     struct KvGet {
         value_len: usize,
+        seen: Seen,
     }
 
     impl UnaryService<kvrpcpb::GetRequest> for KvGet {
@@ -148,7 +180,16 @@ mod tests {
         type Future =
             std::future::Ready<std::result::Result<tonic::Response<Self::Response>, tonic::Status>>;
 
-        fn call(&mut self, _: tonic::Request<kvrpcpb::GetRequest>) -> Self::Future {
+        fn call(&mut self, req: tonic::Request<kvrpcpb::GetRequest>) -> Self::Future {
+            let ms = req
+                .get_ref()
+                .context
+                .as_ref()
+                .map_or(0, |c| c.max_execution_duration_ms);
+            self.seen
+                .lock()
+                .unwrap()
+                .push(("KvGet".to_owned(), ms, None));
             std::future::ready(Ok(tonic::Response::new(kvrpcpb::GetResponse {
                 value: vec![7; self.value_len],
                 ..Default::default()
@@ -170,25 +211,52 @@ mod tests {
         }
 
         fn call(&mut self, req: http::Request<B>) -> Self::Future {
-            assert_eq!(req.uri().path(), "/tikvpb.Tikv/KvGet");
-            let svc = KvGet {
-                value_len: self.value_len,
-            };
+            let timeout = req
+                .headers()
+                .get("grpc-timeout")
+                .map(|v| v.to_str().unwrap().to_owned());
+            let path = req.uri().path().to_owned();
+            let seen = self.seen.clone();
+            let value_len = self.value_len;
             Box::pin(async move {
-                let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
-                Ok(grpc.unary(svc, req).await)
+                let resp = match path.as_str() {
+                    "/tikvpb.Tikv/KvGet" => {
+                        let svc = KvGet {
+                            value_len,
+                            seen: seen.clone(),
+                        };
+                        tonic::server::Grpc::new(tonic::codec::ProstCodec::default())
+                            .unary(svc, req)
+                            .await
+                    }
+                    "/tikvpb.Tikv/KvBatchGet" => {
+                        tonic::server::Grpc::new(tonic::codec::ProstCodec::default())
+                            .unary(KvBatchGet { seen: seen.clone() }, req)
+                            .await
+                    }
+                    other => panic!("unexpected method {other}"),
+                };
+                // The header of the request just recorded.
+                if let Some(last) = seen.lock().unwrap().last_mut() {
+                    last.2 = timeout;
+                }
+                Ok(resp)
             })
         }
     }
 
     /// Starts the fake TiKV and returns its address.
     async fn start_big_get_tikv(value_len: usize) -> String {
+        start_tikv(value_len, Seen::default()).await
+    }
+
+    async fn start_tikv(value_len: usize, seen: Seen) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let incoming = TcpIncoming::from_listener(listener, true, None).unwrap();
         tokio::spawn(
             Server::builder()
-                .add_service(BigGetTikv { value_len })
+                .add_service(BigGetTikv { value_len, seen })
                 .serve_with_incoming(incoming),
         );
         format!("127.0.0.1:{}", addr.port())
@@ -222,5 +290,60 @@ mod tests {
             format!("{err:?}").contains("OutOfRange"),
             "unexpected error: {err:?}"
         );
+    }
+
+    /// tonic's `grpc-timeout` header (a number and a unit) in milliseconds.
+    fn header_ms(header: &str) -> u64 {
+        let (n, unit) = header.split_at(header.len() - 1);
+        let n: u64 = n.parse().unwrap();
+        match unit {
+            "H" => n * 3_600_000,
+            "M" => n * 60_000,
+            "S" => n * 1000,
+            "m" => n,
+            "u" => n / 1000,
+            "n" => n / 1_000_000,
+            _ => panic!("unit {unit}"),
+        }
+    }
+
+    /// P0-2: TiKV requests are sent with client-go's RPC timeouts (`ReadTimeoutShort` 30 s for
+    /// a Get, `ReadTimeoutMedium` 60 s for a BatchGet; internal/client/client.go:87-88), not
+    /// `Config::timeout` (2 s), and carry the timeout to TiKV as
+    /// `Context.max_execution_duration_ms` (region_request.go:1393-1397). A request with its
+    /// own deadline is sent with that deadline as its timeout.
+    #[tokio::test]
+    async fn requests_use_client_go_timeouts_and_send_the_deadline() {
+        let seen = Seen::default();
+        let addr = start_tikv(1, seen.clone()).await;
+        let connect = TikvConnect::new(
+            Arc::new(SecurityManager::default()),
+            Duration::from_secs(2),
+            usize::MAX,
+        );
+        let client = connect.connect(&addr).await.unwrap();
+        client
+            .dispatch(&kvrpcpb::GetRequest::default())
+            .await
+            .unwrap();
+        client
+            .dispatch(&kvrpcpb::BatchGetRequest::default())
+            .await
+            .unwrap();
+        let mut with_deadline = kvrpcpb::GetRequest::default();
+        with_deadline.set_max_execution_duration(Duration::from_millis(150));
+        client.dispatch(&with_deadline).await.unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        let got: Vec<(&str, u64)> = seen.iter().map(|(m, ms, _)| (m.as_str(), *ms)).collect();
+        assert_eq!(
+            got,
+            [("KvGet", 30_000), ("KvBatchGet", 60_000), ("KvGet", 150)]
+        );
+        let timeouts: Vec<u64> = seen
+            .iter()
+            .map(|(_, _, t)| header_ms(t.as_deref().expect("grpc-timeout")))
+            .collect();
+        assert_eq!(timeouts, [30_000, 60_000, 150]);
     }
 }

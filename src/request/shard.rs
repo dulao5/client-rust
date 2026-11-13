@@ -5,6 +5,7 @@ use std::sync::Arc;
 use futures::stream::BoxStream;
 
 use super::plan::PreserveShard;
+use super::plan::ReadTimeout;
 use crate::pd::PdClient;
 use crate::region::RegionWithLeader;
 use crate::request::plan::CleanupLocks;
@@ -111,6 +112,10 @@ impl<Req: KvRequest + Shardable> Shardable for Dispatch<Req> {
 
     fn apply_shard(&mut self, shard: Self::Shard) {
         self.request.apply_shard(shard);
+        // A request to one region: a BatchGet's read timeout applies to its first attempt
+        // again (see `ReadTimeout`). Wrappers clone and then apply the shard, so this is the
+        // place that sees every region request.
+        self.read_timeout = self.read_timeout.as_ref().map(ReadTimeout::for_region);
     }
 
     fn clone_then_apply_shard(&self, shard: Self::Shard) -> Self
@@ -121,6 +126,7 @@ impl<Req: KvRequest + Shardable> Shardable for Dispatch<Req> {
             request: self.request.clone_then_apply_shard(shard),
             kv_client: self.kv_client.clone(),
             lock_hints: self.lock_hints.clone(),
+            read_timeout: self.read_timeout.as_ref().map(ReadTimeout::for_region),
         }
     }
 
