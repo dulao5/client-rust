@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use fail::fail_point;
 use log::debug;
@@ -87,6 +88,18 @@ pub(crate) fn reject_shared_locks(locks: &[kvrpcpb::LockInfo]) -> Result<()> {
 /// An expired async-commit lock needs an extra step in between: TiKV refuses to roll it back
 /// via `CheckTxnStatus`, so the transaction's final status is first recovered from all of its
 /// secondary locks (`CheckSecondaryLocks`), and then every lock of the transaction is resolved.
+/// [`resolve_locks`] that also reports how long until the first live lock expires
+/// ([`ReadLocks::ms_before_expired`]), for callers that back off (client-go `ResolveLocks`
+/// returns that TTL).
+pub(crate) async fn resolve_locks_with_expiry(
+    locks: Vec<kvrpcpb::LockInfo>,
+    timestamp: Timestamp,
+    pd_client: Arc<impl PdClient>,
+    keyspace: Keyspace,
+) -> Result<ReadLocks> {
+    resolve_locks_impl(locks, timestamp, pd_client, keyspace, false).await
+}
+
 pub async fn resolve_locks(
     locks: Vec<kvrpcpb::LockInfo>,
     timestamp: Timestamp,
@@ -113,6 +126,43 @@ pub(crate) struct ReadLocks {
     /// Start timestamps of transactions committed at or before the read's timestamp
     /// (`canAccess`, sent as `Context.committed_locks`): TiKV reads through their locks.
     pub accessible: Vec<u64>,
+    /// Milliseconds until the first of the `live` locks expires, 0 if none or already
+    /// expired: client-go `msBeforeTxnExpired` (`txnExpireTime`, lock_resolver.go:671), the
+    /// `TTL` of `ResolveLockResult`. Callers cap each lock-backoff sleep with it
+    /// ([`lock_backoff_sleep`]).
+    pub ms_before_expired: i64,
+}
+
+impl ReadLocks {
+    /// client-go `txnExpireTime.update` (lock_resolver.go:676): keep the minimum, negatives
+    /// as 0.
+    fn update_expire(&mut self, ms: i64) {
+        let ms = ms.max(0);
+        if self.live.is_empty() || ms < self.ms_before_expired {
+            self.ms_before_expired = ms;
+        }
+    }
+}
+
+/// How long to sleep before retrying a read that met live locks, given what
+/// [`resolve_locks_for_read`] / [`resolve_locks_with_expiry`] found: client-go
+/// `bo.BackoffWithMaxSleepTxnLockFast(msBeforeExpired)` (txnsnapshot/snapshot.go:582, :927;
+/// TiDB store/copr/coprocessor.go:1843), called only when `msBeforeExpired > 0`. The next
+/// delay of `backoff`, capped at the time left until the first live lock expires; zero, and
+/// no attempt spent, when that time is 0 (retry at once, as client-go). `None` when the
+/// backoff is exhausted.
+///
+/// One difference: client-go's budget is total sleep time, so capped sleeps use up less of
+/// it; `Backoff` counts attempts, so each capped sleep still spends one.
+pub(crate) fn lock_backoff_sleep(
+    backoff: &mut Backoff,
+    ms_before_expired: i64,
+) -> Option<Duration> {
+    if ms_before_expired <= 0 {
+        return Some(Duration::ZERO);
+    }
+    let cap = Duration::from_millis(ms_before_expired as u64);
+    backoff.next_delay_duration().map(|d| d.min(cap))
 }
 
 /// The lock hints of a snapshot or of one coprocessor request: client-go's pair of
@@ -282,6 +332,7 @@ async fn resolve_locks_impl(
             }
             LockAction::Live {
                 primary_lock,
+                ttl,
                 min_commit_ts_pushed,
             } => {
                 // lock_resolver.go:616-624: a live transaction is waited for, unless the read
@@ -290,6 +341,8 @@ async fn resolve_locks_impl(
                     out.ignorable.push(lock.lock_version);
                 } else {
                     metrics::lock_resolver(LockMetric::NotExpired);
+                    // lock_resolver.go:619 / :637: `UntilExpired(l.TxnID, status.ttl)`.
+                    out.update_expire(lock_until_expired_ms(lock.lock_version, ttl, ts.clone()));
                     out.live.push(primary_lock);
                 }
                 continue;
@@ -383,6 +436,8 @@ enum LockAction {
     /// `min_commit_ts_pushed`: `CheckTxnStatus` answered `MinCommitTsPushed`.
     Live {
         primary_lock: kvrpcpb::LockInfo,
+        /// The TTL `CheckTxnStatus` answered (client-go `status.ttl`).
+        ttl: u64,
         min_commit_ts_pushed: bool,
     },
     /// The lock has been dealt with on its own (a stale pessimistic lock rolled back by
@@ -403,8 +458,9 @@ impl LockAction {
                 commit_version: 0,
                 keys: Vec::new(),
             },
-            TransactionStatusKind::Locked(_, primary_lock) => LockAction::Live {
+            TransactionStatusKind::Locked(ttl, primary_lock) => LockAction::Live {
                 primary_lock: primary_lock.clone(),
+                ttl: *ttl,
                 min_commit_ts_pushed: status.action == kvrpcpb::Action::MinCommitTsPushed,
             },
         }
@@ -1417,6 +1473,83 @@ mod tests {
         assert_eq!(*resolved.lock().unwrap(), vec![44, 44]);
     }
 
+    /// R3: the time until the first live lock expires is the minimum over the live locks,
+    /// from the TTL `CheckTxnStatus` answered (client-go `txnExpireTime`,
+    /// lock_resolver.go:617, :671). Under the mock PD clock (physical 0) and lock versions
+    /// with physical 0, it is the TTL itself.
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_locks_reports_time_to_first_expiry() {
+        let client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if let Some(req) = req.downcast_ref::<kvrpcpb::CheckTxnStatusRequest>() {
+                    // Transaction 1 has 3000 ms left, transaction 2 has 1000 ms.
+                    let ttl = if req.lock_ts == 1 { 3000 } else { 1000 };
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        lock_ttl: ttl,
+                        lock_info: Some(kvrpcpb::LockInfo {
+                            key: vec![req.lock_ts as u8],
+                            primary_lock: vec![req.lock_ts as u8],
+                            lock_version: req.lock_ts,
+                            lock_ttl: ttl,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                panic!("unexpected request type: {:?}", req.type_id());
+            },
+        )));
+        let lock = |txn: u64| kvrpcpb::LockInfo {
+            key: vec![txn as u8],
+            primary_lock: vec![txn as u8],
+            lock_version: txn,
+            lock_ttl: 5000,
+            ..Default::default()
+        };
+        let found = resolve_locks_with_expiry(
+            vec![lock(1), lock(2)],
+            Timestamp::from_version(10),
+            client.clone(),
+            Keyspace::Disable,
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.live.len(), 2);
+        assert_eq!(found.ms_before_expired, 1000);
+        // Reads report the same.
+        let read = resolve_locks_for_read(
+            vec![lock(1)],
+            Timestamp::from_version(10),
+            client,
+            Keyspace::Disable,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.ms_before_expired, 3000);
+    }
+
+    /// R3: `BackoffWithMaxSleepTxnLockFast(msBeforeExpired)`: the delay is capped at the time
+    /// left; with no time left the retry is immediate and spends no attempt.
+    #[test]
+    fn lock_backoff_sleep_is_capped_by_expiry() {
+        let mut backoff = Backoff::no_jitter_backoff(100, 1000, 2);
+        assert_eq!(
+            lock_backoff_sleep(&mut backoff, 0),
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(backoff.current_attempts(), 0);
+        assert_eq!(
+            lock_backoff_sleep(&mut backoff, 30),
+            Some(std::time::Duration::from_millis(30))
+        );
+        assert_eq!(
+            lock_backoff_sleep(&mut backoff, 10_000),
+            Some(std::time::Duration::from_millis(200))
+        );
+        assert_eq!(lock_backoff_sleep(&mut backoff, 10_000), None);
+    }
+
     /// `ReadLockHints` (client-go `util.TSSet` pair): `get_all` is `None` while empty, the
     /// sets deduplicate, and clones share them.
     #[test]
@@ -1430,6 +1563,7 @@ mod tests {
                 live: vec![],
                 ignorable: vec![7, 3],
                 accessible: vec![5],
+                ms_before_expired: 0,
             },
         );
         hints.put_resolved([3]);

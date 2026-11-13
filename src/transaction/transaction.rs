@@ -1220,7 +1220,11 @@ async fn get_at_max_ts<PdC: PdClient>(
         .await?;
         hints.record(u64::MAX, &outcome);
         if !outcome.live.is_empty() {
-            match lock_backoff.next_delay_duration() {
+            // `bo.BackoffWithMaxSleepTxnLockFast(msBeforeExpired)` (snapshot.go:927).
+            match crate::transaction::lock_backoff_sleep(
+                &mut lock_backoff,
+                outcome.ms_before_expired,
+            ) {
                 None => return Err(Error::ResolveLockError(outcome.live)),
                 Some(delay) => tokio::time::sleep(delay).await,
             }
