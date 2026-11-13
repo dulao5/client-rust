@@ -1280,6 +1280,12 @@ pub struct ResolveLock<P: Plan, PdC: PdClient> {
     pub timestamp: Timestamp,
     pub pd_client: Arc<PdC>,
     pub backoff: Backoff,
+    /// Region-error retries of the lock resolution's own requests (CheckTxnStatus,
+    /// CheckSecondaryLocks, ResolveLock, PessimisticRollback). client-go resolves with the
+    /// reading request's own `Backoffer` (`ResolveLocks(bo, ..)`, txnlock/lock_resolver.go),
+    /// so its budget is the read's, not a fixed one; here the caller's
+    /// `RetryOptions::region_backoff` (P0-1 of tidb-rs `client-go-parity.md`).
+    pub region_backoff: Backoff,
     pub keyspace: Keyspace,
     /// `Some` for a read (client-go `ForRead`, through `ClientHelper`): locks are resolved for
     /// read and the transactions the read may ignore or read through are added here. The
@@ -1296,6 +1302,7 @@ impl<P: Plan, PdC: PdClient> Clone for ResolveLock<P, PdC> {
             timestamp: self.timestamp.clone(),
             pd_client: self.pd_client.clone(),
             backoff: self.backoff.clone(),
+            region_backoff: self.region_backoff.clone(),
             keyspace: self.keyspace,
             read_hints: self.read_hints.clone(),
             lite: self.lite,
@@ -1335,6 +1342,7 @@ where
                         pd_client.clone(),
                         self.keyspace,
                         self.lite,
+                        self.region_backoff.clone(),
                     )
                     .await?;
                     hints.record(self.timestamp.version(), &read);
@@ -1346,6 +1354,7 @@ where
                         self.timestamp.clone(),
                         pd_client.clone(),
                         self.keyspace,
+                        self.region_backoff.clone(),
                     )
                     .await?
                 }
@@ -1796,6 +1805,7 @@ mod test {
                 inner: ErrPlan,
                 timestamp: Timestamp::default(),
                 backoff: Backoff::no_backoff(),
+                region_backoff: Backoff::no_backoff(),
                 pd_client: Arc::new(MockPdClient::default()),
                 keyspace: Keyspace::Disable,
                 read_hints: None,

@@ -13,7 +13,6 @@ use log::{debug, error, info, trace, warn};
 use tokio::time::Duration;
 
 use crate::backoff::Backoff;
-use crate::backoff::DEFAULT_REGION_BACKOFF;
 use crate::pd::PdClient;
 use crate::pd::PdRpcClient;
 use crate::proto::kvrpcpb;
@@ -182,7 +181,12 @@ impl<PdC: PdClient> Transaction<PdC> {
                         hints,
                         true,
                     )
-                    .retry_multi_region(DEFAULT_REGION_BACKOFF)
+                    // client-go: the snapshot's own `Backoffer` (getMaxBackoff 20 s,
+                    // snapshot.go:698, used at :750), for the read and its lock
+                    // resolution alike, not a fixed budget (tidb-rs
+                    // `client-go-parity.md` P0-1).
+                    .lock_region_backoff(retry_options.region_backoff.clone())
+                    .retry_multi_region(retry_options.region_backoff)
                     .merge(CollectSingle)
                     .post_process_default()
                     .plan();
@@ -328,6 +332,7 @@ impl<PdC: PdClient> Transaction<PdC> {
                         hints,
                         false,
                     )
+                    .lock_region_backoff(retry_options.region_backoff.clone())
                     .retry_multi_region(retry_options.region_backoff)
                     .merge(Collect)
                     .plan();
@@ -916,6 +921,7 @@ impl<PdC: PdClient> Transaction<PdC> {
                     );
                     let plan = PlanBuilder::new(rpc, keyspace, request)
                         .resolve_lock(timestamp, retry_options.lock_backoff, keyspace)
+                        .lock_region_backoff(retry_options.region_backoff.clone())
                         .retry_multi_region(retry_options.region_backoff)
                         .merge(Collect)
                         .plan();
@@ -1209,7 +1215,8 @@ async fn get_at_max_ts<PdC: PdClient>(
                 Backoff::no_backoff(),
                 keyspace,
             )
-            .retry_multi_region(DEFAULT_REGION_BACKOFF)
+            // The caller's budget, as for `get` (P0-1).
+            .retry_multi_region(retry_options.region_backoff.clone())
             .merge(CollectSingle)
             .post_process_default()
             .plan();
@@ -1232,6 +1239,7 @@ async fn get_at_max_ts<PdC: PdClient>(
             keyspace,
             // `KVSnapshot.get`'s helper resolves lite (snapshot.go:786).
             true,
+            retry_options.region_backoff.clone(),
         )
         .await?;
         hints.record(u64::MAX, &outcome);
@@ -2410,5 +2418,133 @@ mod tests {
             gets[2].context.as_ref().unwrap().resolved_locks,
             vec![10, 20]
         );
+    }
+
+    /// The caller's retry budget, for P0-1 tests: 48 region attempts of 1 ms (tidb-rs uses
+    /// 48 attempts, ~20.5 s), so that more than `DEFAULT_REGION_BACKOFF`'s 10 retries fit.
+    fn wide_region_budget() -> TransactionOptions {
+        TransactionOptions::new_optimistic().retry_options(crate::RetryOptions::new(
+            crate::Backoff::no_jitter_backoff(1, 1, 48),
+            crate::Backoff::no_jitter_backoff(1, 1, 16),
+        ))
+    }
+
+    fn stale_command() -> crate::proto::errorpb::Error {
+        crate::proto::errorpb::Error {
+            stale_command: Some(crate::proto::errorpb::StaleCommand::default()),
+            ..Default::default()
+        }
+    }
+
+    /// P0-1 (tidb-rs `client-go-parity.md` §9): a point get, at a TSO or at MaxTS, retries
+    /// region errors on the caller's `RetryOptions::region_backoff`, as client-go's snapshot
+    /// uses its own 20 s `Backoffer` (`getMaxBackoff`, txnsnapshot/snapshot.go:698). With the
+    /// hardcoded `DEFAULT_REGION_BACKOFF` (10 attempts, ~1.5 s) 15 region errors in a row
+    /// failed the read; this is what a TiKV killed under load produced (tools/ab/faults
+    /// kill_tikv).
+    #[rstest::rstest]
+    #[case::tso(100)]
+    #[case::max_ts(u64::MAX)]
+    #[tokio::test]
+    async fn test_point_get_uses_callers_region_budget(#[case] read_ts: u64) {
+        let gets = Arc::new(AtomicUsize::new(0));
+        let gets_cloned = gets.clone();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                assert!(req.downcast_ref::<kvrpcpb::GetRequest>().is_some());
+                let n = gets_cloned.fetch_add(1, Ordering::SeqCst);
+                let resp = if n < 15 {
+                    kvrpcpb::GetResponse {
+                        region_error: Some(stale_command()),
+                        ..Default::default()
+                    }
+                } else {
+                    kvrpcpb::GetResponse {
+                        value: b"v".to_vec(),
+                        ..Default::default()
+                    }
+                };
+                Ok(Box::new(resp) as Box<dyn Any>)
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(read_ts),
+            pd_client,
+            wide_region_budget(),
+            Keyspace::Disable,
+        );
+        assert_eq!(txn.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
+        assert_eq!(gets.load(Ordering::SeqCst), 16);
+        txn.rollback().await.unwrap();
+    }
+
+    /// P0-1: the lock resolution of a point get retries its own requests (here
+    /// CheckTxnStatus) on the caller's region budget too: client-go resolves with the read's
+    /// `Backoffer` (`ResolveLocks(bo, ..)`).
+    #[tokio::test]
+    async fn test_point_get_lock_resolution_uses_callers_region_budget() {
+        let checks = Arc::new(AtomicUsize::new(0));
+        let checks_cloned = checks.clone();
+        let gets = Arc::new(AtomicUsize::new(0));
+        let gets_cloned = gets.clone();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.downcast_ref::<kvrpcpb::GetRequest>().is_some() {
+                    let resp = if gets_cloned.fetch_add(1, Ordering::SeqCst) == 0 {
+                        kvrpcpb::GetResponse {
+                            error: Some(kvrpcpb::KeyError {
+                                locked: Some(kvrpcpb::LockInfo {
+                                    key: b"k".to_vec(),
+                                    primary_lock: b"k".to_vec(),
+                                    lock_version: 50,
+                                    lock_ttl: 3000,
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }
+                    } else {
+                        kvrpcpb::GetResponse {
+                            value: b"v".to_vec(),
+                            ..Default::default()
+                        }
+                    };
+                    Ok(Box::new(resp) as Box<dyn Any>)
+                } else if req
+                    .downcast_ref::<kvrpcpb::CheckTxnStatusRequest>()
+                    .is_some()
+                {
+                    let resp = if checks_cloned.fetch_add(1, Ordering::SeqCst) < 15 {
+                        kvrpcpb::CheckTxnStatusResponse {
+                            region_error: Some(stale_command()),
+                            ..Default::default()
+                        }
+                    } else {
+                        // Committed at 60, before the read at 100: read through it.
+                        kvrpcpb::CheckTxnStatusResponse {
+                            commit_version: 60,
+                            action: kvrpcpb::Action::NoAction as i32,
+                            ..Default::default()
+                        }
+                    };
+                    Ok(Box::new(resp) as Box<dyn Any>)
+                } else if req.downcast_ref::<kvrpcpb::ResolveLockRequest>().is_some() {
+                    Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>)
+                } else {
+                    panic!("unexpected request");
+                }
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(100),
+            pd_client,
+            wide_region_budget(),
+            Keyspace::Disable,
+        );
+        assert_eq!(txn.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
+        assert_eq!(checks.load(Ordering::SeqCst), 16);
+        assert_eq!(gets.load(Ordering::SeqCst), 2);
+        txn.rollback().await.unwrap();
     }
 }

@@ -114,13 +114,26 @@ pub(crate) fn is_pessimistic(lock: &kvrpcpb::LockInfo) -> bool {
 /// [`resolve_locks`] that also reports how long until the first live lock expires
 /// ([`ReadLocks::ms_before_expired`]), for callers that back off (client-go `ResolveLocks`
 /// returns that TTL).
+///
+/// `region_backoff`: region-error retries of the resolution's own requests, the caller's
+/// `RetryOptions::region_backoff` (client-go resolves with the read's `Backoffer`).
 pub(crate) async fn resolve_locks_with_expiry(
     locks: Vec<kvrpcpb::LockInfo>,
     timestamp: Timestamp,
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
+    region_backoff: Backoff,
 ) -> Result<ReadLocks> {
-    resolve_locks_impl(locks, timestamp, pd_client, keyspace, false, false).await
+    resolve_locks_impl(
+        locks,
+        timestamp,
+        pd_client,
+        keyspace,
+        false,
+        false,
+        region_backoff,
+    )
+    .await
 }
 
 pub async fn resolve_locks(
@@ -129,11 +142,17 @@ pub async fn resolve_locks(
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
 ) -> Result<Vec<kvrpcpb::LockInfo> /* live_locks */> {
-    Ok(
-        resolve_locks_impl(locks, timestamp, pd_client, keyspace, false, false)
-            .await?
-            .live,
+    Ok(resolve_locks_impl(
+        locks,
+        timestamp,
+        pd_client,
+        keyspace,
+        false,
+        false,
+        DEFAULT_REGION_BACKOFF,
     )
+    .await?
+    .live)
 }
 
 /// What [`resolve_locks_for_read`] found out about the encountered locks: client-go's
@@ -374,14 +393,26 @@ impl ReadLockHints {
 /// `lite`: client-go's `ResolveLocksOptions.Lite`, set by a snapshot's point get
 /// (`NewClientHelper(.., resolveLite = true)`, txnsnapshot/snapshot.go:786): resolve only the
 /// encountered key instead of the whole region (see [`RESOLVE_LOCK_LITE_THRESHOLD`]).
+///
+/// `region_backoff`: as for [`resolve_locks_with_expiry`].
 pub(crate) async fn resolve_locks_for_read(
     locks: Vec<kvrpcpb::LockInfo>,
     timestamp: Timestamp,
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
     lite: bool,
+    region_backoff: Backoff,
 ) -> Result<ReadLocks> {
-    resolve_locks_impl(locks, timestamp, pd_client, keyspace, true, lite).await
+    resolve_locks_impl(
+        locks,
+        timestamp,
+        pd_client,
+        keyspace,
+        true,
+        lite,
+        region_backoff,
+    )
+    .await
 }
 
 async fn resolve_locks_impl(
@@ -391,6 +422,7 @@ async fn resolve_locks_impl(
     keyspace: Keyspace,
     for_read: bool,
     lite: bool,
+    region_backoff: Backoff,
 ) -> Result<ReadLocks> {
     debug!("resolving locks");
     reject_shared_locks(&locks)?;
@@ -405,7 +437,8 @@ async fn resolve_locks_impl(
     let mut out = ReadLocks::default();
     // Final transaction statuses are cached in the resolver's context, so a transaction met
     // through several locks is queried (or recovered) only once.
-    let mut lock_resolver = LockResolver::new(ResolveLocksContext::default());
+    let mut lock_resolver = LockResolver::new(ResolveLocksContext::default())
+        .with_region_backoff(region_backoff.clone());
     // Regions already swept by ResolveLock, per transaction.
     let mut clean_regions: HashMap<u64, HashSet<RegionVerId>> = HashMap::new();
     // We must check txn status for *all* locks, not only TTL-expired ones.
@@ -496,7 +529,7 @@ async fn resolve_locks_impl(
                 lite,
                 pd_client.clone(),
                 keyspace,
-                OPTIMISTIC_BACKOFF,
+                region_backoff.clone(),
                 regions,
             )
             .await?;
@@ -692,6 +725,7 @@ async fn pessimistic_rollback_lock(
     lock: &kvrpcpb::LockInfo,
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
+    region_backoff: Backoff,
 ) -> Result<()> {
     if lock.key == lock.primary_lock {
         // The lock is its transaction's primary: the CheckTxnStatus just sent to this very
@@ -711,7 +745,7 @@ async fn pessimistic_rollback_lock(
         for_update_ts,
     );
     let plan = crate::request::PlanBuilder::new(pd_client, keyspace, req)
-        .retry_multi_region(DEFAULT_REGION_BACKOFF)
+        .retry_multi_region(region_backoff)
         .extract_error()
         .plan();
     plan.execute().await?;
@@ -1060,11 +1094,25 @@ impl ResolveLocksContext {
 
 pub struct LockResolver {
     ctx: ResolveLocksContext,
+    /// Region-error retries of the resolver's requests (default [`DEFAULT_REGION_BACKOFF`]).
+    region_backoff: Backoff,
 }
 
 impl LockResolver {
     pub fn new(ctx: ResolveLocksContext) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            region_backoff: DEFAULT_REGION_BACKOFF,
+        }
+    }
+
+    /// Retry the resolver's requests (CheckTxnStatus, CheckSecondaryLocks,
+    /// PessimisticRollback) on region errors with `backoff`: a reader passes its own
+    /// `RetryOptions::region_backoff`, as client-go resolves with the read's `Backoffer`.
+    #[must_use]
+    pub fn with_region_backoff(mut self, backoff: Backoff) -> Self {
+        self.region_backoff = backoff;
+        self
     }
 
     /// Decide what `resolve_locks` has to do about `lock`: query its transaction's status and,
@@ -1098,7 +1146,8 @@ impl LockResolver {
                 // changed its primary after writing this lock (pingcap/tidb#42937). Roll back
                 // only this stale lock — the transaction itself may still be alive, and a
                 // region-wide ResolveLock could roll back its other, legitimate locks.
-                pessimistic_rollback_lock(lock, pd_client, keyspace).await?;
+                pessimistic_rollback_lock(lock, pd_client, keyspace, self.region_backoff.clone())
+                    .await?;
                 // client-go goes on with the zero `TxnStatus{}` (lock_resolver.go:533), which
                 // `IsRolledBack`: a read ignores the transaction (lock_resolver.go:624).
                 return Ok(LockAction::Done {
@@ -1124,7 +1173,8 @@ impl LockResolver {
                 // encountered lock itself may be removed — a region-wide ResolveLock could roll
                 // back the transaction's legitimate locks, prewrite locks included. Pessimistic
                 // locks never block reads, so nothing else is waiting on this region either.
-                pessimistic_rollback_lock(lock, pd_client, keyspace).await?;
+                pessimistic_rollback_lock(lock, pd_client, keyspace, self.region_backoff.clone())
+                    .await?;
                 // lock_resolver.go:571 then :624 with the status as answered.
                 return Ok(LockAction::Done {
                     read: ReadVerdict::of(&status, caller_start_ts),
@@ -1357,7 +1407,7 @@ impl LockResolver {
             is_txn_file,
         );
         let plan = crate::request::PlanBuilder::new(pd_client.clone(), keyspace, req)
-            .retry_multi_region(DEFAULT_REGION_BACKOFF)
+            .retry_multi_region(self.region_backoff.clone())
             .merge(CollectSingle)
             .extract_error()
             .post_process_default()
@@ -1421,7 +1471,7 @@ impl LockResolver {
         let req = new_check_secondary_locks_request(keys, txn_id);
         let plan = crate::request::PlanBuilder::new(pd_client.clone(), keyspace, req)
             .preserve_shard()
-            .retry_multi_region(DEFAULT_REGION_BACKOFF)
+            .retry_multi_region(self.region_backoff.clone())
             .extract_error()
             .merge(CollectSecondaryLocks {
                 start_version: txn_id,
@@ -1733,6 +1783,7 @@ mod tests {
             client,
             Keyspace::Disable,
             false,
+            DEFAULT_REGION_BACKOFF,
         )
         .await
         .unwrap();
@@ -1795,6 +1846,7 @@ mod tests {
             client,
             Keyspace::Disable,
             false,
+            DEFAULT_REGION_BACKOFF,
         )
         .await
         .unwrap();
@@ -1852,6 +1904,7 @@ mod tests {
             client,
             Keyspace::Disable,
             false,
+            DEFAULT_REGION_BACKOFF,
         )
         .await
         .unwrap();
@@ -1907,6 +1960,7 @@ mod tests {
             Timestamp::from_version(10),
             client.clone(),
             Keyspace::Disable,
+            DEFAULT_REGION_BACKOFF,
         )
         .await
         .unwrap();
@@ -1919,6 +1973,7 @@ mod tests {
             client,
             Keyspace::Disable,
             false,
+            DEFAULT_REGION_BACKOFF,
         )
         .await
         .unwrap();
@@ -2011,6 +2066,7 @@ mod tests {
                 client,
                 Keyspace::Disable,
                 true,
+                DEFAULT_REGION_BACKOFF,
             )
             .await
             .unwrap();
@@ -2332,6 +2388,7 @@ mod tests {
             client.clone(),
             Keyspace::Disable,
             true,
+            DEFAULT_REGION_BACKOFF,
         )
         .await
         .unwrap();
@@ -2350,6 +2407,7 @@ mod tests {
             client,
             Keyspace::Disable,
             true,
+            DEFAULT_REGION_BACKOFF,
         )
         .await
         .unwrap();
