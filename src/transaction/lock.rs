@@ -99,36 +99,94 @@ pub async fn resolve_locks(
     )
 }
 
-/// What [`resolve_locks_for_max_ts_read`] found out about the encountered locks.
+/// What [`resolve_locks_for_read`] found out about the encountered locks: client-go's
+/// `ResolveLockResult` (txnlock/lock_resolver.go:415) without the TTL.
 #[derive(Debug, Default)]
-pub(crate) struct MaxTsReadLocks {
+pub(crate) struct ReadLocks {
     /// Locks of transactions that are still alive and must be waited for.
     pub live: Vec<kvrpcpb::LockInfo>,
-    /// Start timestamps of live transactions the read may bypass (`Context.resolved_locks`).
+    /// Start timestamps of transactions whose locks the read may ignore (`canIgnore`, sent as
+    /// `Context.resolved_locks`): rolled back, committed after the read's timestamp, or alive
+    /// with their `min_commit_ts` pushed past it.
     pub ignorable: Vec<u64>,
+    /// Start timestamps of transactions committed at or before the read's timestamp
+    /// (`canAccess`, sent as `Context.committed_locks`): TiKV reads through their locks.
+    pub accessible: Vec<u64>,
 }
 
-/// [`resolve_locks`] for a read at `u64::MAX` (TiDB's autocommit point get, which reads the
-/// latest committed version without a TSO). It differs in one way, as in client-go's
-/// `ResolveLocksForRead`: when `CheckTxnStatus` (sent with `caller_start_ts = u64::MAX`)
-/// answers `MinCommitTsPushed` for a live transaction, the transaction is not committed yet
-/// and TiKV deliberately did not push its `min_commit_ts`, so the read may ignore its locks
-/// instead of waiting: the start timestamp is returned in `ignorable`. Committed and rolled
-/// back transactions are resolved as usual; live async-commit transactions (TiKV answers
-/// `NoAction` for them) stay in `live`.
-pub(crate) async fn resolve_locks_for_max_ts_read(
+/// The lock hints of a snapshot or of one coprocessor request: client-go's pair of
+/// `util.TSSet`s, `KVSnapshot.resolvedLocks` / `committedLocks`
+/// (txnsnapshot/snapshot.go:124) and TiDB's `copIterator.resolvedLocks` / `committedLocks`
+/// (store/copr/coprocessor.go:708). A read that resolves locks for read adds the
+/// transactions it may ignore or read through; every later request of the same snapshot (or
+/// coprocessor request) sends the whole sets in `Context.resolved_locks` /
+/// `Context.committed_locks`, as `ClientHelper.SendReqCtx` does with `GetAll()`
+/// (txnsnapshot/client_helper.go). Cheap to clone: the sets are shared.
+#[derive(Clone, Debug, Default)]
+pub struct ReadLockHints(Arc<std::sync::RwLock<HintSets>>);
+
+#[derive(Debug, Default)]
+struct HintSets {
+    resolved: HashSet<u64>,
+    committed: HashSet<u64>,
+}
+
+impl ReadLockHints {
+    /// Add transactions whose locks the read may ignore (`resolvedLocks.Put`).
+    pub fn put_resolved(&self, txns: impl IntoIterator<Item = u64>) {
+        let mut sets = self.0.write().unwrap_or_else(|e| e.into_inner());
+        sets.resolved.extend(txns);
+    }
+
+    /// Add transactions the read may read through (`committedLocks.Put`).
+    pub fn put_committed(&self, txns: impl IntoIterator<Item = u64>) {
+        let mut sets = self.0.write().unwrap_or_else(|e| e.into_inner());
+        sets.committed.extend(txns);
+    }
+
+    /// Record what [`resolve_locks_for_read`] found (client-go
+    /// `ClientHelper.ResolveLocksWithOpts`).
+    pub(crate) fn record(&self, locks: &ReadLocks) {
+        if locks.ignorable.is_empty() && locks.accessible.is_empty() {
+            return;
+        }
+        let mut sets = self.0.write().unwrap_or_else(|e| e.into_inner());
+        sets.resolved.extend(locks.ignorable.iter().copied());
+        sets.committed.extend(locks.accessible.iter().copied());
+    }
+
+    /// Both sets (sorted), or `None` while both are empty (`GetAll()`).
+    pub fn get_all(&self) -> Option<(Vec<u64>, Vec<u64>)> {
+        let sets = self.0.read().unwrap_or_else(|e| e.into_inner());
+        if sets.resolved.is_empty() && sets.committed.is_empty() {
+            return None;
+        }
+        let mut resolved: Vec<u64> = sets.resolved.iter().copied().collect();
+        let mut committed: Vec<u64> = sets.committed.iter().copied().collect();
+        resolved.sort_unstable();
+        committed.sort_unstable();
+        Some((resolved, committed))
+    }
+}
+
+/// [`resolve_locks`] for a read: client-go's `resolveLocks` with `ForRead` (lock_resolver.go:
+/// 497, reached through `ClientHelper.ResolveLocksWithOpts`). The transactions of the
+/// encountered locks are classified as in lock_resolver.go:624-639, and the read may then
+/// ignore or read through their locks instead of waiting (see [`ReadLocks`]). Transactions
+/// whose fate is settled are still resolved here, synchronously (client-go does that in the
+/// background for reads; issue #101 R2).
+///
+/// TiDB's autocommit point get at `u64::MAX` uses this with `timestamp = u64::MAX`, as
+/// client-go does (`KVSnapshot.get` goes through the same `ClientHelper`): `CheckTxnStatus`
+/// then answers `MinCommitTsPushed` for a live transaction that is not committed, and every
+/// committed one can be read through.
+pub(crate) async fn resolve_locks_for_read(
     locks: Vec<kvrpcpb::LockInfo>,
+    timestamp: Timestamp,
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
-) -> Result<MaxTsReadLocks> {
-    resolve_locks_impl(
-        locks,
-        Timestamp::from_version(u64::MAX),
-        pd_client,
-        keyspace,
-        true,
-    )
-    .await
+) -> Result<ReadLocks> {
+    resolve_locks_impl(locks, timestamp, pd_client, keyspace, true).await
 }
 
 async fn resolve_locks_impl(
@@ -136,8 +194,8 @@ async fn resolve_locks_impl(
     timestamp: Timestamp,
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
-    max_ts_read: bool,
-) -> Result<MaxTsReadLocks> {
+    for_read: bool,
+) -> Result<ReadLocks> {
     debug!("resolving locks");
     reject_shared_locks(&locks)?;
     if !locks.is_empty() {
@@ -147,7 +205,7 @@ async fn resolve_locks_impl(
     let caller_start_ts = timestamp.version();
     let current_ts = ts.version();
 
-    let mut out = MaxTsReadLocks::default();
+    let mut out = ReadLocks::default();
     // Final transaction statuses are cached in the resolver's context, so a transaction met
     // through several locks is queried (or recovered) only once.
     let mut lock_resolver = LockResolver::new(ResolveLocksContext::default());
@@ -179,13 +237,25 @@ async fn resolve_locks_impl(
                 keys,
             } => {
                 metrics::lock_resolver(LockMetric::Expired);
+                if for_read {
+                    // lock_resolver.go:624-634: rolled back, or committed after the read →
+                    // ignore; committed at or before it → read through.
+                    let verdict = if commit_version == 0 || commit_version > caller_start_ts {
+                        ReadVerdict::Ignore
+                    } else {
+                        ReadVerdict::Access
+                    };
+                    out.classify(lock.lock_version, verdict);
+                }
                 (commit_version, keys)
             }
             LockAction::Live {
                 primary_lock,
                 min_commit_ts_pushed,
             } => {
-                if max_ts_read && min_commit_ts_pushed {
+                // lock_resolver.go:616-624: a live transaction is waited for, unless the read
+                // may ignore it because its min_commit_ts was pushed past the read.
+                if for_read && min_commit_ts_pushed {
                     out.ignorable.push(lock.lock_version);
                 } else {
                     metrics::lock_resolver(LockMetric::NotExpired);
@@ -193,8 +263,11 @@ async fn resolve_locks_impl(
                 }
                 continue;
             }
-            LockAction::Done => {
+            LockAction::Done { read } => {
                 metrics::lock_resolver(LockMetric::Expired);
+                if for_read {
+                    out.classify(lock.lock_version, read);
+                }
                 continue;
             }
         };
@@ -219,6 +292,47 @@ async fn resolve_locks_impl(
     Ok(out)
 }
 
+impl ReadLocks {
+    // glue: lock_resolver.go:624-639 (the canIgnore / canAccess lists)
+    fn classify(&mut self, txn: u64, verdict: ReadVerdict) {
+        match verdict {
+            ReadVerdict::Ignore => self.ignorable.push(txn),
+            ReadVerdict::Access => self.accessible.push(txn),
+            ReadVerdict::Neither => {}
+        }
+    }
+}
+
+/// How a read may treat the locks of a transaction whose lock was dealt with on its own
+/// (lock_resolver.go:624-639).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadVerdict {
+    /// `canIgnore`.
+    Ignore,
+    /// `canAccess`.
+    Access,
+    /// Neither: the read retries and meets the lock again (lock_resolver.go:635, with no
+    /// time to wait).
+    Neither,
+}
+
+impl ReadVerdict {
+    /// The classification of a settled status for a read at `caller_start_ts`.
+    // glue: lock_resolver.go:624-639
+    fn of(status: &TransactionStatus, caller_start_ts: u64) -> ReadVerdict {
+        match &status.kind {
+            TransactionStatusKind::Committed(ts) if ts.version() > caller_start_ts => {
+                ReadVerdict::Ignore
+            }
+            TransactionStatusKind::Committed(_) => ReadVerdict::Access,
+            // `IsRolledBack` (lock_resolver.go:127) is `is_determined` for this kind.
+            TransactionStatusKind::RolledBack if status.is_determined() => ReadVerdict::Ignore,
+            _ if status.action == kvrpcpb::Action::MinCommitTsPushed => ReadVerdict::Ignore,
+            _ => ReadVerdict::Neither,
+        }
+    }
+}
+
 /// What `resolve_locks` has to do about one encountered lock.
 enum LockAction {
     /// The transaction's fate is known: resolve its locks with `commit_version` (zero rolls
@@ -234,8 +348,9 @@ enum LockAction {
         min_commit_ts_pushed: bool,
     },
     /// The lock has been dealt with on its own (a stale pessimistic lock rolled back by
-    /// itself) and nothing else needs resolving.
-    Done,
+    /// itself) and nothing else needs resolving. `read`: how a read may treat the
+    /// transaction's locks.
+    Done { read: ReadVerdict },
 }
 
 impl LockAction {
@@ -487,7 +602,11 @@ impl LockResolver {
                 // only this stale lock — the transaction itself may still be alive, and a
                 // region-wide ResolveLock could roll back its other, legitimate locks.
                 pessimistic_rollback_lock(lock, pd_client, keyspace).await?;
-                return Ok(LockAction::Done);
+                // client-go goes on with the zero `TxnStatus{}` (lock_resolver.go:533), which
+                // `IsRolledBack`: a read ignores the transaction (lock_resolver.go:624).
+                return Ok(LockAction::Done {
+                    read: ReadVerdict::Ignore,
+                });
             }
             Err(err) => return Err(err),
         };
@@ -509,7 +628,10 @@ impl LockResolver {
                 // back the transaction's legitimate locks, prewrite locks included. Pessimistic
                 // locks never block reads, so nothing else is waiting on this region either.
                 pessimistic_rollback_lock(lock, pd_client, keyspace).await?;
-                return Ok(LockAction::Done);
+                // lock_resolver.go:571 then :624 with the status as answered.
+                return Ok(LockAction::Done {
+                    read: ReadVerdict::of(&status, caller_start_ts),
+                });
             }
             _ => return Ok(LockAction::from_status(&status)),
         };
@@ -1016,6 +1138,90 @@ mod tests {
             ..Default::default()
         };
         assert!(reject_shared_locks(&[by_op]).is_err());
+    }
+
+    /// The read's view of `CheckTxnStatus` (lock_resolver.go:624-639), for a read at 10 meeting
+    /// a lock of transaction 1 (TTL not expired under the mock PD clock):
+    /// (commit_version, lock_ttl, action) → (live, ignorable, accessible, ResolveLock sent).
+    #[rstest::rstest]
+    // Committed at or before the read: read through it.
+    #[case(5, 0, kvrpcpb::Action::NoAction, (0, vec![], vec![1], true))]
+    #[case(10, 0, kvrpcpb::Action::NoAction, (0, vec![], vec![1], true))]
+    // Committed after the read: ignore it.
+    #[case(20, 0, kvrpcpb::Action::NoAction, (0, vec![1], vec![], true))]
+    // Rolled back: ignore it.
+    #[case(0, 0, kvrpcpb::Action::TtlExpireRollback, (0, vec![1], vec![], true))]
+    // Alive, min_commit_ts pushed past the read: ignore it, nothing to resolve.
+    #[case(0, 100, kvrpcpb::Action::MinCommitTsPushed, (0, vec![1], vec![], false))]
+    // Alive otherwise: wait.
+    #[case(0, 100, kvrpcpb::Action::NoAction, (1, vec![], vec![], false))]
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_locks_for_read_classifies(
+        #[case] commit_version: u64,
+        #[case] lock_ttl: u64,
+        #[case] action: kvrpcpb::Action,
+        #[case] expected: (usize, Vec<u64>, Vec<u64>, bool),
+    ) {
+        let lock = kvrpcpb::LockInfo {
+            key: vec![1],
+            primary_lock: vec![1],
+            lock_version: 1,
+            lock_ttl: 100,
+            ..Default::default()
+        };
+        let lock_captured = lock.clone();
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let resolve_count_captured = resolve_count.clone();
+        let client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if let Some(req) = req.downcast_ref::<kvrpcpb::CheckTxnStatusRequest>() {
+                    assert_eq!(req.caller_start_ts, 10);
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        commit_version,
+                        lock_ttl,
+                        lock_info: (lock_ttl != 0).then(|| lock_captured.clone()),
+                        action: action as i32,
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                if req.is::<kvrpcpb::ResolveLockRequest>() {
+                    resolve_count_captured.fetch_add(1, Ordering::SeqCst);
+                    return Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>);
+                }
+                panic!("unexpected request type: {:?}", req.type_id());
+            },
+        )));
+        let read = resolve_locks_for_read(
+            vec![lock],
+            Timestamp::from_version(10),
+            client,
+            Keyspace::Disable,
+        )
+        .await
+        .unwrap();
+        let (live, ignorable, accessible, resolves) = expected;
+        assert_eq!(read.live.len(), live);
+        assert_eq!(read.ignorable, ignorable);
+        assert_eq!(read.accessible, accessible);
+        assert_eq!(resolve_count.load(Ordering::SeqCst) > 0, resolves);
+    }
+
+    /// `ReadLockHints` (client-go `util.TSSet` pair): `get_all` is `None` while empty, the
+    /// sets deduplicate, and clones share them.
+    #[test]
+    fn read_lock_hints_are_shared_sets() {
+        let hints = ReadLockHints::default();
+        assert_eq!(hints.get_all(), None);
+        let clone = hints.clone();
+        clone.record(&ReadLocks {
+            live: vec![],
+            ignorable: vec![7, 3],
+            accessible: vec![5],
+        });
+        hints.put_resolved([3]);
+        hints.put_committed([9]);
+        assert_eq!(hints.get_all(), Some((vec![3, 7], vec![5, 9])));
     }
 
     #[rstest::rstest]

@@ -24,6 +24,10 @@ pub trait Request: Any + Sync + Send + 'static {
     fn as_any(&self) -> &dyn Any;
     fn set_leader(&mut self, leader: &RegionWithLeader) -> Result<()>;
     fn set_api_version(&mut self, api_version: kvrpcpb::ApiVersion);
+    /// Set `Context.resolved_locks` / `Context.committed_locks` (client-go: the request's
+    /// `ResolvedLocks` / `CommittedLocks`, filled in `ClientHelper.SendReqCtx`). Requests
+    /// without a `kvrpcpb::Context` ignore it.
+    fn set_lock_hints(&mut self, _resolved: Vec<u64>, _committed: Vec<u64>) {}
 }
 
 /// TiKV's own handling time of a request (ExecDetailsV2 `total_rpc_wall_time_ns`), which
@@ -148,6 +152,12 @@ macro_rules! impl_request {
             fn set_api_version(&mut self, api_version: kvrpcpb::ApiVersion) {
                 let ctx = self.context.get_or_insert(kvrpcpb::Context::default());
                 ctx.api_version = api_version.into();
+            }
+
+            fn set_lock_hints(&mut self, resolved: Vec<u64>, committed: Vec<u64>) {
+                let ctx = self.context.get_or_insert(kvrpcpb::Context::default());
+                ctx.resolved_locks = resolved;
+                ctx.committed_locks = committed;
             }
         }
     };

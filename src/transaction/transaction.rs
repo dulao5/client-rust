@@ -36,6 +36,7 @@ use crate::transaction::lock::format_key_for_log;
 use crate::transaction::lowering::*;
 use crate::transaction::CopRequest;
 use crate::transaction::CopResponseStream;
+use crate::transaction::ReadLockHints;
 use crate::BoundRange;
 use crate::Error;
 use crate::Key;
@@ -98,6 +99,9 @@ pub struct Transaction<PdC: PdClient = PdRpcClient> {
     /// had started — which a rollback retry would otherwise need to know.
     prewritten: bool,
     start_instant: Instant,
+    /// The snapshot's lock hints (client-go `KVSnapshot.resolvedLocks` / `committedLocks`,
+    /// txnsnapshot/snapshot.go:124): shared by its point and batch gets.
+    lock_hints: ReadLockHints,
 }
 
 impl<PdC: PdClient> Transaction<PdC> {
@@ -122,6 +126,7 @@ impl<PdC: PdClient> Transaction<PdC> {
             is_heartbeat_started: false,
             prewritten: false,
             start_instant: std::time::Instant::now(),
+            lock_hints: ReadLockHints::default(),
         }
     }
 
@@ -151,18 +156,24 @@ impl<PdC: PdClient> Transaction<PdC> {
         let key = key.into().encode_keyspace(self.keyspace, KeyMode::Txn);
         let retry_options = self.options.retry_options.clone();
         let keyspace = self.keyspace;
+        let hints = self.lock_hints.clone();
 
         if timestamp.version() == u64::MAX {
             return self
                 .buffer
-                .get_or_else(key, |key| get_at_max_ts(rpc, keyspace, key, retry_options))
+                .get_or_else(key, |key| {
+                    get_at_max_ts(rpc, keyspace, key, retry_options, hints)
+                })
                 .await;
         }
+        // client-go `KVSnapshot.get` (txnsnapshot/snapshot.go:786): ForRead through the
+        // snapshot's `ClientHelper`.
         self.buffer
             .get_or_else(key, |key| async move {
                 let request = new_get_request(key, timestamp.clone());
                 let plan = PlanBuilder::new(rpc, keyspace, request)
-                    .resolve_lock(timestamp, retry_options.lock_backoff, keyspace)
+                    .read_lock_hints(hints.clone())
+                    .resolve_lock_for_read(timestamp, retry_options.lock_backoff, keyspace, hints)
                     .retry_multi_region(DEFAULT_REGION_BACKOFF)
                     .merge(CollectSingle)
                     .post_process_default()
@@ -292,12 +303,16 @@ impl<PdC: PdClient> Transaction<PdC> {
             .into_iter()
             .map(move |k| k.into().encode_keyspace(keyspace, KeyMode::Txn));
         let retry_options = self.options.retry_options.clone();
+        let hints = self.lock_hints.clone();
 
+        // client-go `KVSnapshot.batchGetSingleRegion` (txnsnapshot/snapshot.go:591): ForRead
+        // through the snapshot's `ClientHelper`.
         self.buffer
             .batch_get_or_else(keys, move |keys| async move {
                 let request = new_batch_get_request(keys, timestamp.clone());
                 let plan = PlanBuilder::new(rpc, keyspace, request)
-                    .resolve_lock(timestamp, retry_options.lock_backoff, keyspace)
+                    .read_lock_hints(hints.clone())
+                    .resolve_lock_for_read(timestamp, retry_options.lock_backoff, keyspace, hints)
                     .retry_multi_region(retry_options.region_backoff)
                     .merge(Collect)
                     .plan();
@@ -1143,33 +1158,37 @@ impl<PdC: PdClient> Transaction<PdC> {
 
 /// A point get at `u64::MAX` (TiDB's autocommit point get with MaxTS): reads the latest
 /// committed version without a TSO, at high priority, with client-go's lock handling for
-/// such reads (`KVSnapshot.get` with `version == maxTimestamp`):
+/// such reads (`KVSnapshot.get` with `version == maxTimestamp`, txnsnapshot/snapshot.go:880-935):
 ///
 /// - TiKV itself ignores a lock on the read key when the key is the lock's primary and the
 ///   transaction uses neither async commit nor 1PC (`check_ts_conflict_si`).
 /// - Only the *first* lock met blocks the read. If a retry meets a lock of another
 ///   transaction, that transaction started after the read began, so the read may ignore it
-///   (it is passed in `Context.resolved_locks`).
-/// - The first lock is resolved with `caller_start_ts = u64::MAX`: committed or rolled back
-///   transactions are resolved and the read retried; a live transaction for which TiKV answers
-///   `MinCommitTsPushed` is not committed, so the read ignores it; anything else (a live
-///   async-commit transaction) is waited for with the lock backoff.
+///   (snapshot.go:900: `cli.resolvedLocks.Put(lock.TxnID)`).
+/// - The first lock is resolved for read with `caller_start_ts = u64::MAX`
+///   ([`resolve_locks_for_read`](crate::transaction::lock::resolve_locks_for_read)): a live
+///   transaction for which TiKV answers `MinCommitTsPushed` is not committed, so the read
+///   ignores it; a committed one is read through; anything else (a live async-commit
+///   transaction) is waited for with the lock backoff.
+///
+/// `hints` are the snapshot's lock hints (`KVSnapshot.resolvedLocks` / `committedLocks`): they
+/// are sent with every request and kept for the snapshot's later reads.
 async fn get_at_max_ts<PdC: PdClient>(
     rpc: Arc<PdC>,
     keyspace: Keyspace,
     key: Key,
     retry_options: RetryOptions,
+    hints: ReadLockHints,
 ) -> Result<Option<Value>> {
     let mut lock_backoff = retry_options.lock_backoff;
     let mut first_lock: Option<u64> = None;
-    let mut resolved_locks: Vec<u64> = Vec::new();
     loop {
         let mut request = new_get_request(key.clone(), Timestamp::from_version(u64::MAX));
         let ctx = request.context.get_or_insert_with(Default::default);
         ctx.priority = kvrpcpb::CommandPri::High as i32;
-        ctx.resolved_locks = resolved_locks.clone();
         // A lock fails the plan at once (no lock backoff): it is handled below.
         let plan = PlanBuilder::new(rpc.clone(), keyspace, request)
+            .read_lock_hints(hints.clone())
             .resolve_lock(
                 Timestamp::from_version(u64::MAX),
                 Backoff::no_backoff(),
@@ -1186,18 +1205,19 @@ async fn get_at_max_ts<PdC: PdClient>(
         let lock = locks.swap_remove(0);
         match first_lock {
             Some(first) if first != lock.lock_version => {
-                resolved_locks.push(lock.lock_version);
+                hints.put_resolved([lock.lock_version]);
                 continue;
             }
             _ => first_lock = Some(lock.lock_version),
         }
-        let outcome = crate::transaction::lock::resolve_locks_for_max_ts_read(
+        let outcome = crate::transaction::lock::resolve_locks_for_read(
             vec![lock],
+            Timestamp::from_version(u64::MAX),
             rpc.clone(),
             keyspace,
         )
         .await?;
-        resolved_locks.extend(outcome.ignorable);
+        hints.record(&outcome);
         if !outcome.live.is_empty() {
             match lock_backoff.next_delay_duration() {
                 None => return Err(Error::ResolveLockError(outcome.live)),
@@ -2085,6 +2105,81 @@ mod tests {
     /// A point get at `u64::MAX`: high priority, no TSO for the read itself; the first lock
     /// of a live transaction for which TiKV answers `MinCommitTsPushed` is bypassed through
     /// `resolved_locks`, and a later lock of another transaction is bypassed outright.
+    /// R1 (#101): a transaction met through a lock is put into the snapshot's lock hints
+    /// (here `canAccess`: committed at 5, before the read at 10), and every later get and
+    /// batch get of the same snapshot sends them (client-go `KVSnapshot.resolvedLocks` /
+    /// `committedLocks`).
+    #[tokio::test]
+    async fn snapshot_reads_share_lock_hints() {
+        let contexts = Arc::new(Mutex::new(Vec::<(Vec<u64>, Vec<u64>)>::new()));
+        let contexts_captured = contexts.clone();
+        let gets = AtomicUsize::new(0);
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                let ctx = |c: &Option<kvrpcpb::Context>| {
+                    let c = c.as_ref().unwrap();
+                    (c.resolved_locks.clone(), c.committed_locks.clone())
+                };
+                if let Some(req) = req.downcast_ref::<kvrpcpb::GetRequest>() {
+                    contexts_captured.lock().unwrap().push(ctx(&req.context));
+                    let locked =
+                        (gets.fetch_add(1, Ordering::SeqCst) == 0).then(|| kvrpcpb::LockInfo {
+                            key: b"k".to_vec(),
+                            primary_lock: b"p".to_vec(),
+                            lock_version: 3,
+                            lock_ttl: 3000,
+                            ..Default::default()
+                        });
+                    return Ok(Box::new(kvrpcpb::GetResponse {
+                        error: locked.map(|l| kvrpcpb::KeyError {
+                            locked: Some(l),
+                            ..Default::default()
+                        }),
+                        value: b"v".to_vec(),
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                if let Some(req) = req.downcast_ref::<kvrpcpb::BatchGetRequest>() {
+                    contexts_captured.lock().unwrap().push(ctx(&req.context));
+                    return Ok(Box::<kvrpcpb::BatchGetResponse>::default() as Box<dyn Any>);
+                }
+                if let Some(req) = req.downcast_ref::<kvrpcpb::CheckTxnStatusRequest>() {
+                    assert_eq!(req.caller_start_ts, 10);
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        commit_version: 5,
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                if req.is::<kvrpcpb::ResolveLockRequest>() {
+                    return Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>);
+                }
+                panic!("unexpected request {:?}", req.type_id());
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(10),
+            pd_client,
+            TransactionOptions::new_optimistic().read_only(),
+            Keyspace::Disable,
+        );
+        assert_eq!(txn.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
+        assert_eq!(txn.get(b"k2".to_vec()).await.unwrap(), Some(b"v".to_vec()));
+        assert_eq!(
+            txn.batch_get(vec![b"k3".to_vec()]).await.unwrap().count(),
+            0
+        );
+        assert_eq!(
+            *contexts.lock().unwrap(),
+            vec![
+                (vec![], vec![]),
+                // The retry of the first get, then the snapshot's later reads.
+                (vec![], vec![3]),
+                (vec![], vec![3]),
+                (vec![], vec![3]),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn get_at_max_ts_bypasses_uncommitted_locks() {
         let gets = Arc::new(Mutex::new(Vec::<kvrpcpb::GetRequest>::new()));

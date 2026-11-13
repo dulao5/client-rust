@@ -120,6 +120,7 @@ impl<Req: KvRequest + Shardable> Shardable for Dispatch<Req> {
         Dispatch {
             request: self.request.clone_then_apply_shard(shard),
             kv_client: self.kv_client.clone(),
+            lock_hints: self.lock_hints.clone(),
         }
     }
 
