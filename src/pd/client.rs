@@ -13,6 +13,7 @@ use crate::compat::stream_fn;
 use crate::kv::codec;
 use crate::pd::retry::RetryClientTrait;
 use crate::pd::Cluster;
+use crate::pd::LowResolutionTs;
 use crate::pd::RetryClient;
 use crate::proto::keyspacepb;
 use crate::proto::kvrpcpb;
@@ -89,6 +90,13 @@ pub trait PdClient: Send + Sync + 'static {
     /// the coprocessor, snapshot reads) are handed; it has nothing to do with PD. `None`: no
     /// sharing, every resolution starts from scratch (test doubles).
     fn lock_resolver_state(&self) -> Option<&LockResolverState> {
+        None
+    }
+
+    /// The low-resolution timestamp of this cluster client (client-go `pdOracle`'s last TSO):
+    /// implementors that keep one refresh it in [`PdClient::get_timestamp`]. `None`: callers
+    /// fetch a TSO instead.
+    fn low_resolution_ts(&self) -> Option<&LowResolutionTs> {
         None
     }
 
@@ -229,6 +237,8 @@ pub struct PdRpcClient<KvC: KvConnect + Send + Sync + 'static = TikvConnect, Cl 
     region_cache: RegionCache<RetryClient<Cl>>,
     /// See [`PdClient::lock_resolver_state`].
     lock_resolver: LockResolverState,
+    /// See [`PdClient::low_resolution_ts`].
+    low_resolution_ts: LowResolutionTs,
 }
 
 #[async_trait]
@@ -263,6 +273,10 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
         Some(&self.lock_resolver)
     }
 
+    fn low_resolution_ts(&self) -> Option<&LowResolutionTs> {
+        Some(&self.low_resolution_ts)
+    }
+
     async fn all_stores(&self) -> Result<Vec<Store>> {
         let pb_stores = self.region_cache.read_through_all_stores().await?;
         let mut stores = Vec::with_capacity(pb_stores.len());
@@ -274,7 +288,10 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
     }
 
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp> {
-        self.pd.clone().get_timestamp().await
+        let ts = self.pd.clone().get_timestamp().await?;
+        // client-go `GetTimestamp` → `setLastTS` (oracle/oracles/pd.go:220).
+        self.low_resolution_ts.set_last_ts(&ts);
+        Ok(ts)
     }
 
     async fn update_safepoint(self: Arc<Self>, safepoint: u64) -> Result<bool> {
@@ -355,6 +372,7 @@ impl<KvC: KvConnect + Send + Sync + 'static, Cl> PdRpcClient<KvC, Cl> {
             enable_codec,
             region_cache: RegionCache::new(pd),
             lock_resolver: LockResolverState::default(),
+            low_resolution_ts: LowResolutionTs::default(),
         })
     }
 

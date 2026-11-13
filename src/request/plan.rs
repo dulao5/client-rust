@@ -37,10 +37,10 @@ use crate::store::KvClient;
 use crate::store::RegionStore;
 use crate::store::{HasKeyErrors, Store};
 use crate::timestamp::TimestampExt;
-use crate::transaction::lock_backoff_sleep;
 use crate::transaction::resolve_locks_for_read;
 use crate::transaction::resolve_locks_with_expiry;
 use crate::transaction::HasLocks;
+use crate::transaction::LockBackoff;
 use crate::transaction::ReadLockHints;
 use crate::transaction::ResolveLocksContext;
 use crate::transaction::ResolveLocksOptions;
@@ -1312,7 +1312,8 @@ where
 
     async fn execute(&self) -> Result<Self::Result> {
         let mut result = self.inner.execute().await?;
-        let mut clone = self.clone();
+        let clone = self.clone();
+        let mut lock_backoff = LockBackoff::new(self.backoff.clone());
         loop {
             let locks = result.take_locks();
             if locks.is_empty() {
@@ -1353,13 +1354,10 @@ where
                 result = self.inner.execute().await?;
             } else {
                 // client-go `BackoffWithMaxSleepTxnLockFast(msBeforeExpired)`.
-                match lock_backoff_sleep(&mut clone.backoff, found.ms_before_expired) {
+                match lock_backoff.next_wait(found.ms_before_expired) {
                     None => return Err(Error::ResolveLockError(found.live)),
-                    Some(delay_duration) => {
-                        if !delay_duration.is_zero() {
-                            metrics::backoff(BackoffType::TikvLockFast, delay_duration);
-                            sleep(delay_duration).await;
-                        }
+                    Some(wait) => {
+                        wait.wait(pd_client.clone()).await?;
                         result = clone.inner.execute().await?;
                     }
                 }
