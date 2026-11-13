@@ -68,6 +68,12 @@ pub trait Plan: Sized + Clone + Sync + Send + 'static {
         ""
     }
 
+    /// Whether the last attempt was sent with a configurable read timeout shorter than
+    /// `ReadTimeoutShort` (TiDB's `tikv_client_read_timeout`), see [`ReadTimeout`].
+    fn sent_with_read_timeout(&self) -> bool {
+        false
+    }
+
     /// Make the lock resolution inside this plan draw from `budget`, a
     /// [`Backoff::time_budget`] forked for one region of a multi-region request, so that a
     /// region's retries, lock resolution and lock waits share one budget as client-go's
@@ -101,6 +107,8 @@ pub struct ReadTimeout {
     /// Whether each region gets its own first attempt (BatchGet) or the whole read has one
     /// (Get).
     per_region: bool,
+    /// Whether the last attempt carried the deadline (shared like `unused`).
+    last_used: Arc<AtomicBool>,
 }
 
 impl ReadTimeout {
@@ -109,14 +117,23 @@ impl ReadTimeout {
             duration,
             unused: Arc::new(AtomicBool::new(true)),
             per_region,
+            last_used: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// The deadline for the next attempt: `Some` the first time only.
     fn take(&self) -> Option<Duration> {
-        self.unused
-            .swap(false, AtomicOrdering::Relaxed)
-            .then_some(self.duration)
+        let first = self.unused.swap(false, AtomicOrdering::Relaxed);
+        self.last_used.store(first, AtomicOrdering::Relaxed);
+        first.then_some(self.duration)
+    }
+
+    /// Whether the last attempt was sent with this read timeout, and it is shorter than
+    /// `ReadTimeoutShort`: client-go's `isReadReqConfigurableTimeout`
+    /// (internal/locate/replica_selector.go:590-597; only reads carry a `ReadTimeout`).
+    fn last_attempt_used(&self) -> bool {
+        self.last_used.load(AtomicOrdering::Relaxed)
+            && self.duration < crate::store::READ_TIMEOUT_SHORT
     }
 
     /// The deadline of a request split off for one region: unused again for a BatchGet,
@@ -136,6 +153,12 @@ impl<Req: KvRequest> Plan for Dispatch<Req> {
 
     fn label(&self) -> &'static str {
         self.request.label()
+    }
+
+    fn sent_with_read_timeout(&self) -> bool {
+        self.read_timeout
+            .as_ref()
+            .is_some_and(ReadTimeout::last_attempt_used)
     }
 
     async fn execute(&self) -> Result<Self::Result> {
@@ -970,6 +993,19 @@ where
         };
 
         if let Some(server_is_busy) = error.server_is_busy.as_ref() {
+            // TiKV gave up at the deadline of an attempt sent with `tikv_client_read_timeout`:
+            // retry at once with the default timeout, without backing off (client-go
+            // `onReadReqConfigurableTimeout`, internal/locate/region_request.go:1941-1946).
+            // Backing off as serverBusy (2-10 s) would defeat a timeout meant to be short.
+            if server_is_busy.reason.contains("deadline is exceeded")
+                && plan.sent_with_read_timeout()
+            {
+                return ShardStep::Again {
+                    plan,
+                    backoff,
+                    candidate_state,
+                };
+            }
             if !used_fallback && server_is_busy.estimated_wait_ms == 0 {
                 let mut candidate_state = candidate_state;
                 if let Some(peer) = region_store.region_with_leader.leader.as_ref() {
@@ -1435,6 +1471,10 @@ impl<P: Plan, Pr: Process<P::Result>> Plan for ProcessResponse<P, Pr> {
         self.inner.label()
     }
 
+    fn sent_with_read_timeout(&self) -> bool {
+        self.inner.sent_with_read_timeout()
+    }
+
     fn use_budget(&mut self, budget: &Backoff) {
         self.inner.use_budget(budget)
     }
@@ -1487,6 +1527,10 @@ where
 
     fn label(&self) -> &'static str {
         self.inner.label()
+    }
+
+    fn sent_with_read_timeout(&self) -> bool {
+        self.inner.sent_with_read_timeout()
     }
 
     fn use_budget(&mut self, budget: &Backoff) {
@@ -1767,6 +1811,10 @@ where
         self.inner.label()
     }
 
+    fn sent_with_read_timeout(&self) -> bool {
+        self.inner.sent_with_read_timeout()
+    }
+
     fn use_budget(&mut self, budget: &Backoff) {
         self.inner.use_budget(budget)
     }
@@ -1840,6 +1888,10 @@ where
 
     fn label(&self) -> &'static str {
         self.inner.label()
+    }
+
+    fn sent_with_read_timeout(&self) -> bool {
+        self.inner.sent_with_read_timeout()
     }
 
     fn use_budget(&mut self, budget: &Backoff) {
