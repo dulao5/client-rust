@@ -32,7 +32,11 @@ pub struct Config {
 }
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-const DEFAULT_GRPC_MAX_DECODING_MESSAGE_SIZE: usize = 4 * 1024 * 1024; // 4MB
+/// No receive limit, as in client-go (`MaxRecvMsgSize = math.MaxInt64 - 1`,
+/// `internal/client/client.go:82`, applied per call at `:318`). tonic's own default is 4 MiB,
+/// which fails coprocessor responses over wide rows and large BatchGets
+/// (`specs/D07.1-store/client-go-parity.md` P0-3 in tidb-rs).
+const DEFAULT_GRPC_MAX_DECODING_MESSAGE_SIZE: usize = usize::MAX;
 const DEFAULT_GRPC_CONNECTION_COUNT: usize = 1;
 
 impl Default for Config {
@@ -99,7 +103,8 @@ impl Config {
         self
     }
 
-    /// Set the maximum decoding message size for gRPC.
+    /// Set the maximum size of a gRPC message received from TiKV or PD.
+    /// Default: no limit (`usize::MAX`), as in client-go.
     #[must_use]
     pub fn with_grpc_max_decoding_message_size(mut self, size: usize) -> Self {
         self.grpc_max_decoding_message_size = size;
