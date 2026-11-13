@@ -650,7 +650,7 @@ async fn handle_task_once<PdC: PdClient>(
                 "coprocessor: giving up after exhausting retries on region error, region: {:?}",
                 task.region.ver_id()
             );
-            return Err(Error::RegionError(Box::new(region_error)));
+            return Err(region_backoff.exhausted(Error::RegionError(Box::new(region_error))));
         };
         let resolved =
             handle_region_error(ctx.pd_client.clone(), region_error, region_store).await?;
@@ -686,7 +686,7 @@ async fn handle_task_once<PdC: PdClient>(
             // TiDB `bo.BackoffWithMaxSleepTxnLockFast(msBeforeExpired)` (coprocessor.go:1843).
             match lock_backoff.next_wait(read.ms_before_expired) {
                 Some(wait) => wait.wait(ctx.pd_client.clone()).await?,
-                None => return Err(Error::ResolveLockError(read.live)),
+                None => return Err(lock_backoff.exhausted(Error::ResolveLockError(read.live))),
             }
         }
         // Retry the same ranges at the same start_ts and page size.
@@ -751,7 +751,7 @@ async fn retry_after_backoff<PdC: PdClient>(
             sleep(delay).await;
             resplit(ctx, task).await
         }
-        None => Err(error),
+        None => Err(region_backoff.exhausted(error)),
     }
 }
 

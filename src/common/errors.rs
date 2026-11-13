@@ -78,6 +78,16 @@ pub enum Error {
     /// Errors caused by changes of region information
     #[error("Region error: {0:?}")]
     RegionError(Box<ProtoRegionError>),
+    /// A read's retry budget ([`Backoff::time_budget`](crate::Backoff::time_budget)) ran out.
+    /// `kind` is the kind of error it slept on longest, which client-go turns into the error
+    /// it returns (`longestSleepCfg`, config/retry/backoff.go:175-180; see
+    /// [`BackoffType::go_config`](crate::metrics::BackoffType::go_config)); `last` is the
+    /// error the last attempt met.
+    #[error("{} backoff budget exceeded, last error: {last}", kind.go_config())]
+    BackoffExhausted {
+        kind: crate::metrics::BackoffType,
+        last: Box<Error>,
+    },
     /// Whether the transaction is committed or not is undetermined
     #[error("Whether the transaction is committed or not is undetermined")]
     UndeterminedError(Box<Error>),

@@ -415,7 +415,9 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
             if let Some(region_error) = response.region_error() {
                 let backoff_type = metrics::backoff_type_for_region_error(&region_error);
                 let Some(delay) = region_backoff.next_delay_for(backoff_type) else {
-                    return Err(Error::RegionError(Box::new(region_error)));
+                    return Err(
+                        region_backoff.exhausted(Error::RegionError(Box::new(region_error)))
+                    );
                 };
                 let retry_immediately =
                     handle_region_error(self.pd_client.clone(), region_error, region_store).await?;
@@ -476,7 +478,7 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
             BackoffType::RegionMiss
         };
         let Some(delay) = backoff.next_delay_for(t) else {
-            return Err(error);
+            return Err(backoff.exhausted(error));
         };
         metrics::backoff(t, delay);
         sleep(delay).await;

@@ -312,9 +312,9 @@ pub(crate) fn region_error(e: &errorpb::Error, store_id: u64) {
 // Backoff.
 
 /// client-go backoff configs, by their metric label (`metrics/shortcuts.go`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
-pub(crate) enum BackoffType {
+pub enum BackoffType {
     /// `BoTiKVRPC`: gRPC errors.
     TikvRpc,
     /// `BoTxnLockFast` (label `tikvLockFast`): waiting for a live lock on the read path.
@@ -332,6 +332,34 @@ pub(crate) enum BackoffType {
 }
 
 pub(crate) const BACKOFF_COUNT: usize = BackoffType::TxnNotFound as usize + 1;
+
+impl BackoffType {
+    /// client-go's config name (`config/retry/config.go:122-140`), which TiDB maps to an error:
+    /// `tikvRPC` → `ErrTiKVServerTimeout`, `regionMiss` / `regionScheduling` →
+    /// `ErrRegionUnavailable`, `tikvServerBusy` → `ErrTiKVServerBusy`, `staleCommand` →
+    /// `ErrTiKVStaleCommand`, `txnLockFast` / `txnNotFound` → `ErrResolveLockTimeout`.
+    pub fn go_config(self) -> &'static str {
+        match self {
+            BackoffType::TikvRpc => "tikvRPC",
+            BackoffType::TikvLockFast => "txnLockFast",
+            BackoffType::RegionMiss => "regionMiss",
+            BackoffType::RegionScheduling => "regionScheduling",
+            BackoffType::ServerBusy => "tikvServerBusy",
+            BackoffType::StaleCommand => "staleCommand",
+            BackoffType::TxnNotFound => "txnNotFound",
+        }
+    }
+
+    pub(crate) const ALL: [BackoffType; BACKOFF_COUNT] = [
+        BackoffType::TikvRpc,
+        BackoffType::TikvLockFast,
+        BackoffType::RegionMiss,
+        BackoffType::RegionScheduling,
+        BackoffType::ServerBusy,
+        BackoffType::StaleCommand,
+        BackoffType::TxnNotFound,
+    ];
+}
 const BACKOFF_LABELS: [&str; BACKOFF_COUNT] = [
     "tikvRPC",
     "tikvLockFast",

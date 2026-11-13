@@ -1249,7 +1249,7 @@ async fn get_at_max_ts<PdC: PdClient>(
         if !outcome.live.is_empty() {
             // `bo.BackoffWithMaxSleepTxnLockFast(msBeforeExpired)` (snapshot.go:927).
             match lock_backoff.next_wait(outcome.ms_before_expired) {
-                None => return Err(Error::ResolveLockError(outcome.live)),
+                None => return Err(lock_backoff.exhausted(Error::ResolveLockError(outcome.live))),
                 Some(wait) => wait.wait(rpc.clone()).await?,
             }
         }
@@ -2813,5 +2813,76 @@ mod tests {
             start.elapsed()
         );
         txn.rollback().await.unwrap();
+    }
+
+    /// Lucky's note on client-rust#12: when the budget runs out, report the kind of error it
+    /// slept on longest, as client-go does (`longestSleepCfg`, config/retry/backoff.go:175-180),
+    /// with the last error inside.
+    #[tokio::test(start_paused = true)]
+    async fn test_exhausted_budget_reports_the_longest_sleep() {
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |_: &dyn Any| {
+                Ok(Box::new(kvrpcpb::GetResponse {
+                    region_error: Some(stale_command()),
+                    ..Default::default()
+                }) as Box<dyn Any>)
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(100),
+            pd_client,
+            go_budget(),
+            Keyspace::Disable,
+        );
+        match txn.get(b"k".to_vec()).await {
+            Err(crate::Error::BackoffExhausted { kind, last }) => {
+                assert_eq!(kind, crate::metrics::BackoffType::StaleCommand);
+                assert_eq!(kind.go_config(), "staleCommand");
+                assert!(
+                    matches!(*last, crate::Error::RegionError(ref e) if e.stale_command.is_some()),
+                    "{last:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        txn.rollback().await.unwrap();
+    }
+
+    /// Lucky's note on client-rust#12: a read's lock resolution must draw from the read's
+    /// started budget; handing it the unstarted template is caught in debug builds.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "unstarted time budget")]
+    async fn test_read_lock_resolution_requires_a_started_budget() {
+        use crate::request::Plan;
+        use crate::request::PlanBuilder;
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |_: &dyn Any| Ok(Box::<kvrpcpb::GetResponse>::default() as Box<dyn Any>),
+        )));
+        let hints = crate::transaction::ReadLockHints::new(100);
+        let request = crate::transaction::lowering::new_get_request(
+            b"k".to_vec().into(),
+            Timestamp::from_version(100),
+        );
+        // As the scanner does: one region, no `RetryableMultiRegion` to start the budget.
+        let region_store = pd_client
+            .clone()
+            .map_region_to_store(MockPdClient::region1())
+            .await
+            .unwrap();
+        let plan = PlanBuilder::new(pd_client, Keyspace::Disable, request)
+            .read_lock_hints(hints.clone())
+            .single_region_with_store(region_store)
+            .await
+            .unwrap()
+            .resolve_lock_for_read(
+                Timestamp::from_version(100),
+                crate::Backoff::time_budget(20_000),
+                Keyspace::Disable,
+                hints,
+                true,
+            )
+            .plan();
+        let _ = plan.execute().await;
     }
 }

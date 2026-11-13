@@ -217,6 +217,12 @@ pub(crate) struct LockBackoff {
 }
 
 impl LockBackoff {
+    /// The error to return when the lock backoff gives up after `error`
+    /// ([`Backoff::exhausted`]).
+    pub(crate) fn exhausted(&self, error: Error) -> Error {
+        self.backoff.exhausted(error)
+    }
+
     /// The sleep of a round that refreshes the low-resolution timestamp.
     pub(crate) const REFRESH_SLEEP: Duration = Duration::from_millis(1);
 
@@ -808,7 +814,7 @@ async fn resolve_lock_with_retry(
                             sleep(duration).await;
                             continue;
                         }
-                        None => return Err(Error::LeaderNotFound { region }),
+                        None => return Err(backoff.exhausted(Error::LeaderNotFound { region })),
                     }
                 }
                 Err(err) => return Err(err),
@@ -844,7 +850,7 @@ async fn resolve_lock_with_retry(
                             }
                             continue;
                         }
-                        None => return Err(Error::RegionError(e)),
+                        None => return Err(backoff.exhausted(Error::RegionError(e))),
                     }
                 }
                 Some(e) => return Err(e),
@@ -876,7 +882,7 @@ async fn resolve_lock_with_retry(
                     sleep(duration).await;
                     continue;
                 }
-                None => return Err(e),
+                None => return Err(backoff.exhausted(e)),
             },
             Err(e) => return Err(e),
         }
@@ -1574,7 +1580,7 @@ impl LockResolver {
                         sleep(duration).await;
                         continue;
                     }
-                    return Err(Error::TxnNotFound(txn_not_found));
+                    return Err(backoff.exhausted(Error::TxnNotFound(txn_not_found)));
                 }
                 Err(err) => return Err(err),
             }

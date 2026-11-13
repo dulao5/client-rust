@@ -737,7 +737,7 @@ where
                     candidate_state,
                 }
             }
-            None => ShardStep::Done(Err(error)),
+            None => ShardStep::Done(Err(backoff.exhausted(error))),
         }
     }
 
@@ -1000,7 +1000,7 @@ where
                     plan.label(),
                     region_ver_id
                 );
-                Err(Error::RegionError(Box::new(error)))
+                Err(backoff.exhausted(Error::RegionError(Box::new(error))))
             }
         }
     }
@@ -1034,7 +1034,7 @@ where
                 sleep(duration).await;
                 Self::single_plan_handler(context, plan, backoff).await
             }
-            None => Err(error),
+            None => Err(backoff.exhausted(error)),
         }
     }
 }
@@ -1184,7 +1184,17 @@ where
             terminal_on_undetermined: self.terminal_on_undetermined,
             terminal_on_dispatch_error: self.terminal_on_dispatch_error,
         };
-        Self::single_plan_handler(context, self.inner.clone(), self.backoff.clone()).await
+        let mut inner = self.inner.clone();
+        let mut backoff = self.backoff.clone();
+        if backoff.is_unstarted_time_budget() {
+            // A time budget the caller did not start (reads start theirs with
+            // `RetryOptions::for_read`; a write's comes straight from the template): one per
+            // execution, which the plan's lock resolution draws from too, so that budgets
+            // never multiply (client-rust#12 review).
+            backoff = backoff.start();
+            inner.use_budget(&backoff);
+        }
+        Self::single_plan_handler(context, inner, backoff).await
     }
 }
 
@@ -1270,7 +1280,7 @@ where
                         sleep(duration).await;
                         continue;
                     }
-                    None => return Err(e),
+                    None => return Err(backoff.exhausted(e)),
                 },
                 Err(e) => return Err(e),
             }
@@ -1435,6 +1445,17 @@ where
     }
 
     async fn execute(&self) -> Result<Self::Result> {
+        // A read's lock resolution and lock waits draw from the read's own budget (client-go's
+        // `bo`): a read path that hands over the unstarted template instead would give every
+        // execution a budget of its own again (client-rust#12 review). Start it with
+        // `RetryOptions::for_read`, or let `RetryableMultiRegion` start it.
+        debug_assert!(
+            self.read_hints.is_none()
+                || !(self.backoff.is_unstarted_time_budget()
+                    || self.region_backoff.is_unstarted_time_budget()),
+            "{}: a read's lock resolution has an unstarted time budget",
+            self.inner.label()
+        );
         let mut result = self.inner.execute().await?;
         let clone = self.clone();
         let mut lock_backoff = LockBackoff::new(self.backoff.clone());
@@ -1481,7 +1502,7 @@ where
             } else {
                 // client-go `BackoffWithMaxSleepTxnLockFast(msBeforeExpired)`.
                 match lock_backoff.next_wait(found.ms_before_expired) {
-                    None => return Err(Error::ResolveLockError(found.live)),
+                    None => return Err(lock_backoff.exhausted(Error::ResolveLockError(found.live))),
                     Some(wait) => {
                         wait.wait(pd_client.clone()).await?;
                         result = clone.inner.execute().await?;
