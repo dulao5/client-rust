@@ -140,6 +140,11 @@ impl<C: RetryClientTrait> RegionCache<C> {
             self.inner_client.clone().get_region(key.into()),
         )
         .await?;
+        log::debug!(
+            "region cache: loaded region {} (by key) from PD, leader store {:?}",
+            region.id(),
+            region.leader.as_ref().map(|l| l.store_id)
+        );
         self.add_region(region.clone()).await;
         Ok(region)
     }
