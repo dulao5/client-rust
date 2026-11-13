@@ -2296,8 +2296,8 @@ mod tests {
 
     /// #8 review: when the low-resolution timestamp says the lock has expired but TiKV (with
     /// that timestamp) still reports it live, the retry is immediate; the second such retry
-    /// first refreshes the timestamp with a TSO, which lets TiKV roll the lock back. No
-    /// attempt is spent and the read succeeds.
+    /// first refreshes the timestamp with a TSO (and sleeps 1 ms), which lets TiKV roll the
+    /// lock back. A lock backoff of a single 1 ms step is enough.
     #[tokio::test(start_paused = true)]
     async fn max_ts_get_refreshes_the_ts_when_stuck_at_expiry() {
         // TSO fetches: 1000, 2000, ...; the lock expired at 999 by its TTL, but TiKV only
@@ -2311,13 +2311,38 @@ mod tests {
                 .read_only()
                 .retry_options(crate::RetryOptions::new(
                     crate::Backoff::no_jitter_backoff(2, 500, 10),
-                    crate::Backoff::no_backoff(),
+                    crate::Backoff::no_jitter_backoff(1, 1, 1),
                 )),
             Keyspace::Disable,
         );
-        // With no lock backoff at all, only free (zero-time) retries can succeed.
         assert_eq!(txn.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
         assert_eq!(tso_fetches.load(Ordering::SeqCst), 2);
+    }
+
+    /// #8 review (non-blocking): if TiKV keeps a lock live even with fresh timestamps while
+    /// every round sees no time left, the read neither spins nor waits forever: each refresh
+    /// round sleeps 1 ms charged to the lock backoff, so it gives up once the budget's worth
+    /// of rounds is spent (here 3 steps of 2 ms → 6 refresh rounds, 12 rounds in all).
+    #[tokio::test(start_paused = true)]
+    async fn max_ts_get_gives_up_when_stuck_at_expiry_forever() {
+        // TiKV never rolls the lock back (rollback_from is out of reach).
+        let (pd, tso_fetches) = low_res_cluster(500, 499, i64::MAX, |n| 1000 + 1000 * n as i64);
+        pd.clone().get_timestamp().await.unwrap();
+        let mut txn = Transaction::new(
+            Timestamp::from_version(u64::MAX),
+            pd,
+            TransactionOptions::new_optimistic()
+                .read_only()
+                .retry_options(crate::RetryOptions::new(
+                    crate::Backoff::no_jitter_backoff(2, 500, 10),
+                    crate::Backoff::no_jitter_backoff(2, 2, 3),
+                )),
+            Keyspace::Disable,
+        );
+        let err = txn.get(b"k".to_vec()).await.unwrap_err();
+        assert!(matches!(err, crate::Error::ResolveLockError(_)), "{err:?}");
+        // The initial fetch plus one per refresh round.
+        assert_eq!(tso_fetches.load(Ordering::SeqCst), 1 + 6);
     }
 
     #[tokio::test]
