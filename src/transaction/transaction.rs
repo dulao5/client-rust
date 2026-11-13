@@ -1197,6 +1197,7 @@ async fn get_at_max_ts<PdC: PdClient>(
 ) -> Result<Option<Value>> {
     let mut lock_backoff = retry_options.lock_backoff;
     let mut first_lock: Option<u64> = None;
+    let mut zero_streak = 0;
     loop {
         let mut request = new_get_request(key.clone(), Timestamp::from_version(u64::MAX));
         let ctx = request.context.get_or_insert_with(Default::default);
@@ -1240,6 +1241,7 @@ async fn get_at_max_ts<PdC: PdClient>(
             match crate::transaction::lock_backoff_sleep(
                 &mut lock_backoff,
                 outcome.ms_before_expired,
+                &mut zero_streak,
             ) {
                 None => return Err(Error::ResolveLockError(outcome.live)),
                 Some(delay) => tokio::time::sleep(delay).await,

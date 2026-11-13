@@ -538,9 +538,18 @@ async fn run_task<PdC: PdClient>(
     // As in TiDB, one backoff budget covers a task and everything it is split into.
     let mut region_backoff = ctx.retry_options.region_backoff.clone();
     let mut lock_backoff = ctx.retry_options.lock_backoff.clone();
+    let mut lock_zero_streak = 0;
     let mut remains = VecDeque::from([task]);
     while let Some(task) = remains.pop_front() {
-        match handle_task_once(ctx, task, &mut region_backoff, &mut lock_backoff).await {
+        match handle_task_once(
+            ctx,
+            task,
+            &mut region_backoff,
+            &mut lock_backoff,
+            &mut lock_zero_streak,
+        )
+        .await
+        {
             Ok(outcome) => {
                 if let Some(response) = outcome.response {
                     if tx.send(TaskMessage::Response(Ok(response))).await.is_err() {
@@ -566,6 +575,7 @@ async fn handle_task_once<PdC: PdClient>(
     mut task: CopTask,
     region_backoff: &mut Backoff,
     lock_backoff: &mut Backoff,
+    lock_zero_streak: &mut u32,
 ) -> Result<TaskOutcome> {
     let region_store = match ctx
         .pd_client
@@ -679,7 +689,7 @@ async fn handle_task_once<PdC: PdClient>(
         ctx.lock_hints.record(ctx.timestamp.version(), &read);
         if !read.live.is_empty() {
             // TiDB `bo.BackoffWithMaxSleepTxnLockFast(msBeforeExpired)` (coprocessor.go:1843).
-            match lock_backoff_sleep(lock_backoff, read.ms_before_expired) {
+            match lock_backoff_sleep(lock_backoff, read.ms_before_expired, lock_zero_streak) {
                 Some(delay) if !delay.is_zero() => {
                     metrics::backoff(BackoffType::TikvLockFast, delay);
                     sleep(delay).await

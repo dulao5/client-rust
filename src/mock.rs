@@ -80,6 +80,12 @@ pub struct MockPdClient {
     /// Shared lock-resolution state, as the real client has one per cluster client.
     #[new(default)]
     lock_resolver: crate::transaction::LockResolverState,
+    /// As the real client: refreshed by `get_timestamp`.
+    #[new(default)]
+    low_resolution_ts: crate::pd::LowResolutionTs,
+    /// Optional override for `get_timestamp` (default: `Timestamp::default()`).
+    #[new(default)]
+    timestamp_hook: Option<Arc<dyn Fn() -> Timestamp + Send + Sync + 'static>>,
     /// Optional override for `map_region_to_store`.
     #[new(default)]
     map_region_to_store_hook:
@@ -123,6 +129,15 @@ impl KvConnect for MockKvConnect {
 impl MockPdClient {
     pub fn default() -> MockPdClient {
         MockPdClient::new(MockKvClient::default())
+    }
+
+    /// Override `get_timestamp` (a TSO clock the test controls).
+    pub fn with_timestamp_hook<F>(mut self, hook: F) -> MockPdClient
+    where
+        F: Fn() -> Timestamp + Send + Sync + 'static,
+    {
+        self.timestamp_hook = Some(Arc::new(hook));
+        self
     }
 
     pub fn with_map_region_to_store_hook<F>(mut self, hook: F) -> MockPdClient
@@ -225,6 +240,10 @@ impl PdClient for MockPdClient {
         Some(&self.lock_resolver)
     }
 
+    fn low_resolution_ts(&self) -> Option<&crate::pd::LowResolutionTs> {
+        Some(&self.low_resolution_ts)
+    }
+
     async fn map_region_to_store(self: Arc<Self>, region: RegionWithLeader) -> Result<RegionStore> {
         if let Some(hook) = &self.map_region_to_store_hook {
             return hook(region);
@@ -262,7 +281,12 @@ impl PdClient for MockPdClient {
     }
 
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp> {
-        Ok(Timestamp::default())
+        let ts = self
+            .timestamp_hook
+            .as_ref()
+            .map_or_else(Timestamp::default, |hook| hook());
+        self.low_resolution_ts.set_last_ts(&ts);
+        Ok(ts)
     }
 
     async fn update_safepoint(self: Arc<Self>, _safepoint: u64) -> Result<bool> {

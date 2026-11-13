@@ -20,6 +20,7 @@ use crate::backoff::Backoff;
 use crate::backoff::DEFAULT_REGION_BACKOFF;
 use crate::backoff::OPTIMISTIC_BACKOFF;
 use crate::kv::HexRepr;
+use crate::pd::LowResolutionTs;
 use crate::pd::PdClient;
 use crate::Key;
 
@@ -170,19 +171,27 @@ impl ReadLocks {
 /// [`resolve_locks_for_read`] / [`resolve_locks_with_expiry`] found: client-go
 /// `bo.BackoffWithMaxSleepTxnLockFast(msBeforeExpired)` (txnsnapshot/snapshot.go:582, :927;
 /// TiDB store/copr/coprocessor.go:1843), called only when `msBeforeExpired > 0`. The next
-/// delay of `backoff`, capped at the time left until the first live lock expires; zero, and
-/// no attempt spent, when that time is 0 (retry at once, as client-go). `None` when the
-/// backoff is exhausted.
+/// delay of `backoff`, capped at the time left until the first live lock expires. When that
+/// time is 0 the retry is immediate, as client-go; but every second such retry in a row
+/// (`zero_streak`) spends one attempt without sleeping, so a lock that keeps looking expired
+/// yet live (a stale low-resolution timestamp, R7) cannot retry forever (#3 review). `None`
+/// when the backoff is exhausted.
 ///
 /// One difference: client-go's budget is total sleep time, so capped sleeps use up less of
 /// it; `Backoff` counts attempts, so each capped sleep still spends one.
 pub(crate) fn lock_backoff_sleep(
     backoff: &mut Backoff,
     ms_before_expired: i64,
+    zero_streak: &mut u32,
 ) -> Option<Duration> {
     if ms_before_expired <= 0 {
+        *zero_streak += 1;
+        if zero_streak.is_multiple_of(2) {
+            return backoff.next_delay_duration().map(|_| Duration::ZERO);
+        }
         return Some(Duration::ZERO);
     }
+    *zero_streak = 0;
     let cap = Duration::from_millis(ms_before_expired as u64);
     backoff.next_delay_duration().map(|d| d.min(cap))
 }
@@ -311,7 +320,8 @@ async fn resolve_locks_impl(
     if !locks.is_empty() {
         metrics::lock_resolver(LockMetric::Resolve);
     }
-    let ts = pd_client.clone().get_timestamp().await?;
+    // client-go `getTxnStatusFromLock`: `GetLowResolutionTimestamp` (lock_resolver.go:723).
+    let ts = low_resolution_timestamp(pd_client.clone()).await?;
     let caller_start_ts = timestamp.version();
     let current_ts = ts.version();
 
@@ -769,6 +779,24 @@ pub const RESOLVED_CACHE_SIZE: usize = 2048;
 pub struct LockResolverState {
     resolved: std::sync::Mutex<ResolvedCache>,
     in_flight: std::sync::Mutex<HashMap<(u64, u64), InFlight>>,
+}
+
+/// The low-resolution timestamp (client-go `GetLowResolutionTimestamp`, pd.go:577): the
+/// latest TSO this cluster client has fetched, refreshed by every TSO fetch (`setLastTS` in
+/// `GetTimestamp`, pd.go:220). Lock resolution uses it as CheckTxnStatus's `current_ts` and
+/// for lock expiry (`IsExpired` / `UntilExpired`, pd.go:206, :514), so resolving a lock costs
+/// no PD round trip. A read that fetched no TSO (a max-ts point get) may therefore see a
+/// timestamp up to [`LowResolutionTs::MAX_AGE`] old and treat a just-expired lock as live, as
+/// client-go does. When none is fresh (or the client keeps none: test doubles), a TSO is
+/// fetched, which refreshes it.
+pub(crate) async fn low_resolution_timestamp(pd_client: Arc<impl PdClient>) -> Result<Timestamp> {
+    if let Some(ts) = pd_client
+        .low_resolution_ts()
+        .and_then(LowResolutionTs::low_resolution_ts)
+    {
+        return Ok(ts);
+    }
+    pd_client.get_timestamp().await
 }
 
 type InFlight = futures::future::Shared<futures::future::BoxFuture<'static, bool>>;
@@ -1283,7 +1311,8 @@ impl LockResolver {
             Err(err) => return Err(err),
         };
 
-        let current = pd_client.clone().get_timestamp().await?;
+        // client-go `IsExpired` on the low-resolution timestamp (lock_resolver.go:537).
+        let current = low_resolution_timestamp(pd_client.clone()).await?;
         status.check_ttl(current);
         match status.kind {
             TransactionStatusKind::Committed(_) => {
@@ -1383,7 +1412,8 @@ impl LockResolver {
             {
                 Ok(status) => return Ok(status),
                 Err(Error::TxnNotFound(txn_not_found)) => {
-                    let current = pd_client.clone().get_timestamp().await?;
+                    // client-go `UntilExpired` on the low-resolution timestamp (:748).
+                    let current = low_resolution_timestamp(pd_client.clone()).await?;
                     if lock_until_expired_ms(lock.lock_version, lock.lock_ttl, current) <= 0 {
                         warn!(
                             "lock txn not found, lock has expired, lock {:?}, caller_start_ts {}, current_ts {}",
@@ -1822,21 +1852,34 @@ mod tests {
     /// left; with no time left the retry is immediate and spends no attempt.
     #[test]
     fn lock_backoff_sleep_is_capped_by_expiry() {
-        let mut backoff = Backoff::no_jitter_backoff(100, 1000, 2);
+        let mut backoff = Backoff::no_jitter_backoff(100, 1000, 3);
+        let mut zero_streak = 0;
+        // No time left: an immediate retry that spends no attempt...
         assert_eq!(
-            lock_backoff_sleep(&mut backoff, 0),
+            lock_backoff_sleep(&mut backoff, 0, &mut zero_streak),
             Some(std::time::Duration::ZERO)
         );
         assert_eq!(backoff.current_attempts(), 0);
+        // ...but the second in a row spends one, still without sleeping (#3 review).
         assert_eq!(
-            lock_backoff_sleep(&mut backoff, 30),
+            lock_backoff_sleep(&mut backoff, 0, &mut zero_streak),
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(backoff.current_attempts(), 1);
+        // Time left: the delay (200 ms), capped at it; the streak restarts.
+        assert_eq!(
+            lock_backoff_sleep(&mut backoff, 30, &mut zero_streak),
             Some(std::time::Duration::from_millis(30))
         );
+        assert_eq!(zero_streak, 0);
         assert_eq!(
-            lock_backoff_sleep(&mut backoff, 10_000),
-            Some(std::time::Duration::from_millis(200))
+            lock_backoff_sleep(&mut backoff, 10_000, &mut zero_streak),
+            Some(std::time::Duration::from_millis(400))
         );
-        assert_eq!(lock_backoff_sleep(&mut backoff, 10_000), None);
+        assert_eq!(
+            lock_backoff_sleep(&mut backoff, 10_000, &mut zero_streak),
+            None
+        );
     }
 
     /// R5: lite resolution (client-go `resolveLock`, lock_resolver.go:1204-1271). A
@@ -2146,6 +2189,98 @@ mod tests {
         assert!(waiter.await.unwrap().is_ok());
         assert_eq!(sends.load(Ordering::SeqCst), 2);
         assert!(state.in_flight.lock().unwrap().is_empty());
+    }
+
+    /// R7: lock resolution reads the time from the low-resolution timestamp (the latest TSO
+    /// this client fetched) instead of fetching a TSO, as client-go (`getTxnStatusFromLock`,
+    /// lock_resolver.go:723; `IsExpired`, :537). A max-ts point get fetches no TSO, so the
+    /// timestamp can be stale: here the last TSO is at physical 1000 ms, the PD clock has
+    /// moved to 2000 ms, and a lock that expires at 1100 ms is still treated as live, with
+    /// 100 ms left (client-go behaves the same; see tidb-rs specs/D07.1-store/
+    /// mixed-cluster-locks.md). Once the timestamp is older than `LowResolutionTs::MAX_AGE`, a
+    /// TSO is fetched and the lock is seen as expired.
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_lock_resolution_uses_low_resolution_ts() {
+        let physical = Arc::new(AtomicU64::new(1000));
+        let tso_fetches = Arc::new(AtomicUsize::new(0));
+        let current_ts_seen = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        let (physical_c, fetches_c, seen_c) = (
+            physical.clone(),
+            tso_fetches.clone(),
+            current_ts_seen.clone(),
+        );
+        let lock = kvrpcpb::LockInfo {
+            key: vec![1],
+            primary_lock: vec![1],
+            lock_version: Timestamp {
+                physical: 900,
+                ..Default::default()
+            }
+            .version(),
+            lock_ttl: 200,
+            txn_size: 100,
+            ..Default::default()
+        };
+        let lock_c = lock.clone();
+        let client = Arc::new(
+            MockPdClient::new(MockKvClient::with_dispatch_hook(move |req: &dyn Any| {
+                if let Some(req) = req.downcast_ref::<kvrpcpb::CheckTxnStatusRequest>() {
+                    seen_c
+                        .lock()
+                        .unwrap()
+                        .push(Timestamp::from_version(req.current_ts).physical);
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        lock_ttl: 200,
+                        lock_info: Some(lock_c.clone()),
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                panic!("unexpected request type: {:?}", req.type_id());
+            }))
+            .with_timestamp_hook(move || {
+                fetches_c.fetch_add(1, Ordering::SeqCst);
+                Timestamp {
+                    physical: physical_c.load(Ordering::SeqCst) as i64,
+                    ..Default::default()
+                }
+            }),
+        );
+        // Some earlier read fetched a TSO at 1000 ms.
+        client.clone().get_timestamp().await.unwrap();
+        physical.store(2000, Ordering::SeqCst);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+
+        let read = resolve_locks_for_read(
+            vec![lock.clone()],
+            Timestamp::from_version(u64::MAX),
+            client.clone(),
+            Keyspace::Disable,
+            true,
+        )
+        .await
+        .unwrap();
+        // No new TSO: the lock looks live with 100 ms left.
+        assert_eq!(tso_fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(*current_ts_seen.lock().unwrap(), vec![1000]);
+        assert_eq!(read.live.len(), 1);
+        assert_eq!(read.ms_before_expired, 100);
+
+        // Past MAX_AGE the next resolution fetches a TSO (at 3000 ms).
+        physical.store(3000, Ordering::SeqCst);
+        tokio::time::advance(crate::pd::LowResolutionTs::MAX_AGE).await;
+        let read = resolve_locks_for_read(
+            vec![lock],
+            Timestamp::from_version(u64::MAX),
+            client,
+            Keyspace::Disable,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tso_fetches.load(Ordering::SeqCst), 2);
+        assert_eq!(*current_ts_seen.lock().unwrap(), vec![1000, 3000]);
+        assert_eq!(read.ms_before_expired, 0);
     }
 
     /// `ReadLockHints` (client-go `util.TSSet` pair): `get_all` is `None` while empty, the

@@ -1313,6 +1313,7 @@ where
     async fn execute(&self) -> Result<Self::Result> {
         let mut result = self.inner.execute().await?;
         let mut clone = self.clone();
+        let mut zero_streak = 0;
         loop {
             let locks = result.take_locks();
             if locks.is_empty() {
@@ -1353,7 +1354,11 @@ where
                 result = self.inner.execute().await?;
             } else {
                 // client-go `BackoffWithMaxSleepTxnLockFast(msBeforeExpired)`.
-                match lock_backoff_sleep(&mut clone.backoff, found.ms_before_expired) {
+                match lock_backoff_sleep(
+                    &mut clone.backoff,
+                    found.ms_before_expired,
+                    &mut zero_streak,
+                ) {
                     None => return Err(Error::ResolveLockError(found.live)),
                     Some(delay_duration) => {
                         if !delay_duration.is_zero() {
