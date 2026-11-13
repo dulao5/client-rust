@@ -164,6 +164,11 @@ impl<C: RetryClientTrait> RegionCache<C> {
         )
         .await;
         if let Ok(region) = &result {
+            log::debug!(
+                "region cache: loaded region {} (by id) from PD, leader store {:?}",
+                region.id(),
+                region.leader.as_ref().map(|l| l.store_id)
+            );
             self.add_region(region.clone()).await;
         }
 
