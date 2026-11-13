@@ -442,6 +442,7 @@ pub(crate) async fn send_coprocessor_request<PdC: PdClient>(
         .get_or_insert(kvrpcpb::Context::default())
         .api_version = keyspace.api_version().into();
 
+    let start_ts = timestamp.version();
     let ctx = Arc::new(CopContext {
         pd_client,
         keyspace,
@@ -451,7 +452,7 @@ pub(crate) async fn send_coprocessor_request<PdC: PdClient>(
         desc: req.desc,
         max_paging_size,
         retry_options: req.retry_options.unwrap_or(default_retry_options),
-        lock_hints: ReadLockHints::default(),
+        lock_hints: ReadLockHints::new(start_ts),
     });
 
     let task_count = tasks.len();
@@ -670,7 +671,7 @@ async fn handle_task_once<PdC: PdClient>(
             ctx.keyspace,
         )
         .await?;
-        ctx.lock_hints.record(&read);
+        ctx.lock_hints.record(ctx.timestamp.version(), &read);
         let live_locks = read.live;
         if !live_locks.is_empty() {
             match lock_backoff.next_delay_duration() {

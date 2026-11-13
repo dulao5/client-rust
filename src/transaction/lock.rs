@@ -123,8 +123,18 @@ pub(crate) struct ReadLocks {
 /// coprocessor request) sends the whole sets in `Context.resolved_locks` /
 /// `Context.committed_locks`, as `ClientHelper.SendReqCtx` does with `GetAll()`
 /// (txnsnapshot/client_helper.go). Cheap to clone: the sets are shared.
-#[derive(Clone, Debug, Default)]
-pub struct ReadLockHints(Arc<std::sync::RwLock<HintSets>>);
+///
+/// **The sets are only valid for one fixed read timestamp.** Whether a transaction may be
+/// ignored (committed after the read, min_commit_ts pushed past it) or read through
+/// (committed at or before it) depends on the read's timestamp, so the hints must never be
+/// shared by reads at different timestamps: a future read-committed mode, a pessimistic
+/// `for_update_ts` read or a stale read needs its own hints. The timestamp is recorded at
+/// creation and checked (`debug_assert`) whenever results are recorded.
+#[derive(Clone, Debug)]
+pub struct ReadLockHints {
+    read_ts: u64,
+    sets: Arc<std::sync::RwLock<HintSets>>,
+}
 
 #[derive(Debug, Default)]
 struct HintSets {
@@ -133,32 +143,50 @@ struct HintSets {
 }
 
 impl ReadLockHints {
+    /// Empty hints for reads at `read_ts`.
+    pub fn new(read_ts: u64) -> ReadLockHints {
+        ReadLockHints {
+            read_ts,
+            sets: Arc::default(),
+        }
+    }
+
+    /// The read timestamp these hints are valid for.
+    pub fn read_ts(&self) -> u64 {
+        self.read_ts
+    }
+
     /// Add transactions whose locks the read may ignore (`resolvedLocks.Put`).
     pub fn put_resolved(&self, txns: impl IntoIterator<Item = u64>) {
-        let mut sets = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut sets = self.sets.write().unwrap_or_else(|e| e.into_inner());
         sets.resolved.extend(txns);
     }
 
     /// Add transactions the read may read through (`committedLocks.Put`).
     pub fn put_committed(&self, txns: impl IntoIterator<Item = u64>) {
-        let mut sets = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut sets = self.sets.write().unwrap_or_else(|e| e.into_inner());
         sets.committed.extend(txns);
     }
 
-    /// Record what [`resolve_locks_for_read`] found (client-go
-    /// `ClientHelper.ResolveLocksWithOpts`).
-    pub(crate) fn record(&self, locks: &ReadLocks) {
+    /// Record what [`resolve_locks_for_read`] found at `read_ts` (client-go
+    /// `ClientHelper.ResolveLocksWithOpts`). Done before the read retries, so the retry
+    /// already carries them; the cleanup itself may still be running in the background.
+    pub(crate) fn record(&self, read_ts: u64, locks: &ReadLocks) {
+        debug_assert_eq!(
+            read_ts, self.read_ts,
+            "lock hints recorded by a read at another timestamp"
+        );
         if locks.ignorable.is_empty() && locks.accessible.is_empty() {
             return;
         }
-        let mut sets = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut sets = self.sets.write().unwrap_or_else(|e| e.into_inner());
         sets.resolved.extend(locks.ignorable.iter().copied());
         sets.committed.extend(locks.accessible.iter().copied());
     }
 
     /// Both sets (sorted), or `None` while both are empty (`GetAll()`).
     pub fn get_all(&self) -> Option<(Vec<u64>, Vec<u64>)> {
-        let sets = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let sets = self.sets.read().unwrap_or_else(|e| e.into_inner());
         if sets.resolved.is_empty() && sets.committed.is_empty() {
             return None;
         }
@@ -1393,14 +1421,17 @@ mod tests {
     /// sets deduplicate, and clones share them.
     #[test]
     fn read_lock_hints_are_shared_sets() {
-        let hints = ReadLockHints::default();
+        let hints = ReadLockHints::new(10);
         assert_eq!(hints.get_all(), None);
         let clone = hints.clone();
-        clone.record(&ReadLocks {
-            live: vec![],
-            ignorable: vec![7, 3],
-            accessible: vec![5],
-        });
+        clone.record(
+            10,
+            &ReadLocks {
+                live: vec![],
+                ignorable: vec![7, 3],
+                accessible: vec![5],
+            },
+        );
         hints.put_resolved([3]);
         hints.put_committed([9]);
         assert_eq!(hints.get_all(), Some((vec![3, 7], vec![5, 9])));

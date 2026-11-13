@@ -36,6 +36,7 @@ use crate::store::HasRegionErrors;
 use crate::store::KvClient;
 use crate::store::RegionStore;
 use crate::store::{HasKeyErrors, Store};
+use crate::timestamp::TimestampExt;
 use crate::transaction::resolve_locks;
 use crate::transaction::resolve_locks_for_read;
 use crate::transaction::HasLocks;
@@ -1330,7 +1331,7 @@ where
                         self.keyspace,
                     )
                     .await?;
-                    hints.record(&read);
+                    hints.record(self.timestamp.version(), &read);
                     read.live
                 }
                 None => {

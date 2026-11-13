@@ -111,6 +111,7 @@ impl<PdC: PdClient> Transaction<PdC> {
         options: TransactionOptions,
         keyspace: Keyspace,
     ) -> Transaction<PdC> {
+        let timestamp_version = timestamp.version();
         let status = if options.read_only {
             TransactionStatus::ReadOnly
         } else {
@@ -126,7 +127,7 @@ impl<PdC: PdClient> Transaction<PdC> {
             is_heartbeat_started: false,
             prewritten: false,
             start_instant: std::time::Instant::now(),
-            lock_hints: ReadLockHints::default(),
+            lock_hints: ReadLockHints::new(timestamp_version),
         }
     }
 
@@ -1217,7 +1218,7 @@ async fn get_at_max_ts<PdC: PdClient>(
             keyspace,
         )
         .await?;
-        hints.record(&outcome);
+        hints.record(u64::MAX, &outcome);
         if !outcome.live.is_empty() {
             match lock_backoff.next_delay_duration() {
                 None => return Err(Error::ResolveLockError(outcome.live)),
