@@ -331,7 +331,7 @@ pub(crate) enum BackoffType {
     TxnNotFound,
 }
 
-const BACKOFF_COUNT: usize = BackoffType::TxnNotFound as usize + 1;
+pub(crate) const BACKOFF_COUNT: usize = BackoffType::TxnNotFound as usize + 1;
 const BACKOFF_LABELS: [&str; BACKOFF_COUNT] = [
     "tikvRPC",
     "tikvLockFast",

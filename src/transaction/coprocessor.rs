@@ -535,9 +535,12 @@ async fn run_task<PdC: PdClient>(
     task: CopTask,
     tx: &mpsc::Sender<TaskMessage>,
 ) -> bool {
-    // As in TiDB, one backoff budget covers a task and everything it is split into.
-    let mut region_backoff = ctx.retry_options.region_backoff.clone();
-    let mut lock_backoff = LockBackoff::new(ctx.retry_options.lock_backoff.clone());
+    // As in TiDB, one backoff budget covers a task and everything it is split into
+    // (`NewBackofferWithVars(.., CopNextMaxBackoff, ..)` per task), including its lock
+    // resolution and lock waits.
+    let retry_options = ctx.retry_options.for_read();
+    let mut region_backoff = retry_options.region_backoff;
+    let mut lock_backoff = LockBackoff::new(retry_options.lock_backoff);
     let mut remains = VecDeque::from([task]);
     while let Some(task) = remains.pop_front() {
         match handle_task_once(ctx, task, &mut region_backoff, &mut lock_backoff).await {
@@ -641,14 +644,14 @@ async fn handle_task_once<PdC: PdClient>(
             task.region.ver_id(),
             region_error
         );
-        let Some(delay) = region_backoff.next_delay_duration() else {
+        let backoff_type = metrics::backoff_type_for_region_error(&region_error);
+        let Some(delay) = region_backoff.next_delay_for(backoff_type) else {
             warn!(
                 "coprocessor: giving up after exhausting retries on region error, region: {:?}",
                 task.region.ver_id()
             );
             return Err(Error::RegionError(Box::new(region_error)));
         };
-        let backoff_type = metrics::backoff_type_for_region_error(&region_error);
         let resolved =
             handle_region_error(ctx.pd_client.clone(), region_error, region_store).await?;
         if !resolved {
@@ -674,7 +677,8 @@ async fn handle_task_once<PdC: PdClient>(
             ctx.keyspace,
             // `NewClientHelper(.., resolveLite = false)` (coprocessor.go:924).
             false,
-            ctx.retry_options.region_backoff.clone(),
+            // The task's own budget: the resolution draws from it (client-go `bo`).
+            region_backoff.clone(),
         )
         .await?;
         ctx.lock_hints.record(ctx.timestamp.version(), &read);
@@ -734,15 +738,15 @@ async fn retry_after_backoff<PdC: PdClient>(
     region_backoff: &mut Backoff,
     error: Error,
 ) -> Result<TaskOutcome> {
-    match region_backoff.next_delay_duration() {
+    // gRPC errors back off as client-go's `tikvRPC`; failing to locate the region or store
+    // as `regionMiss`.
+    let t = if is_grpc_error(&error) {
+        BackoffType::TikvRpc
+    } else {
+        BackoffType::RegionMiss
+    };
+    match region_backoff.next_delay_for(t) {
         Some(delay) => {
-            // gRPC errors back off as client-go's `tikvRPC`; failing to locate the region
-            // or store as `regionMiss`.
-            let t = if is_grpc_error(&error) {
-                BackoffType::TikvRpc
-            } else {
-                BackoffType::RegionMiss
-            };
             metrics::backoff(t, delay);
             sleep(delay).await;
             resplit(ctx, task).await
