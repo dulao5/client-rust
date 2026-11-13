@@ -75,6 +75,12 @@ impl<Cl> RetryClient<Cl> {
     }
 }
 
+/// The sleep after the `attempt`-th failed PD request: 10 ms, doubled, at most
+/// RECONNECT_INTERVAL_SEC (the attempts span about 4 s in all).
+fn retry_backoff(attempt: usize) -> Duration {
+    Duration::from_millis(10u64 << attempt.min(10)).min(Duration::from_secs(RECONNECT_INTERVAL_SEC))
+}
+
 macro_rules! retry_core {
     ($self: ident, $tag: literal, $cmd: expr, $call: expr) => {{
         let stats = pd_stats($tag);
@@ -82,7 +88,7 @@ macro_rules! retry_core {
         let start = Instant::now();
         let result = async {
             let mut last_err = Ok(());
-            for _ in 0..LEADER_CHANGE_RETRY {
+            for attempt in 0..LEADER_CHANGE_RETRY {
                 let res = $call;
 
                 match stats.done(res) {
@@ -97,6 +103,14 @@ macro_rules! retry_core {
                         return Err(e);
                     }
                     sleep(Duration::from_secs(RECONNECT_INTERVAL_SEC)).await;
+                }
+                // Wait before the next attempt. `reconnect` does nothing within
+                // RECONNECT_INTERVAL_SEC of the last reconnect, so without a sleep a burst of
+                // failures (a broken TSO stream) used up all attempts in milliseconds and
+                // reached the caller (tidb-rs weekly build, wide_rows). client-go's PD client
+                // retries with a backoff too.
+                if attempt + 1 < LEADER_CHANGE_RETRY {
+                    sleep(retry_backoff(attempt)).await;
                 }
             }
 
@@ -348,8 +362,9 @@ mod test {
         })
     }
 
-    #[test]
-    fn test_retry() {
+    // Paused time: the retries now sleep between attempts.
+    #[tokio::test(start_paused = true)]
+    async fn test_retry() {
         struct MockClient {
             cluster: RwLock<(AtomicUsize, Instant)>,
         }
@@ -395,7 +410,7 @@ mod test {
             })
         }
 
-        executor::block_on(async {
+        {
             let client = Arc::new(MockClient {
                 cluster: RwLock::new((AtomicUsize::new(0), Instant::now())),
             });
@@ -414,6 +429,6 @@ mod test {
 
             assert!(retry_max_ok(client.clone(), max_retries).await.is_ok());
             assert_eq!(client.cluster.read().await.0.load(Ordering::SeqCst), 2);
-        })
+        }
     }
 }
