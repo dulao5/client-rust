@@ -7,6 +7,7 @@ use std::sync::Arc;
 use fail::fail_point;
 use log::debug;
 use log::error;
+use log::info;
 use log::warn;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
@@ -122,8 +123,18 @@ pub(crate) struct ReadLocks {
 /// coprocessor request) sends the whole sets in `Context.resolved_locks` /
 /// `Context.committed_locks`, as `ClientHelper.SendReqCtx` does with `GetAll()`
 /// (txnsnapshot/client_helper.go). Cheap to clone: the sets are shared.
-#[derive(Clone, Debug, Default)]
-pub struct ReadLockHints(Arc<std::sync::RwLock<HintSets>>);
+///
+/// **The sets are only valid for one fixed read timestamp.** Whether a transaction may be
+/// ignored (committed after the read, min_commit_ts pushed past it) or read through
+/// (committed at or before it) depends on the read's timestamp, so the hints must never be
+/// shared by reads at different timestamps: a future read-committed mode, a pessimistic
+/// `for_update_ts` read or a stale read needs its own hints. The timestamp is recorded at
+/// creation and checked (`debug_assert`) whenever results are recorded.
+#[derive(Clone, Debug)]
+pub struct ReadLockHints {
+    read_ts: u64,
+    sets: Arc<std::sync::RwLock<HintSets>>,
+}
 
 #[derive(Debug, Default)]
 struct HintSets {
@@ -132,32 +143,50 @@ struct HintSets {
 }
 
 impl ReadLockHints {
+    /// Empty hints for reads at `read_ts`.
+    pub fn new(read_ts: u64) -> ReadLockHints {
+        ReadLockHints {
+            read_ts,
+            sets: Arc::default(),
+        }
+    }
+
+    /// The read timestamp these hints are valid for.
+    pub fn read_ts(&self) -> u64 {
+        self.read_ts
+    }
+
     /// Add transactions whose locks the read may ignore (`resolvedLocks.Put`).
     pub fn put_resolved(&self, txns: impl IntoIterator<Item = u64>) {
-        let mut sets = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut sets = self.sets.write().unwrap_or_else(|e| e.into_inner());
         sets.resolved.extend(txns);
     }
 
     /// Add transactions the read may read through (`committedLocks.Put`).
     pub fn put_committed(&self, txns: impl IntoIterator<Item = u64>) {
-        let mut sets = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut sets = self.sets.write().unwrap_or_else(|e| e.into_inner());
         sets.committed.extend(txns);
     }
 
-    /// Record what [`resolve_locks_for_read`] found (client-go
-    /// `ClientHelper.ResolveLocksWithOpts`).
-    pub(crate) fn record(&self, locks: &ReadLocks) {
+    /// Record what [`resolve_locks_for_read`] found at `read_ts` (client-go
+    /// `ClientHelper.ResolveLocksWithOpts`). Done before the read retries, so the retry
+    /// already carries them; the cleanup itself may still be running in the background.
+    pub(crate) fn record(&self, read_ts: u64, locks: &ReadLocks) {
+        debug_assert_eq!(
+            read_ts, self.read_ts,
+            "lock hints recorded by a read at another timestamp"
+        );
         if locks.ignorable.is_empty() && locks.accessible.is_empty() {
             return;
         }
-        let mut sets = self.0.write().unwrap_or_else(|e| e.into_inner());
+        let mut sets = self.sets.write().unwrap_or_else(|e| e.into_inner());
         sets.resolved.extend(locks.ignorable.iter().copied());
         sets.committed.extend(locks.accessible.iter().copied());
     }
 
     /// Both sets (sorted), or `None` while both are empty (`GetAll()`).
     pub fn get_all(&self) -> Option<(Vec<u64>, Vec<u64>)> {
-        let sets = self.0.read().unwrap_or_else(|e| e.into_inner());
+        let sets = self.sets.read().unwrap_or_else(|e| e.into_inner());
         if sets.resolved.is_empty() && sets.committed.is_empty() {
             return None;
         }
@@ -172,9 +201,11 @@ impl ReadLockHints {
 /// [`resolve_locks`] for a read: client-go's `resolveLocks` with `ForRead` (lock_resolver.go:
 /// 497, reached through `ClientHelper.ResolveLocksWithOpts`). The transactions of the
 /// encountered locks are classified as in lock_resolver.go:624-639, and the read may then
-/// ignore or read through their locks instead of waiting (see [`ReadLocks`]). Transactions
-/// whose fate is settled are still resolved here, synchronously (client-go does that in the
-/// background for reads; issue #101 R2).
+/// ignore or read through their locks instead of waiting (see [`ReadLocks`]). The locks of
+/// transactions whose fate is settled are resolved in the background
+/// ([`resolve_in_background`]), as client-go does for reads; stale pessimistic locks are
+/// still rolled back before returning (client-go: "pessimistic locks don't block read so it
+/// needn't be async", lock_resolver.go:572).
 ///
 /// TiDB's autocommit point get at `u64::MAX` uses this with `timestamp = u64::MAX`, as
 /// client-go does (`KVSnapshot.get` goes through the same `ClientHelper`): `CheckTxnStatus`
@@ -271,6 +302,13 @@ async fn resolve_locks_impl(
                 continue;
             }
         };
+        if for_read {
+            // A read does not wait for the cleanup: it already knows how to treat the
+            // transaction's locks (client-go lock_resolver.go:584-596, and :1092 for an
+            // async-commit transaction, `asyncResolveAll = forRead`).
+            resolve_in_background(&lock, keys, commit_version, pd_client.clone(), keyspace);
+            continue;
+        }
         let regions = clean_regions.entry(lock.lock_version).or_default();
         for key in keys.iter().chain([&lock.key]) {
             resolve_lock_with_retry(
@@ -371,6 +409,56 @@ impl LockAction {
             },
         }
     }
+}
+
+/// Backoff of a background lock cleanup: client-go gives it its own backoffer of
+/// `asyncResolveLockMaxBackoff` = 40 s (lock_resolver.go:48, :586, :1093). Here an attempt
+/// budget with about the same total sleep: 2, 4, ..., 256 ms, then 80 × 500 ms ≈ 40.5 s.
+pub(crate) const ASYNC_RESOLVE_LOCK_BACKOFF: Backoff = Backoff::no_jitter_backoff(2, 500, 88);
+
+/// Resolve the locks of a settled transaction in a background task, for a read
+/// (client-go: the goroutines of lock_resolver.go:587 and :1094). `keys` are the other keys of
+/// an async-commit transaction (empty otherwise); the encountered lock's key is always
+/// resolved. The task does not share the read's cleaned regions (client-go passes an empty
+/// map, lock_resolver.go:588) and only logs its failure: the read has already moved on, and
+/// a later reader resolves again.
+///
+/// Unlike client-go there is no `LockResolver.Close` to cancel these tasks; each ends when
+/// its backoff runs out (about 40 s at most) or with the runtime.
+// glue: client-go `go func() { lr.resolveLock(asyncBo, ...) }()`
+fn resolve_in_background(
+    lock: &kvrpcpb::LockInfo,
+    keys: Vec<Vec<u8>>,
+    commit_version: u64,
+    pd_client: Arc<impl PdClient>,
+    keyspace: Keyspace,
+) {
+    let start_version = lock.lock_version;
+    let is_txn_file = lock.is_txn_file;
+    let key = lock.key.clone();
+    tokio::spawn(async move {
+        let mut regions = HashSet::new();
+        for k in keys.iter().chain([&key]) {
+            if let Err(e) = resolve_lock_with_retry(
+                k.into(),
+                start_version,
+                commit_version,
+                is_txn_file,
+                pd_client.clone(),
+                keyspace,
+                ASYNC_RESOLVE_LOCK_BACKOFF,
+                &mut regions,
+            )
+            .await
+            {
+                info!(
+                    "failed to resolve lock asynchronously, start_ts: {}, commit_ts: {}, error: {:?}",
+                    start_version, commit_version, e
+                );
+                return;
+            }
+        }
+    });
 }
 
 /// Roll back one pessimistic lock, leaving the rest of its transaction alone. This is
@@ -1204,21 +1292,146 @@ mod tests {
         assert_eq!(read.live.len(), live);
         assert_eq!(read.ignorable, ignorable);
         assert_eq!(read.accessible, accessible);
+        // A settled transaction's locks are resolved in the background (R2).
+        for _ in 0..200 {
+            if resolve_count.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         assert_eq!(resolve_count.load(Ordering::SeqCst) > 0, resolves);
+    }
+
+    /// R2: for a read, the settled transaction's locks are resolved in a background task;
+    /// `resolve_locks_for_read` returns before that cleanup finishes (client-go
+    /// lock_resolver.go:584-596).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_resolve_locks_for_read_does_not_wait_for_cleanup() {
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let gate_captured = gate.clone();
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let resolve_count_captured = resolve_count.clone();
+        let client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.is::<kvrpcpb::CheckTxnStatusRequest>() {
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        commit_version: 5,
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                if req.is::<kvrpcpb::ResolveLockRequest>() {
+                    // Held until the test opens the gate.
+                    let (open, cv) = &*gate_captured;
+                    let mut open = open.lock().unwrap();
+                    while !*open {
+                        open = cv.wait(open).unwrap();
+                    }
+                    resolve_count_captured.fetch_add(1, Ordering::SeqCst);
+                    return Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>);
+                }
+                panic!("unexpected request type: {:?}", req.type_id());
+            },
+        )));
+        let lock = kvrpcpb::LockInfo {
+            key: vec![1],
+            primary_lock: vec![1],
+            lock_version: 1,
+            lock_ttl: 100,
+            ..Default::default()
+        };
+        let read = resolve_locks_for_read(
+            vec![lock],
+            Timestamp::from_version(10),
+            client,
+            Keyspace::Disable,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.accessible, vec![1]);
+        assert_eq!(resolve_count.load(Ordering::SeqCst), 0);
+        {
+            let (open, cv) = &*gate;
+            *open.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        for _ in 0..200 {
+            if resolve_count.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// R2: an expired async-commit transaction met by a read: its status is recovered from the
+    /// secondaries before returning (the read needs it), and all of its locks are then
+    /// resolved in the background (client-go `resolveAsyncCommitLock(.., asyncResolveAll =
+    /// forRead)`, lock_resolver.go:1092).
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_locks_for_read_async_commit_in_background() {
+        let resolved = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let resolved_captured = resolved.clone();
+        let client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.is::<kvrpcpb::CheckTxnStatusRequest>() {
+                    return Ok(Box::new(still_locked_response(async_commit_primary_lock(
+                        PRIMARY_KEY,
+                        44,
+                        vec![SECONDARY_KEY.to_vec()],
+                    ))) as Box<dyn Any>);
+                }
+                if req.is::<kvrpcpb::CheckSecondaryLocksRequest>() {
+                    return Ok(Box::new(kvrpcpb::CheckSecondaryLocksResponse {
+                        locks: vec![async_commit_secondary_lock(SECONDARY_KEY, 43)],
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                if let Some(req) = req.downcast_ref::<kvrpcpb::ResolveLockRequest>() {
+                    resolved_captured.lock().unwrap().push(req.commit_version);
+                    return Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>);
+                }
+                panic!("unexpected request type: {:?}", req.type_id());
+            },
+        )));
+        let lock = async_commit_primary_lock(PRIMARY_KEY, 44, vec![SECONDARY_KEY.to_vec()]);
+        let read = resolve_locks_for_read(
+            vec![lock],
+            Timestamp::from_version(100),
+            client,
+            Keyspace::Disable,
+        )
+        .await
+        .unwrap();
+        // Committed at 44, before the read at 100: read through.
+        assert!(read.live.is_empty());
+        assert_eq!(read.accessible, vec![EXPIRED_TXN_VERSION]);
+        for _ in 0..200 {
+            if resolved.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Both regions (secondary and primary), with the recovered commit version.
+        assert_eq!(*resolved.lock().unwrap(), vec![44, 44]);
     }
 
     /// `ReadLockHints` (client-go `util.TSSet` pair): `get_all` is `None` while empty, the
     /// sets deduplicate, and clones share them.
     #[test]
     fn read_lock_hints_are_shared_sets() {
-        let hints = ReadLockHints::default();
+        let hints = ReadLockHints::new(10);
         assert_eq!(hints.get_all(), None);
         let clone = hints.clone();
-        clone.record(&ReadLocks {
-            live: vec![],
-            ignorable: vec![7, 3],
-            accessible: vec![5],
-        });
+        clone.record(
+            10,
+            &ReadLocks {
+                live: vec![],
+                ignorable: vec![7, 3],
+                accessible: vec![5],
+            },
+        );
         hints.put_resolved([3]);
         hints.put_committed([9]);
         assert_eq!(hints.get_all(), Some((vec![3, 7], vec![5, 9])));
