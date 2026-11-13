@@ -37,8 +37,9 @@ use crate::store::KvClient;
 use crate::store::RegionStore;
 use crate::store::{HasKeyErrors, Store};
 use crate::timestamp::TimestampExt;
-use crate::transaction::resolve_locks;
+use crate::transaction::lock_backoff_sleep;
 use crate::transaction::resolve_locks_for_read;
+use crate::transaction::resolve_locks_with_expiry;
 use crate::transaction::HasLocks;
 use crate::transaction::ReadLockHints;
 use crate::transaction::ResolveLocksContext;
@@ -1320,7 +1321,7 @@ where
             }
 
             let pd_client = self.pd_client.clone();
-            let live_locks = match &self.read_hints {
+            let found = match &self.read_hints {
                 // client-go `ClientHelper.ResolveLocksWithOpts` (txnsnapshot/client_helper.go):
                 // ForRead, then `resolvedLocks.Put(IgnoreLocks)` / `committedLocks.Put(AccessLocks)`.
                 Some(hints) => {
@@ -1332,10 +1333,10 @@ where
                     )
                     .await?;
                     hints.record(self.timestamp.version(), &read);
-                    read.live
+                    read
                 }
                 None => {
-                    resolve_locks(
+                    resolve_locks_with_expiry(
                         locks,
                         self.timestamp.clone(),
                         pd_client.clone(),
@@ -1344,14 +1345,17 @@ where
                     .await?
                 }
             };
-            if live_locks.is_empty() {
+            if found.live.is_empty() {
                 result = self.inner.execute().await?;
             } else {
-                match clone.backoff.next_delay_duration() {
-                    None => return Err(Error::ResolveLockError(live_locks)),
+                // client-go `BackoffWithMaxSleepTxnLockFast(msBeforeExpired)`.
+                match lock_backoff_sleep(&mut clone.backoff, found.ms_before_expired) {
+                    None => return Err(Error::ResolveLockError(found.live)),
                     Some(delay_duration) => {
-                        metrics::backoff(BackoffType::TikvLockFast, delay_duration);
-                        sleep(delay_duration).await;
+                        if !delay_duration.is_zero() {
+                            metrics::backoff(BackoffType::TikvLockFast, delay_duration);
+                            sleep(delay_duration).await;
+                        }
                         result = clone.inner.execute().await?;
                     }
                 }

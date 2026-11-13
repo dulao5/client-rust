@@ -58,6 +58,7 @@ use crate::request::RetryOptions;
 use crate::stats::tikv_stats;
 use crate::store::Request;
 use crate::timestamp::TimestampExt;
+use crate::transaction::lock_backoff_sleep;
 use crate::transaction::resolve_locks_for_read;
 use crate::transaction::ReadLockHints;
 use crate::BoundRange;
@@ -672,14 +673,15 @@ async fn handle_task_once<PdC: PdClient>(
         )
         .await?;
         ctx.lock_hints.record(ctx.timestamp.version(), &read);
-        let live_locks = read.live;
-        if !live_locks.is_empty() {
-            match lock_backoff.next_delay_duration() {
-                Some(delay) => {
+        if !read.live.is_empty() {
+            // TiDB `bo.BackoffWithMaxSleepTxnLockFast(msBeforeExpired)` (coprocessor.go:1843).
+            match lock_backoff_sleep(lock_backoff, read.ms_before_expired) {
+                Some(delay) if !delay.is_zero() => {
                     metrics::backoff(BackoffType::TikvLockFast, delay);
                     sleep(delay).await
                 }
-                None => return Err(Error::ResolveLockError(live_locks)),
+                Some(_) => {}
+                None => return Err(Error::ResolveLockError(read.live)),
             }
         }
         // Retry the same ranges at the same start_ts and page size.
