@@ -388,6 +388,7 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
                         self.retry_options.lock_backoff.clone(),
                         keyspace,
                     )
+                    .lock_region_backoff(self.retry_options.region_backoff.clone())
                     .plan(),
                 Err(error) => {
                     self.retry_region_client_error(&region, &mut region_backoff, error)

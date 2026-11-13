@@ -674,6 +674,7 @@ async fn handle_task_once<PdC: PdClient>(
             ctx.keyspace,
             // `NewClientHelper(.., resolveLite = false)` (coprocessor.go:924).
             false,
+            ctx.retry_options.region_backoff.clone(),
         )
         .await?;
         ctx.lock_hints.record(ctx.timestamp.version(), &read);

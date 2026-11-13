@@ -153,21 +153,25 @@ impl<C: RetryClientTrait> RegionCache<C> {
             region_cache_guard.on_my_way_id.insert(id, notify.clone());
         }
 
-        let region = timed_load(
+        let result = timed_load(
             RegionCacheOp::GetRegionById,
             self.inner_client.clone().get_region_by_id(id),
         )
-        .await?;
-        self.add_region(region.clone()).await;
+        .await;
+        if let Ok(region) = &result {
+            self.add_region(region.clone()).await;
+        }
 
-        // notify others
+        // Notify others, on failure too: an entry left behind would make every later
+        // `get_region_by_id(id)` wait for a notification that never comes (tidb-rs
+        // `client-go-parity.md` §2). Waiters then retry and query PD themselves.
         {
             let mut region_cache_guard = self.region_cache.write().await;
             notify.notify_waiters();
             region_cache_guard.on_my_way_id.remove(&id);
         }
 
-        Ok(region)
+        result
     }
 
     async fn read_through_store_by_id(&self, id: StoreId) -> Result<Store> {
@@ -393,6 +397,41 @@ mod test {
         async fn load_keyspace(&self, _keyspace: &str) -> Result<keyspacepb::KeyspaceMeta> {
             unimplemented!()
         }
+    }
+
+    /// A failed PD lookup must not leave its `on_my_way_id` entry behind: every later lookup
+    /// of that region would wait for a notification that never comes (tidb-rs
+    /// `client-go-parity.md` §2, fixed with P0-1).
+    #[tokio::test]
+    async fn failed_lookup_by_id_does_not_block_later_ones() -> Result<()> {
+        let retry_client = Arc::new(MockRetryClient::default());
+        let cache = RegionCache::new(retry_client.clone());
+
+        // PD does not know region 1 yet: the lookup fails.
+        assert!(cache.get_region_by_id(1).await.is_err());
+
+        retry_client.regions.lock().await.insert(
+            1,
+            RegionWithLeader {
+                region: metapb::Region {
+                    id: 1,
+                    end_key: vec![100],
+                    region_epoch: Some(RegionEpoch::default()),
+                    ..Default::default()
+                },
+                leader: Some(metapb::Peer {
+                    store_id: 1,
+                    ..Default::default()
+                }),
+            },
+        );
+        let region =
+            tokio::time::timeout(std::time::Duration::from_secs(5), cache.get_region_by_id(1))
+                .await
+                .expect("the second lookup waited for the failed one forever")?;
+        assert_eq!(region.end_key(), vec![100].into());
+        assert_eq!(retry_client.get_region_count.load(SeqCst), 2);
+        Ok(())
     }
 
     #[tokio::test]

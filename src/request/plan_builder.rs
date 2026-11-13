@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::plan::PreserveShard;
 use super::Keyspace;
 use crate::backoff::Backoff;
+use crate::backoff::DEFAULT_REGION_BACKOFF;
 use crate::pd::PdClient;
 use crate::request::plan::{CleanupLocks, RetryableAllStores};
 use crate::request::shard::HasNextBatch;
@@ -96,6 +97,7 @@ impl<PdC: PdClient, P: Plan, Ph: PlanBuilderPhase> PlanBuilder<PdC, P, Ph> {
                 inner: self.plan,
                 timestamp,
                 backoff,
+                region_backoff: DEFAULT_REGION_BACKOFF,
                 pd_client: self.pd_client,
                 keyspace,
                 read_hints: None,
@@ -279,6 +281,22 @@ where
             },
             phantom: PhantomData,
         }
+    }
+}
+
+impl<PdC: PdClient, P: Plan, Ph: PlanBuilderPhase> PlanBuilder<PdC, ResolveLock<P, PdC>, Ph>
+where
+    P::Result: HasLocks,
+{
+    /// Retry the lock resolution's own requests on region errors with `backoff` instead of
+    /// [`DEFAULT_REGION_BACKOFF`]. A read passes its `RetryOptions::region_backoff`: client-go
+    /// resolves with the read's own `Backoffer` (`ResolveLocks(bo, ..)`), so a lock met while
+    /// a TiKV is down does not fail the read after a fixed ~1.5 s (tidb-rs
+    /// `client-go-parity.md` P0-1).
+    #[must_use]
+    pub fn lock_region_backoff(mut self, backoff: Backoff) -> Self {
+        self.plan.region_backoff = backoff;
+        self
     }
 }
 
