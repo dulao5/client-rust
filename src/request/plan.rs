@@ -1285,6 +1285,8 @@ pub struct ResolveLock<P: Plan, PdC: PdClient> {
     /// read and the transactions the read may ignore or read through are added here. The
     /// inner `Dispatch` must carry the same hints, so the retry sends them.
     pub read_hints: Option<ReadLockHints>,
+    /// With `read_hints`: resolve lite (client-go `ResolveLocksOptions.Lite`).
+    pub lite: bool,
 }
 
 impl<P: Plan, PdC: PdClient> Clone for ResolveLock<P, PdC> {
@@ -1296,6 +1298,7 @@ impl<P: Plan, PdC: PdClient> Clone for ResolveLock<P, PdC> {
             backoff: self.backoff.clone(),
             keyspace: self.keyspace,
             read_hints: self.read_hints.clone(),
+            lite: self.lite,
         }
     }
 }
@@ -1330,6 +1333,7 @@ where
                         self.timestamp.clone(),
                         pd_client.clone(),
                         self.keyspace,
+                        self.lite,
                     )
                     .await?;
                     hints.record(self.timestamp.version(), &read);
@@ -1797,6 +1801,7 @@ mod test {
                 pd_client: Arc::new(MockPdClient::default()),
                 keyspace: Keyspace::Disable,
                 read_hints: None,
+                lite: false,
             },
             pd_client: Arc::new(MockPdClient::default()),
             backoff: Backoff::no_backoff(),

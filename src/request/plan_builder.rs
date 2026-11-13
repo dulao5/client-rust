@@ -99,6 +99,7 @@ impl<PdC: PdClient, P: Plan, Ph: PlanBuilderPhase> PlanBuilder<PdC, P, Ph> {
                 pd_client: self.pd_client,
                 keyspace,
                 read_hints: None,
+                lite: false,
             },
             phantom: PhantomData,
         }
@@ -107,19 +108,22 @@ impl<PdC: PdClient, P: Plan, Ph: PlanBuilderPhase> PlanBuilder<PdC, P, Ph> {
     /// [`resolve_lock`](PlanBuilder::resolve_lock) for a read (client-go `ForRead`): the
     /// transactions whose locks the read may ignore or read through are added to `hints`,
     /// which the request (built with [`read_lock_hints`](PlanBuilder::read_lock_hints) on the
-    /// same hints) sends on its retry.
+    /// same hints) sends on its retry. `lite`: resolve only the encountered keys of small
+    /// transactions' locks (client-go `ResolveLocksOptions.Lite`; a snapshot's point get).
     pub fn resolve_lock_for_read(
         self,
         timestamp: Timestamp,
         backoff: Backoff,
         keyspace: Keyspace,
         hints: ReadLockHints,
+        lite: bool,
     ) -> PlanBuilder<PdC, ResolveLock<P, PdC>, Ph>
     where
         P::Result: HasLocks,
     {
         let mut builder = self.resolve_lock(timestamp, backoff, keyspace);
         builder.plan.read_hints = Some(hints);
+        builder.plan.lite = lite;
         builder
     }
 
