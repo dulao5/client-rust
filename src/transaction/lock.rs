@@ -790,6 +790,17 @@ impl LockResolverState {
     /// save of a transaction must agree with the first (`HasSameDeterminedStatus`). As in
     /// client-go v8.5.8 (c3b5079), a violation panics in every build: the cache would
     /// otherwise make reads resolve the transaction's locks both ways.
+    ///
+    /// What the panic does differs from client-go: there, one in a session goroutine is
+    /// recovered by the connection loop (the statement fails), and one in a background
+    /// cleanup goroutine kills the process. Here a panic ends only the task it happens in (a
+    /// statement's task, or a background cleanup task), so in practice it is "fail loudly";
+    /// a build with `panic = "abort"` would turn every one into a process exit.
+    ///
+    /// The key is the start_ts alone, as in client-go. With API v2 one client may serve
+    /// several keyspaces (`api_v2_no_prefix`); if they belong to different TSO keyspace
+    /// groups, two transactions can share a start_ts and a legitimate pair of statuses would
+    /// trip the conflict panic. tidb-rs uses one keyspace per client.
     pub fn save_resolved(&self, txn_id: u64, status: Arc<TransactionStatus>) {
         if !status.is_determined() {
             error!(
@@ -833,25 +844,36 @@ impl LockResolverState {
         F: Future<Output = Result<()>>,
     {
         let key = (region_id, start_version);
-        let waiting = {
-            let in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-            in_flight.get(&key).cloned()
-        };
-        if let Some(f) = waiting {
-            if f.await {
-                return Ok(());
+        // Look up or register in one critical section: two callers must never both become
+        // the sender for one key (#6 review).
+        let registered = {
+            let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            match in_flight.get(&key) {
+                Some(waiting) => Err(waiting.clone()),
+                None => {
+                    let (tx, rx) = futures::channel::oneshot::channel::<bool>();
+                    let entry: InFlight = rx.map(|r| r.unwrap_or(false)).boxed().shared();
+                    in_flight.insert(key, entry.clone());
+                    Ok((tx, entry))
+                }
             }
-            return send.await;
-        }
-        let (tx, rx) = futures::channel::oneshot::channel::<bool>();
-        let shared: InFlight = rx.map(|r| r.unwrap_or(false)).boxed().shared();
-        self.in_flight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, shared);
-        // Removes the entry even if this future is dropped mid-request; waiters then see a
-        // dropped sender (false) and send their own.
-        let _guard = InFlightGuard { state: self, key };
+        };
+        let (tx, entry) = match registered {
+            Ok(registered) => registered,
+            Err(waiting) => {
+                if waiting.await {
+                    return Ok(());
+                }
+                return send.await;
+            }
+        };
+        // Removes this caller's entry even if the future is dropped mid-request; waiters then
+        // see a dropped sender (false) and send their own.
+        let _guard = InFlightGuard {
+            state: self,
+            key,
+            entry,
+        };
         let result = send.await;
         let _ = tx.send(result.is_ok());
         result
@@ -861,15 +883,23 @@ impl LockResolverState {
 struct InFlightGuard<'a> {
     state: &'a LockResolverState,
     key: (u64, u64),
+    /// This caller's entry: removed only if it is still the one in the map.
+    entry: InFlight,
 }
 
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
-        self.state
+        let mut in_flight = self
+            .state
             .in_flight
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.key);
+            .unwrap_or_else(|e| e.into_inner());
+        if in_flight
+            .get(&self.key)
+            .is_some_and(|e| e.ptr_eq(&self.entry))
+        {
+            in_flight.remove(&self.key);
+        }
     }
 }
 
@@ -2037,6 +2067,84 @@ mod tests {
         assert!(follower.await.unwrap().is_ok());
         assert_eq!(sends.load(Ordering::SeqCst), expected_sends);
         // Nothing left in flight.
+        assert!(state.in_flight.lock().unwrap().is_empty());
+    }
+
+    /// R12 (#6 review): the lookup and the registration are one critical section, so of many
+    /// callers starting at once exactly one sends; the others wait and share its success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_collapse_resolve_concurrent_leaders() {
+        const CALLERS: usize = 16;
+        let state = Arc::new(LockResolverState::default());
+        let sends = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let tasks: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let (state, sends, barrier, gate) =
+                    (state.clone(), sends.clone(), barrier.clone(), gate.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    state
+                        .collapse_resolve(9, 1, async move {
+                            sends.fetch_add(1, Ordering::SeqCst);
+                            gate.notified().await;
+                            Ok(())
+                        })
+                        .await
+                })
+            })
+            .collect();
+        while sends.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // Give every caller time to reach the in-flight map.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        gate.notify_waiters();
+        for t in tasks {
+            assert!(t.await.unwrap().is_ok());
+        }
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert!(state.in_flight.lock().unwrap().is_empty());
+    }
+
+    /// R12: a sender dropped mid-request (its task cancelled) removes its own entry; a waiter
+    /// then sends its own request, and a later caller registers afresh.
+    #[tokio::test]
+    async fn test_collapse_resolve_cancelled_leader() {
+        let state = Arc::new(LockResolverState::default());
+        let sends = Arc::new(AtomicUsize::new(0));
+        let leader = {
+            let (state, sends) = (state.clone(), sends.clone());
+            tokio::spawn(async move {
+                state
+                    .collapse_resolve(9, 1, async move {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        futures::future::pending::<Result<()>>().await
+                    })
+                    .await
+            })
+        };
+        while sends.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let waiter = {
+            let (state, sends) = (state.clone(), sends.clone());
+            tokio::spawn(async move {
+                state
+                    .collapse_resolve(9, 1, async move {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        leader.abort();
+        assert!(waiter.await.unwrap().is_ok());
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
         assert!(state.in_flight.lock().unwrap().is_empty());
     }
 
