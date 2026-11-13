@@ -1,7 +1,10 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::marker::PhantomData;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_recursion::async_recursion;
 use async_trait::async_trait;
@@ -80,6 +83,51 @@ pub struct Dispatch<Req: KvRequest> {
     /// The lock hints of the snapshot (or coprocessor request) this request belongs to: their
     /// current contents are sent with every dispatch, retries included.
     pub lock_hints: Option<ReadLockHints>,
+    /// The read's own deadline (TiDB's `tikv_client_read_timeout`), see [`ReadTimeout`].
+    pub read_timeout: Option<ReadTimeout>,
+}
+
+/// TiDB's `tikv_client_read_timeout`: client-go sends the **first** attempt with this
+/// deadline (as RPC timeout and `MaxExecutionDurationMs`) and the retries with the default
+/// timeout (`useConfigurableKVTimeout`), so a slow replica is given up on quickly but a retry
+/// is not. "First" is per `get` call (txnsnapshot/snapshot.go:845) and, for a BatchGet, per
+/// request to one region (`batchGetSingleRegion`, :631), also when a region error re-splits
+/// the keys.
+#[derive(Clone, Debug)]
+pub struct ReadTimeout {
+    duration: Duration,
+    /// Shared by the clones that count as one request (its retries).
+    unused: Arc<AtomicBool>,
+    /// Whether each region gets its own first attempt (BatchGet) or the whole read has one
+    /// (Get).
+    per_region: bool,
+}
+
+impl ReadTimeout {
+    pub fn new(duration: Duration, per_region: bool) -> ReadTimeout {
+        ReadTimeout {
+            duration,
+            unused: Arc::new(AtomicBool::new(true)),
+            per_region,
+        }
+    }
+
+    /// The deadline for the next attempt: `Some` the first time only.
+    fn take(&self) -> Option<Duration> {
+        self.unused
+            .swap(false, AtomicOrdering::Relaxed)
+            .then_some(self.duration)
+    }
+
+    /// The deadline of a request split off for one region: unused again for a BatchGet,
+    /// the same (shared) one for a Get.
+    pub(crate) fn for_region(&self) -> ReadTimeout {
+        if self.per_region {
+            ReadTimeout::new(self.duration, true)
+        } else {
+            self.clone()
+        }
+    }
 }
 
 #[async_trait]
@@ -94,15 +142,21 @@ impl<Req: KvRequest> Plan for Dispatch<Req> {
         let stats = tikv_stats(self.request.label());
         // client-go `ClientHelper.SendReqCtx`: `req.ResolvedLocks = resolvedLocks.GetAll()`,
         // `req.CommittedLocks = committedLocks.GetAll()` on every send.
-        let hinted;
-        let request = match self.lock_hints.as_ref().and_then(ReadLockHints::get_all) {
-            Some((resolved, committed)) => {
-                let mut request = self.request.clone();
+        let hints = self.lock_hints.as_ref().and_then(ReadLockHints::get_all);
+        let deadline = self.read_timeout.as_ref().and_then(ReadTimeout::take);
+        let changed;
+        let request = if hints.is_some() || deadline.is_some() {
+            let mut request = self.request.clone();
+            if let Some((resolved, committed)) = hints {
                 request.set_lock_hints(resolved, committed);
-                hinted = request;
-                &hinted
             }
-            None => &self.request,
+            if let Some(deadline) = deadline {
+                request.set_max_execution_duration(deadline);
+            }
+            changed = request;
+            &changed
+        } else {
+            &self.request
         };
         let result = self
             .kv_client

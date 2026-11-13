@@ -2,6 +2,7 @@
 
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::plan::PreserveShard;
 use super::Keyspace;
@@ -58,6 +59,7 @@ impl<PdC: PdClient, Req: KvRequest> PlanBuilder<PdC, Dispatch<Req>, NoTarget> {
                 request,
                 kv_client: None,
                 lock_hints: None,
+                read_timeout: None,
             },
             phantom: PhantomData,
         }
@@ -68,6 +70,16 @@ impl<PdC: PdClient, Req: KvRequest> PlanBuilder<PdC, Dispatch<Req>, NoTarget> {
     /// [`resolve_lock_for_read`](PlanBuilder::resolve_lock_for_read) on the same hints.
     pub fn read_lock_hints(mut self, hints: ReadLockHints) -> Self {
         self.plan.lock_hints = Some(hints);
+        self
+    }
+
+    /// Send the first attempt with `timeout` as its deadline (TiDB's
+    /// `tikv_client_read_timeout`; see [`ReadTimeout`](crate::request::plan::ReadTimeout)):
+    /// the first attempt of the read, or with `per_region` the first one to each region.
+    /// `None` keeps the default timeout.
+    pub fn read_timeout(mut self, timeout: Option<Duration>, per_region: bool) -> Self {
+        self.plan.read_timeout =
+            timeout.map(|t| crate::request::plan::ReadTimeout::new(t, per_region));
         self
     }
 }

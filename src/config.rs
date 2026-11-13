@@ -83,11 +83,12 @@ impl Config {
         self
     }
 
-    /// Set the timeout for clients.
+    /// Set the timeout for connecting to TiKV and PD, and for PD requests.
     ///
-    /// The timeout is used for all requests when using or connecting to a TiKV cluster (including
-    /// PD nodes). If the request does not complete within timeout, the request is cancelled and
-    /// an error returned to the user.
+    /// TiKV requests do not use it: like client-go, each has its own RPC timeout, 30 s
+    /// (`ReadTimeoutShort`) or 60 s for BatchGet / Scan / DeleteRange (`ReadTimeoutMedium`)
+    /// and coprocessor requests, unless the request carries its own deadline
+    /// (`TransactionOptions::read_timeout`, TiDB's `tikv_client_read_timeout`).
     ///
     /// The default timeout is two seconds.
     ///

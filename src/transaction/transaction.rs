@@ -159,12 +159,13 @@ impl<PdC: PdClient> Transaction<PdC> {
         let retry_options = self.options.retry_options.for_read();
         let keyspace = self.keyspace;
         let hints = self.lock_hints.clone();
+        let read_timeout = self.options.read_timeout;
 
         if timestamp.version() == u64::MAX {
             return self
                 .buffer
                 .get_or_else(key, |key| {
-                    get_at_max_ts(rpc, keyspace, key, retry_options, hints)
+                    get_at_max_ts(rpc, keyspace, key, retry_options, hints, read_timeout)
                 })
                 .await;
         }
@@ -175,6 +176,8 @@ impl<PdC: PdClient> Transaction<PdC> {
                 let request = new_get_request(key, timestamp.clone());
                 let plan = PlanBuilder::new(rpc, keyspace, request)
                     .read_lock_hints(hints.clone())
+                    // `tikv_client_read_timeout` (snapshot.go:845).
+                    .read_timeout(read_timeout, false)
                     // `NewClientHelper(.., resolveLite = true)` (snapshot.go:786).
                     .resolve_lock_for_read(
                         timestamp,
@@ -319,6 +322,7 @@ impl<PdC: PdClient> Transaction<PdC> {
         // client-go `batchGetMaxBackoff` (snapshot.go:183); regions are forked from it.
         let retry_options = self.options.retry_options.for_read();
         let hints = self.lock_hints.clone();
+        let read_timeout = self.options.read_timeout;
 
         // client-go `KVSnapshot.batchGetSingleRegion` (txnsnapshot/snapshot.go:591): ForRead
         // through the snapshot's `ClientHelper`.
@@ -327,6 +331,8 @@ impl<PdC: PdClient> Transaction<PdC> {
                 let request = new_batch_get_request(keys, timestamp.clone());
                 let plan = PlanBuilder::new(rpc, keyspace, request)
                     .read_lock_hints(hints.clone())
+                    // `tikv_client_read_timeout`, per region (snapshot.go:631).
+                    .read_timeout(read_timeout, true)
                     // `NewClientHelper(.., resolveLite = false)` (snapshot.go:591).
                     .resolve_lock_for_read(
                         timestamp,
@@ -1203,9 +1209,13 @@ async fn get_at_max_ts<PdC: PdClient>(
     key: Key,
     retry_options: RetryOptions,
     hints: ReadLockHints,
+    read_timeout: Option<Duration>,
 ) -> Result<Option<Value>> {
     let mut lock_backoff = crate::transaction::LockBackoff::new(retry_options.lock_backoff);
     let mut first_lock: Option<u64> = None;
+    // client-go uses `tikv_client_read_timeout` for the first attempt of the whole get only
+    // (`useConfigurableKVTimeout`, snapshot.go:845), not again after a lock.
+    let mut read_timeout = read_timeout;
     loop {
         let mut request = new_get_request(key.clone(), Timestamp::from_version(u64::MAX));
         let ctx = request.context.get_or_insert_with(Default::default);
@@ -1213,6 +1223,7 @@ async fn get_at_max_ts<PdC: PdClient>(
         // A lock fails the plan at once (no lock backoff): it is handled below.
         let plan = PlanBuilder::new(rpc.clone(), keyspace, request)
             .read_lock_hints(hints.clone())
+            .read_timeout(read_timeout.take(), false)
             .resolve_lock(
                 Timestamp::from_version(u64::MAX),
                 Backoff::no_backoff(),
@@ -1320,6 +1331,9 @@ pub struct TransactionOptions {
     read_only: bool,
     /// How to retry in the event of certain errors.
     retry_options: RetryOptions,
+    /// The deadline of the first attempt of a point get / BatchGet to each region (TiDB's
+    /// `tikv_client_read_timeout`); `None`: client-go's default timeouts.
+    read_timeout: Option<Duration>,
     /// What to do if the transaction is dropped without an attempt to commit or rollback
     check_level: CheckLevel,
     #[doc(hidden)]
@@ -1347,6 +1361,7 @@ impl TransactionOptions {
             async_commit: false,
             read_only: false,
             retry_options: RetryOptions::default_optimistic(),
+            read_timeout: None,
             check_level: CheckLevel::Panic,
             heartbeat_option: HeartbeatOption::FixedTime(DEFAULT_HEARTBEAT_INTERVAL),
         }
@@ -1360,6 +1375,7 @@ impl TransactionOptions {
             async_commit: false,
             read_only: false,
             retry_options: RetryOptions::default_pessimistic(),
+            read_timeout: None,
             check_level: CheckLevel::Panic,
             heartbeat_option: HeartbeatOption::FixedTime(DEFAULT_HEARTBEAT_INTERVAL),
         }
@@ -1404,6 +1420,17 @@ impl TransactionOptions {
     #[must_use]
     pub fn retry_options(mut self, options: RetryOptions) -> TransactionOptions {
         self.retry_options = options;
+        self
+    }
+
+    /// TiDB's `tikv_client_read_timeout` for this transaction's point gets and BatchGets: the
+    /// first attempt to each region is sent with `timeout` as its RPC timeout and as
+    /// `Context.max_execution_duration_ms`, and retries use the default timeout, as client-go
+    /// does (`KVSnapshot.SetKVReadTimeout`, txnsnapshot/snapshot.go:631, :845, :1243).
+    /// `None` (the default) or zero: client-go's default timeouts only.
+    #[must_use]
+    pub fn read_timeout(mut self, timeout: Option<Duration>) -> TransactionOptions {
+        self.read_timeout = timeout.filter(|t| !t.is_zero());
         self
     }
 
@@ -2928,5 +2955,114 @@ mod tests {
             ),
             other => panic!("{other:?}"),
         }
+    }
+
+    fn deadline_ms(ctx: &Option<kvrpcpb::Context>) -> u64 {
+        ctx.as_ref().map_or(0, |c| c.max_execution_duration_ms)
+    }
+
+    /// P0-2, `tikv_client_read_timeout`: a point get's first attempt carries the read timeout
+    /// as its deadline; the retry after a region error does not (client-go
+    /// `useConfigurableKVTimeout`, txnsnapshot/snapshot.go:845). With no deadline the request
+    /// is sent with the default 30 s.
+    #[rstest::rstest]
+    #[case::tso(100)]
+    #[case::max_ts(u64::MAX)]
+    #[tokio::test]
+    async fn test_read_timeout_applies_to_the_first_attempt_of_a_get(#[case] read_ts: u64) {
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let deadlines_cloned = deadlines.clone();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                let req = req.downcast_ref::<kvrpcpb::GetRequest>().unwrap();
+                let mut deadlines = deadlines_cloned.lock().unwrap();
+                deadlines.push(deadline_ms(&req.context));
+                let resp = if deadlines.len() == 1 {
+                    kvrpcpb::GetResponse {
+                        region_error: Some(stale_command()),
+                        ..Default::default()
+                    }
+                } else {
+                    kvrpcpb::GetResponse {
+                        value: b"v".to_vec(),
+                        ..Default::default()
+                    }
+                };
+                Ok(Box::new(resp) as Box<dyn Any>)
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(read_ts),
+            pd_client,
+            wide_region_budget().read_timeout(Some(Duration::from_millis(100))),
+            Keyspace::Disable,
+        );
+        assert_eq!(txn.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
+        assert_eq!(*deadlines.lock().unwrap(), [100, 0]);
+        txn.rollback().await.unwrap();
+    }
+
+    /// P0-2: a BatchGet's first attempt to *each region* carries the read timeout, also after
+    /// a region error re-splits the keys (client-go `batchGetSingleRegion`,
+    /// txnsnapshot/snapshot.go:631).
+    #[tokio::test]
+    async fn test_read_timeout_applies_per_region_of_a_batch_get() {
+        let deadlines = Arc::new(Mutex::new(Vec::new()));
+        let deadlines_cloned = deadlines.clone();
+        let failed = Arc::new(AtomicUsize::new(0));
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                let req = req.downcast_ref::<kvrpcpb::BatchGetRequest>().unwrap();
+                deadlines_cloned
+                    .lock()
+                    .unwrap()
+                    .push((req.keys.clone(), deadline_ms(&req.context)));
+                // The first request to the region of key 5 fails once.
+                let resp =
+                    if req.keys == vec![vec![5u8]] && failed.fetch_add(1, Ordering::SeqCst) == 0 {
+                        kvrpcpb::BatchGetResponse {
+                            region_error: Some(stale_command()),
+                            ..Default::default()
+                        }
+                    } else {
+                        kvrpcpb::BatchGetResponse {
+                            pairs: req
+                                .keys
+                                .iter()
+                                .map(|k| kvrpcpb::KvPair {
+                                    key: k.clone(),
+                                    value: b"v".to_vec(),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        }
+                    };
+                Ok(Box::new(resp) as Box<dyn Any>)
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(100),
+            pd_client,
+            wide_region_budget().read_timeout(Some(Duration::from_millis(100))),
+            Keyspace::Disable,
+        );
+        let got: Vec<_> = txn
+            .batch_get(vec![vec![5u8], vec![20u8]])
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(got.len(), 2);
+        let mut deadlines = deadlines.lock().unwrap().clone();
+        deadlines.sort();
+        assert_eq!(
+            deadlines,
+            [
+                (vec![vec![5u8]], 100),
+                (vec![vec![5u8]], 100),
+                (vec![vec![20u8]], 100)
+            ]
+        );
+        txn.rollback().await.unwrap();
     }
 }
