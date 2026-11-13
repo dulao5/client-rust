@@ -1249,7 +1249,7 @@ async fn get_at_max_ts<PdC: PdClient>(
         if !outcome.live.is_empty() {
             // `bo.BackoffWithMaxSleepTxnLockFast(msBeforeExpired)` (snapshot.go:927).
             match lock_backoff.next_wait(outcome.ms_before_expired) {
-                None => return Err(Error::ResolveLockError(outcome.live)),
+                None => return Err(lock_backoff.exhausted(Error::ResolveLockError(outcome.live))),
                 Some(wait) => wait.wait(rpc.clone()).await?,
             }
         }
@@ -1892,7 +1892,11 @@ impl<PdC: PdClient> Committer<PdC> {
 /// (`errorpb.UndeterminedResult`). Note `Error::GrpcAPI` is the variant every KV RPC
 /// dispatch failure takes since the tonic migration; `Error::Grpc` is only connection
 /// establishment.
+///
+/// A budget that ran out on such an error reports it inside [`Error::BackoffExhausted`]; the
+/// outcome is still unknown, so the last error is what is classified ([`Error::root`]).
 fn is_commit_outcome_unknown(e: &Error) -> bool {
+    let e = e.root();
     crate::request::plan::is_grpc_error(e) || crate::request::plan::is_undetermined_region_error(e)
 }
 
@@ -2813,5 +2817,116 @@ mod tests {
             start.elapsed()
         );
         txn.rollback().await.unwrap();
+    }
+
+    /// Lucky's note on client-rust#12: when the budget runs out, report the kind of error it
+    /// slept on longest, as client-go does (`longestSleepCfg`, config/retry/backoff.go:175-180),
+    /// with the last error inside.
+    #[tokio::test(start_paused = true)]
+    async fn test_exhausted_budget_reports_the_longest_sleep() {
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |_: &dyn Any| {
+                Ok(Box::new(kvrpcpb::GetResponse {
+                    region_error: Some(stale_command()),
+                    ..Default::default()
+                }) as Box<dyn Any>)
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(100),
+            pd_client,
+            go_budget(),
+            Keyspace::Disable,
+        );
+        match txn.get(b"k".to_vec()).await {
+            Err(crate::Error::BackoffExhausted { kind, last }) => {
+                assert_eq!(kind, crate::metrics::BackoffType::StaleCommand);
+                assert_eq!(kind.go_config(), "staleCommand");
+                assert!(
+                    matches!(*last, crate::Error::RegionError(ref e) if e.stale_command.is_some()),
+                    "{last:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        txn.rollback().await.unwrap();
+    }
+
+    /// Lucky's note on client-rust#12: a read's lock resolution must draw from the read's
+    /// started budget; handing it the unstarted template is caught in debug builds.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "unstarted time budget")]
+    async fn test_read_lock_resolution_requires_a_started_budget() {
+        use crate::request::Plan;
+        use crate::request::PlanBuilder;
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |_: &dyn Any| Ok(Box::<kvrpcpb::GetResponse>::default() as Box<dyn Any>),
+        )));
+        let hints = crate::transaction::ReadLockHints::new(100);
+        let request = crate::transaction::lowering::new_get_request(
+            b"k".to_vec().into(),
+            Timestamp::from_version(100),
+        );
+        // As the scanner does: one region, no `RetryableMultiRegion` to start the budget.
+        let region_store = pd_client
+            .clone()
+            .map_region_to_store(MockPdClient::region1())
+            .await
+            .unwrap();
+        let plan = PlanBuilder::new(pd_client, Keyspace::Disable, request)
+            .read_lock_hints(hints.clone())
+            .single_region_with_store(region_store)
+            .await
+            .unwrap()
+            .resolve_lock_for_read(
+                Timestamp::from_version(100),
+                crate::Backoff::time_budget(20_000),
+                Keyspace::Disable,
+                hints,
+                true,
+            )
+            .plan();
+        let _ = plan.execute().await;
+    }
+
+    /// #13 review: an async-commit prewrite whose time budget runs out on gRPC errors still
+    /// reports the outcome as unknown. The budget wraps the gRPC error in
+    /// `BackoffExhausted { kind: TikvRpc, .. }`, and `is_commit_outcome_unknown` looks
+    /// through it; reporting a plain failure could make the caller retry or roll back a
+    /// transaction that may be durable.
+    #[tokio::test(start_paused = true)]
+    async fn test_async_commit_prewrite_out_of_budget_on_grpc_errors_is_undetermined() {
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.downcast_ref::<kvrpcpb::PrewriteRequest>().is_some() {
+                    Err(crate::Error::GrpcAPI(tonic::Status::unavailable(
+                        "store down",
+                    )))
+                } else {
+                    Ok(Box::<kvrpcpb::BatchRollbackResponse>::default() as Box<dyn Any>)
+                }
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(100),
+            pd_client,
+            go_budget().use_async_commit(),
+            Keyspace::Disable,
+        );
+        txn.put(b"k".to_vec(), b"v".to_vec()).await.unwrap();
+        match txn.commit().await {
+            Err(crate::Error::UndeterminedError(e)) => assert!(
+                matches!(
+                    *e,
+                    crate::Error::BackoffExhausted {
+                        kind: crate::metrics::BackoffType::TikvRpc,
+                        ..
+                    }
+                ),
+                "{e:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 }

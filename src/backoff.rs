@@ -116,6 +116,48 @@ impl Backoff {
         matches!(self.kind, BackoffKind::TimeBudget(_))
     }
 
+    /// A [`time_budget`](Backoff::time_budget) not [started](Backoff::start) yet (a template).
+    pub(crate) fn is_unstarted_time_budget(&self) -> bool {
+        matches!(&self.kind, BackoffKind::TimeBudget(budget) if budget.state.is_none())
+    }
+
+    /// The kind of error this budget slept on longest, `serverBusy` aside (client-go
+    /// `longestSleepCfg`, backoff.go:368-383); `None` for other backoffs or before any sleep.
+    pub(crate) fn longest_sleep(&self) -> Option<BackoffType> {
+        let BackoffKind::TimeBudget(TimeBudget {
+            state: Some(state), ..
+        }) = &self.kind
+        else {
+            return None;
+        };
+        let state = state.lock().unwrap_or_else(|e| e.into_inner());
+        BackoffType::ALL
+            .into_iter()
+            .filter(|t| *t != BackoffType::ServerBusy)
+            .map(|t| (t, state.slept_ms[t as usize]))
+            .filter(|(_, ms)| *ms > 0)
+            .max_by_key(|(_, ms)| *ms)
+            .map(|(t, _)| t)
+    }
+
+    /// The error to return when this backoff refuses another retry after `error`. A
+    /// [`time_budget`](Backoff::time_budget) reports, as client-go does, the kind of error it
+    /// slept on longest ([`Error::BackoffExhausted`]; backoff.go:175-180), with `error` as the
+    /// last one. Any other backoff, or an undetermined outcome (which commit paths must
+    /// recognise as such), returns `error` unchanged.
+    pub(crate) fn exhausted(&self, error: crate::Error) -> crate::Error {
+        if crate::request::plan::is_undetermined_region_error(&error) {
+            return error;
+        }
+        match self.longest_sleep() {
+            Some(kind) => crate::Error::BackoffExhausted {
+                kind,
+                last: Box::new(error),
+            },
+            None => error,
+        }
+    }
+
     /// A budget for one new request: for a [`time_budget`](Backoff::time_budget) backoff, a
     /// fresh budget (client-go's `NewBackofferWithVars` at the start of each read) whose
     /// clones all draw from it; any other backoff is just cloned.
@@ -141,6 +183,8 @@ impl Backoff {
                     total_sleep_ms: state.total_sleep_ms,
                     excluded_sleep_ms: state.excluded_sleep_ms,
                     attempts: [0; BACKOFF_COUNT],
+                    // `Fork` copies `backoffSleepMS` (backoff.go:287).
+                    slept_ms: state.slept_ms,
                 }
             });
             budget.state = forked.map(|state| Arc::new(Mutex::new(state)));
@@ -330,6 +374,8 @@ struct BudgetState {
     total_sleep_ms: u64,
     excluded_sleep_ms: u64,
     attempts: [u32; BACKOFF_COUNT],
+    /// Sleep per kind (`backoffSleepMS`), for the error reported when the budget runs out.
+    slept_ms: [u64; BACKOFF_COUNT],
 }
 
 /// `serverBusy` sleeps excluded from the budget, at most (`isSleepExcluded`, config.go:144).
@@ -399,6 +445,7 @@ impl TimeBudget {
         // charged (backoff.go:200-203).
         let sleep = cap_ms.map_or(sleep, |cap| sleep.min(cap));
         state.total_sleep_ms += sleep;
+        state.slept_ms[t as usize] += sleep;
         if excluded {
             state.excluded_sleep_ms += sleep;
         }
@@ -657,5 +704,26 @@ mod test {
             );
         }
         assert_eq!(b.next_delay_capped(BackoffType::TikvLockFast, cap), None);
+    }
+
+    /// `longest_sleep` (client-go `longestSleepCfg`, backoff.go:368-383): the kind slept on
+    /// longest, `serverBusy` aside; forks keep what was slept.
+    #[test]
+    fn test_time_budget_longest_sleep() {
+        let mut b = Backoff::time_budget(1_000_000).start();
+        assert_eq!(b.longest_sleep(), None);
+        for _ in 0..3 {
+            b.next_delay_for(BackoffType::RegionMiss); // 2 + 4 + 8 ms
+        }
+        assert_eq!(b.longest_sleep(), Some(BackoffType::RegionMiss));
+        b.next_delay_for(BackoffType::TikvRpc); // >= 50 ms
+        assert_eq!(b.longest_sleep(), Some(BackoffType::TikvRpc));
+        b.next_delay_for(BackoffType::ServerBusy); // >= 1000 ms, but excluded
+        assert_eq!(b.longest_sleep(), Some(BackoffType::TikvRpc));
+        assert_eq!(b.fork().longest_sleep(), Some(BackoffType::TikvRpc));
+        // Count-based backoffs report nothing.
+        let mut count = Backoff::no_jitter_backoff(2, 500, 10);
+        count.next_delay_duration();
+        assert_eq!(count.longest_sleep(), None);
     }
 }
