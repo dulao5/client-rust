@@ -8,9 +8,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use derive_new::new;
+use log::info;
 use tonic::codec::CompressionEncoding;
+use tonic::codegen::http::uri::PathAndQuery;
 use tonic::transport::Channel;
 
+use super::liveness;
+use super::liveness::Liveness;
 use super::Request;
 use crate::proto::tikvpb::tikv_client::TikvClient;
 use crate::Result;
@@ -22,6 +26,14 @@ pub trait KvConnect: Sized + Send + Sync + 'static {
     type KvClient: KvClient + Clone + Send + Sync + 'static;
 
     async fn connect(&self, address: &str) -> Result<Self::KvClient>;
+
+    /// Ask the store at `address` whether it is alive, after a connection-level failure
+    /// (client-go `invokeKVStatusAPI`). The caller bounds the call with
+    /// [`liveness::STORE_LIVENESS_TIMEOUT`]. The default says reachable: a connector that
+    /// cannot tell never makes a store be skipped.
+    async fn check_liveness(&self, _address: &str) -> Liveness {
+        Liveness::Reachable
+    }
 }
 
 #[derive(new, Clone)]
@@ -60,6 +72,50 @@ impl KvConnect for TikvConnect {
             clients.push(client);
         }
         Ok(KvRpcClient::with_clients(clients))
+    }
+
+    /// client-go `invokeKVStatusAPI` (internal/locate/store_cache.go): a new connection (not
+    /// the request pool) and one `grpc.health.v1.Health/Check` for the whole server.
+    async fn check_liveness(&self, address: &str) -> Liveness {
+        let timeout = liveness::STORE_LIVENESS_TIMEOUT;
+        let mut grpc = match self
+            .security_mgr
+            .connect_with_timeout(address, timeout, tonic::client::Grpc::new)
+            .await
+        {
+            Ok(grpc) => grpc,
+            Err(e) => {
+                info!("[health check] connect to store {address} failed: {e:?}");
+                return Liveness::Unreachable;
+            }
+        };
+        if let Err(e) = grpc.ready().await {
+            info!("[health check] store {address} not ready: {e:?}");
+            return Liveness::Unreachable;
+        }
+        let mut request = tonic::Request::new(liveness::HealthCheckRequest::default());
+        request.set_timeout(timeout);
+        let response = grpc
+            .unary::<_, liveness::HealthCheckResponse, _>(
+                request,
+                PathAndQuery::from_static(liveness::HEALTH_CHECK_PATH),
+                tonic::codec::ProstCodec::default(),
+            )
+            .await;
+        match response {
+            Ok(response) => {
+                let status = response.into_inner().status;
+                let liveness = liveness::liveness_of_status(status);
+                if liveness != Liveness::Reachable {
+                    info!("[health check] store {address} health status {status}: {liveness:?}");
+                }
+                liveness
+            }
+            Err(status) => {
+                info!("[health check] check store {address} failed: {status:?}");
+                Liveness::Unreachable
+            }
+        }
     }
 }
 
@@ -345,5 +401,96 @@ mod tests {
             .map(|(_, _, t)| header_ms(t.as_deref().expect("grpc-timeout")))
             .collect();
         assert_eq!(timeouts, [30_000, 60_000, 150]);
+    }
+
+    /// A server with only the gRPC health service, answering `status`.
+    #[derive(Clone)]
+    struct HealthOnly {
+        status: i32,
+    }
+
+    impl NamedService for HealthOnly {
+        const NAME: &'static str = "grpc.health.v1.Health";
+    }
+
+    struct Check {
+        status: i32,
+    }
+
+    impl UnaryService<liveness::HealthCheckRequest> for Check {
+        type Response = liveness::HealthCheckResponse;
+        type Future =
+            std::future::Ready<std::result::Result<tonic::Response<Self::Response>, tonic::Status>>;
+
+        fn call(&mut self, _: tonic::Request<liveness::HealthCheckRequest>) -> Self::Future {
+            std::future::ready(Ok(tonic::Response::new(liveness::HealthCheckResponse {
+                status: self.status,
+            })))
+        }
+    }
+
+    impl<B> Service<http::Request<B>> for HealthOnly
+    where
+        B: Body + Send + 'static,
+        B::Error: Into<StdError> + Send + 'static,
+    {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<std::result::Result<(), Infallible>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            assert_eq!(req.uri().path(), liveness::HEALTH_CHECK_PATH);
+            let status = self.status;
+            Box::pin(async move {
+                Ok(
+                    tonic::server::Grpc::new(tonic::codec::ProstCodec::default())
+                        .unary(Check { status }, req)
+                        .await,
+                )
+            })
+        }
+    }
+
+    async fn start_health_server(status: i32) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = TcpIncoming::from_listener(listener, true, None).unwrap();
+        tokio::spawn(
+            Server::builder()
+                .add_service(HealthOnly { status })
+                .serve_with_incoming(incoming),
+        );
+        format!("127.0.0.1:{}", addr.port())
+    }
+
+    /// The liveness check is client-go's `invokeKVStatusAPI`: `grpc.health.v1.Health/Check`,
+    /// SERVING → reachable, UNKNOWN / SERVICE_UNKNOWN → unknown, anything else or no answer →
+    /// unreachable.
+    #[tokio::test]
+    async fn check_liveness_uses_the_grpc_health_service() {
+        let connect = TikvConnect::new(
+            Arc::new(SecurityManager::default()),
+            Duration::from_secs(2),
+            usize::MAX,
+        );
+        for (status, expected) in [
+            (1, Liveness::Reachable),
+            (2, Liveness::Unreachable),
+            (0, Liveness::Unknown),
+            (3, Liveness::Unknown),
+        ] {
+            let addr = start_health_server(status).await;
+            assert_eq!(connect.check_liveness(&addr).await, expected, "{status}");
+        }
+
+        // Nothing listens on a port just released.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        drop(listener);
+        assert_eq!(connect.check_liveness(&addr).await, Liveness::Unreachable);
     }
 }

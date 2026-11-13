@@ -37,6 +37,7 @@ use crate::stats::tikv_stats;
 use crate::store::HasRegionError;
 use crate::store::HasRegionErrors;
 use crate::store::KvClient;
+use crate::store::Liveness;
 use crate::store::RegionStore;
 use crate::store::{HasKeyErrors, Store};
 use crate::timestamp::TimestampExt;
@@ -462,33 +463,65 @@ pub(crate) fn grpc_error_action(error: &Error) -> GrpcErrorAction {
             // Application-level statuses (invalid arguments, auth failures,
             // unsupported APIs, explicit server resource limits, etc.) cannot
             // be healed by replaying the request on every replica. client-go
-            // uses a separate Store health RPC to distinguish this case; Rust
-            // has no equivalent liveness subsystem, so an explicit status with
-            // no transport source is the strongest available signal.
+            // asks the Store's health service on every send failure to tell
+            // this case apart; here the liveness check (`StoreLiveness`) only
+            // follows transport-level failures, so an explicit status with no
+            // transport source is still taken as the server's answer.
             _ => GrpcErrorAction::Return,
         },
         _ => GrpcErrorAction::Return,
     }
 }
 
+/// The peers to try for one round, in order.
+///
+/// Store liveness (client-go `isLeaderCandidate`, internal/locate/replica_selector.go:233-248,
+/// and `ReplicaSelectMixedStrategy.isCandidate`, :320-323): a peer on a store known to be
+/// unreachable is not tried at all, and a leader whose liveness is unknown is tried after the
+/// followers rather than first. With every store reachable the order is unchanged.
 fn region_request_candidates(
     region: &RegionWithLeader,
     followers_only: bool,
-) -> impl Iterator<Item = &metapb::Peer> + '_ {
+    liveness: impl Fn(StoreId) -> Liveness,
+) -> Vec<&metapb::Peer> {
     let leader_store_id = region.leader.as_ref().map(|leader| leader.store_id);
+    let leader = region
+        .leader
+        .as_ref()
+        .filter(|_| !followers_only)
+        .map(|leader| (leader, liveness(leader.store_id)));
     // A request to an unreachable cached leader cannot wake a cold Raft
     // group. Lazily try each data-bearing voter after the cached leader
     // before invalidating it and going back to PD. Learners and witnesses
     // cannot campaign and are not useful for cold-region recovery.
-    region
-        .leader
-        .iter()
-        .filter(move |_| !followers_only)
-        .chain(region.region.peers.iter().filter(move |peer| {
-            !peer.is_witness
-                && peer.role != metapb::PeerRole::Learner as i32
-                && leader_store_id != Some(peer.store_id)
-        }))
+    let followers = region.region.peers.iter().filter(|peer| {
+        !peer.is_witness
+            && peer.role != metapb::PeerRole::Learner as i32
+            && leader_store_id != Some(peer.store_id)
+            && liveness(peer.store_id) != Liveness::Unreachable
+    });
+    let leader_first = leader.filter(|(_, l)| *l == Liveness::Reachable);
+    let leader_last = leader.filter(|(_, l)| *l == Liveness::Unknown);
+    leader_first
+        .map(|(peer, _)| peer)
+        .into_iter()
+        .chain(followers)
+        .chain(leader_last.map(|(peer, _)| peer))
+        .collect()
+}
+
+/// After a connection-level failure to a store, check its liveness (client-go `onSendFail` →
+/// `replicaSelector.onSendFailure` → `checkLiveness`, internal/locate/region_request.go:1663,
+/// replica_selector.go:616): an unreachable store is skipped by later rounds until its
+/// health-check loop sees it back.
+async fn check_store_liveness<PdC: PdClient>(pd_client: &Arc<PdC>, store_id: StoreId) {
+    if let Some(store_liveness) = pd_client.store_liveness() {
+        let liveness = store_liveness.check(store_id).await;
+        debug!(
+            "store {} liveness after a send failure: {:?}",
+            store_id, liveness
+        );
+    }
 }
 
 impl<P: Plan + Shardable, PdC: PdClient> RetryableMultiRegion<P, PdC>
@@ -609,6 +642,9 @@ where
                     "single_shard_handler::map_store, fallback: {}, error: {:?}",
                     is_fallback, err
                 );
+                if is_grpc_error(&err) {
+                    check_store_liveness(pd_client, peer.store_id).await;
+                }
                 // Mapping includes opening the TiKV channel. Drop the Store
                 // entry so a later attempt can reload a changed address from
                 // PD instead of reconnecting to stale metadata indefinitely.
@@ -640,6 +676,10 @@ where
                     "single_shard_handler:execute: grpc error, fallback: {}, error: {:?}",
                     is_fallback, error
                 );
+                let action = grpc_error_action(&error);
+                if matches!(action, GrpcErrorAction::TryNextPeerAndInvalidate) {
+                    check_store_liveness(pd_client, peer.store_id).await;
+                }
                 // A non-idempotent request (raw CAS) may have reached the
                 // server and must not be replayed, including on a follower.
                 if terminal_on_dispatch_error {
@@ -648,7 +688,7 @@ where
                     return CandidateRoundResult::OtherError(error);
                 }
 
-                match grpc_error_action(&error) {
+                match action {
                     GrpcErrorAction::TryNextPeerAndInvalidate => {
                         pd_client.invalidate_store_cache(peer.store_id).await;
                         CandidateRoundResult::RoutingError {
@@ -685,7 +725,11 @@ where
         let mut saw_fallback_not_leader = false;
         let mut last_server_busy_response = None;
 
-        for peer in region_request_candidates(region, followers_only) {
+        let store_liveness = pd_client.store_liveness();
+        let candidates = region_request_candidates(region, followers_only, |store_id| {
+            store_liveness.map_or(Liveness::Reachable, |l| l.get(store_id))
+        });
+        for peer in candidates {
             match Self::execute_candidate(
                 pd_client,
                 plan,

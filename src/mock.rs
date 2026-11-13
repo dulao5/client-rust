@@ -23,6 +23,7 @@ use crate::region::RegionWithLeader;
 use crate::store::KvConnect;
 use crate::store::RegionStore;
 use crate::store::Request;
+use crate::store::StoreLiveness;
 use crate::store::{KvClient, Store};
 use crate::Config;
 use crate::Error;
@@ -102,6 +103,9 @@ pub struct MockPdClient {
     /// Optional observer for region cache invalidations.
     #[new(default)]
     invalidate_region_hook: Option<Arc<dyn Fn(RegionVerId) + Send + Sync + 'static>>,
+    /// Optional store liveness state (default: every store reachable, never probed).
+    #[new(default)]
+    store_liveness: Option<StoreLiveness>,
 }
 
 #[async_trait]
@@ -174,6 +178,12 @@ impl MockPdClient {
         self
     }
 
+    /// Track store liveness with `store_liveness` (whose probe the test controls).
+    pub fn with_store_liveness(mut self, store_liveness: StoreLiveness) -> MockPdClient {
+        self.store_liveness = Some(store_liveness);
+        self
+    }
+
     pub fn region1() -> RegionWithLeader {
         let mut region = RegionWithLeader::default();
         region.region.id = 1;
@@ -242,6 +252,10 @@ impl PdClient for MockPdClient {
 
     fn low_resolution_ts(&self) -> Option<&crate::pd::LowResolutionTs> {
         Some(&self.low_resolution_ts)
+    }
+
+    fn store_liveness(&self) -> Option<&StoreLiveness> {
+        self.store_liveness.as_ref()
     }
 
     async fn map_region_to_store(self: Arc<Self>, region: RegionWithLeader) -> Result<RegionStore> {

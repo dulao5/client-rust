@@ -2,6 +2,7 @@
 
 mod client;
 mod errors;
+pub(crate) mod liveness;
 mod request;
 
 use std::cmp::max;
@@ -18,6 +19,8 @@ pub use self::client::TikvConnect;
 pub use self::errors::HasKeyErrors;
 pub use self::errors::HasRegionError;
 pub use self::errors::HasRegionErrors;
+pub use self::liveness::Liveness;
+pub use self::liveness::StoreLiveness;
 pub(crate) use self::request::context_store_id;
 pub(crate) use self::request::exec_details_wall_time_ns;
 pub use self::request::Request;
