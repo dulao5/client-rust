@@ -253,7 +253,8 @@ impl ReadLockHints {
 /// encountered locks are classified as in lock_resolver.go:624-639, and the read may then
 /// ignore or read through their locks instead of waiting (see [`ReadLocks`]). The locks of
 /// transactions whose fate is settled are resolved in the background
-/// ([`resolve_in_background`]), as client-go does for reads; stale pessimistic locks are
+/// ([`resolve_in_background`], a `tokio::spawn`ed task: call this from within a Tokio
+/// runtime), as client-go does for reads; stale pessimistic locks are
 /// still rolled back before returning (client-go: "pessimistic locks don't block read so it
 /// needn't be async", lock_resolver.go:572).
 ///
@@ -479,8 +480,10 @@ pub(crate) const ASYNC_RESOLVE_LOCK_BACKOFF: Backoff = Backoff::no_jitter_backof
 /// map, lock_resolver.go:588) and only logs its failure: the read has already moved on, and
 /// a later reader resolves again.
 ///
-/// Unlike client-go there is no `LockResolver.Close` to cancel these tasks; each ends when
-/// its backoff runs out (about 40 s at most) or with the runtime.
+/// The task is started with `tokio::spawn`, so this must be called from within a Tokio
+/// runtime (every client-rust request path is). Unlike client-go there is no
+/// `LockResolver.Close` to cancel these tasks; each ends when its backoff runs out (about
+/// 40 s at most) or with the runtime.
 // glue: client-go `go func() { lr.resolveLock(asyncBo, ...) }()`
 fn resolve_in_background(
     lock: &kvrpcpb::LockInfo,
