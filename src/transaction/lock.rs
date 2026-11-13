@@ -183,8 +183,13 @@ impl ReadLocks {
 /// No time left: the retry is immediate, as client-go. Two such retries in a row mean the
 /// low-resolution timestamp and TiKV disagree right at the lock's expiry; the second one
 /// therefore asks the caller to refresh the timestamp with a TSO first
-/// ([`LockWait::refresh_ts`]), spending no attempt: the read neither spins nor fails where
-/// client-go would not (#3 / #8 review).
+/// ([`LockWait::refresh_ts`]), so the read does not fail where client-go would not (#3 / #8
+/// review). That round also sleeps [`Self::REFRESH_SLEEP`], charged to the budget like any
+/// sleep (#8 review, non-blocking): if TiKV keeps the lock live even after fresh timestamps,
+/// the read retries at most once per millisecond per two rounds instead of spinning, and
+/// gives up only after the whole budget's worth of such rounds. (The alternative, spending
+/// one attempt every 8 refreshes, would bound the count but not the rate: 8 × 2 back-to-back
+/// CheckTxnStatus + TSO round trips per attempt.)
 #[derive(Clone, Debug)]
 pub(crate) struct LockBackoff {
     backoff: Backoff,
@@ -194,6 +199,9 @@ pub(crate) struct LockBackoff {
 }
 
 impl LockBackoff {
+    /// The sleep of a round that refreshes the low-resolution timestamp.
+    pub(crate) const REFRESH_SLEEP: Duration = Duration::from_millis(1);
+
     // glue: lock backoff with a time budget
     pub(crate) fn new(backoff: Backoff) -> LockBackoff {
         LockBackoff {
@@ -207,23 +215,37 @@ impl LockBackoff {
     pub(crate) fn next_wait(&mut self, ms_before_expired: i64) -> Option<LockWait> {
         if ms_before_expired <= 0 {
             self.zero_streak += 1;
+            if !self.zero_streak.is_multiple_of(2) {
+                return Some(LockWait {
+                    sleep: Duration::ZERO,
+                    refresh_ts: false,
+                });
+            }
+            let sleep = self.charge(Self::REFRESH_SLEEP)?;
             return Some(LockWait {
-                sleep: Duration::ZERO,
-                refresh_ts: self.zero_streak.is_multiple_of(2),
+                sleep,
+                refresh_ts: true,
             });
         }
         self.zero_streak = 0;
-        let left = match self.step_left {
-            Some(left) => left,
-            None => self.backoff.next_delay_duration()?,
-        };
-        let sleep = left.min(Duration::from_millis(ms_before_expired as u64));
-        let rest = left - sleep;
-        self.step_left = (!rest.is_zero()).then_some(rest);
+        let sleep = self.charge(Duration::from_millis(ms_before_expired as u64))?;
         Some(LockWait {
             sleep,
             refresh_ts: false,
         })
+    }
+
+    /// Take up to `cap` of sleep from the current step (opening the next one if needed),
+    /// or `None` when the budget is spent.
+    fn charge(&mut self, cap: Duration) -> Option<Duration> {
+        let left = match self.step_left {
+            Some(left) => left,
+            None => self.backoff.next_delay_duration()?,
+        };
+        let sleep = left.min(cap);
+        let rest = left - sleep;
+        self.step_left = (!rest.is_zero()).then_some(rest);
+        Some(sleep)
     }
 }
 
@@ -1915,16 +1937,17 @@ mod tests {
         };
         // Steps of 100, 200, 400 ms.
         let mut lb = LockBackoff::new(Backoff::no_jitter_backoff(100, 1000, 3));
-        // No time left: immediate; the second in a row asks for a TSO refresh; nothing spent.
+        // No time left: immediate; the second in a row refreshes the TSO and sleeps 1 ms,
+        // charged to the first (100 ms) step.
         assert_eq!(lb.next_wait(0), wait(0, false));
-        assert_eq!(lb.next_wait(0), wait(0, true));
+        assert_eq!(lb.next_wait(0), wait(1, true));
         assert_eq!(lb.next_wait(0), wait(0, false));
-        assert_eq!(lb.backoff.current_attempts(), 0);
-        // 100 ms step, capped sleeps of 30 ms: 30, 30, 30, 10, then the 200 ms step.
+        assert_eq!(lb.backoff.current_attempts(), 1);
+        // The rest of the 100 ms step (99 ms) in capped sleeps of 30 ms, then the 200 ms step.
         for _ in 0..3 {
             assert_eq!(lb.next_wait(30), wait(30, false));
         }
-        assert_eq!(lb.next_wait(30), wait(10, false));
+        assert_eq!(lb.next_wait(30), wait(9, false));
         assert_eq!(lb.backoff.current_attempts(), 1);
         assert_eq!(lb.next_wait(30), wait(30, false));
         assert_eq!(lb.backoff.current_attempts(), 2);
