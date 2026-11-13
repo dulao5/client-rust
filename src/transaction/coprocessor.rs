@@ -672,6 +672,8 @@ async fn handle_task_once<PdC: PdClient>(
             ctx.timestamp.clone(),
             ctx.pd_client.clone(),
             ctx.keyspace,
+            // `NewClientHelper(.., resolveLite = false)` (coprocessor.go:924).
+            false,
         )
         .await?;
         ctx.lock_hints.record(ctx.timestamp.version(), &read);

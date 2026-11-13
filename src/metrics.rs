@@ -476,13 +476,15 @@ pub(crate) enum LockAction {
     QueryCheckSecondaryLocks,
     /// `ResolveLock` sent.
     QueryResolveLocks,
+    /// A lite `ResolveLock` (one key) sent.
+    ResolveLockLite,
     /// An expired async-commit lock's transaction is being resolved.
     ResolveAsyncCommit,
     /// Locks of several transactions resolved in one request (GC path).
     BatchResolve,
 }
 
-const LOCK_LABELS: [&str; 11] = [
+const LOCK_LABELS: [&str; 12] = [
     "resolve",
     "expired",
     "not_expired",
@@ -492,6 +494,7 @@ const LOCK_LABELS: [&str; 11] = [
     "query_txn_status_rolled_back",
     "query_check_secondary_locks",
     "query_resolve_locks",
+    "query_resolve_lock_lite",
     "resolve_async_commit",
     "batch_resolve",
 ];

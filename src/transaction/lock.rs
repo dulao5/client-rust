@@ -116,7 +116,7 @@ pub(crate) async fn resolve_locks_with_expiry(
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
 ) -> Result<ReadLocks> {
-    resolve_locks_impl(locks, timestamp, pd_client, keyspace, false).await
+    resolve_locks_impl(locks, timestamp, pd_client, keyspace, false, false).await
 }
 
 pub async fn resolve_locks(
@@ -126,7 +126,7 @@ pub async fn resolve_locks(
     keyspace: Keyspace,
 ) -> Result<Vec<kvrpcpb::LockInfo> /* live_locks */> {
     Ok(
-        resolve_locks_impl(locks, timestamp, pd_client, keyspace, false)
+        resolve_locks_impl(locks, timestamp, pd_client, keyspace, false, false)
             .await?
             .live,
     )
@@ -281,13 +281,18 @@ impl ReadLockHints {
 /// client-go does (`KVSnapshot.get` goes through the same `ClientHelper`): `CheckTxnStatus`
 /// then answers `MinCommitTsPushed` for a live transaction that is not committed, and every
 /// committed one can be read through.
+///
+/// `lite`: client-go's `ResolveLocksOptions.Lite`, set by a snapshot's point get
+/// (`NewClientHelper(.., resolveLite = true)`, txnsnapshot/snapshot.go:786): resolve only the
+/// encountered key instead of the whole region (see [`RESOLVE_LOCK_LITE_THRESHOLD`]).
 pub(crate) async fn resolve_locks_for_read(
     locks: Vec<kvrpcpb::LockInfo>,
     timestamp: Timestamp,
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
+    lite: bool,
 ) -> Result<ReadLocks> {
-    resolve_locks_impl(locks, timestamp, pd_client, keyspace, true).await
+    resolve_locks_impl(locks, timestamp, pd_client, keyspace, true, lite).await
 }
 
 async fn resolve_locks_impl(
@@ -296,6 +301,7 @@ async fn resolve_locks_impl(
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
     for_read: bool,
+    lite: bool,
 ) -> Result<ReadLocks> {
     debug!("resolving locks");
     reject_shared_locks(&locks)?;
@@ -379,16 +385,25 @@ async fn resolve_locks_impl(
             // A read does not wait for the cleanup: it already knows how to treat the
             // transaction's locks (client-go lock_resolver.go:584-596, and :1092 for an
             // async-commit transaction, `asyncResolveAll = forRead`).
-            resolve_in_background(&lock, keys, commit_version, pd_client.clone(), keyspace);
+            resolve_in_background(
+                &lock,
+                keys,
+                commit_version,
+                lite,
+                pd_client.clone(),
+                keyspace,
+            );
             continue;
         }
         let regions = clean_regions.entry(lock.lock_version).or_default();
-        for key in keys.iter().chain([&lock.key]) {
+        let plan = ResolvePlan::new(&lock, keys, lite);
+        for (key, lite) in plan.requests() {
             resolve_lock_with_retry(
                 key.into(),
                 lock.lock_version,
                 commit_version,
                 lock.is_txn_file,
+                lite,
                 pd_client.clone(),
                 keyspace,
                 OPTIMISTIC_BACKOFF,
@@ -487,10 +502,50 @@ impl LockAction {
     }
 }
 
+/// client-go `TiKVClient.ResolveLockLiteThreshold` (config/client.go:193, default 16): a lock
+/// of a transaction with fewer keys is resolved "lite", for its own key only
+/// (lock_resolver.go:1208). TiDB's `tikv-client.resolve-lock-lite-threshold`; not
+/// configurable here yet.
+pub(crate) const RESOLVE_LOCK_LITE_THRESHOLD: u64 = 16;
+
 /// Backoff of a background lock cleanup: client-go gives it its own backoffer of
 /// `asyncResolveLockMaxBackoff` = 40 s (lock_resolver.go:48, :586, :1093). Here an attempt
 /// budget with about the same total sleep: 2, 4, ..., 256 ms, then 80 × 500 ms ≈ 40.5 s.
 pub(crate) const ASYNC_RESOLVE_LOCK_BACKOFF: Backoff = Backoff::no_jitter_backoff(2, 500, 88);
+
+/// Which `ResolveLock` requests settle a transaction met through `lock`: client-go
+/// `resolveLock` (lock_resolver.go:1204-1271) for a 2PC transaction, or every key of an
+/// async-commit one (`keys`, from its primary; region-wide, see R8 in tidb-rs's
+/// specs/D07.1-store/lock-resolver.md).
+struct ResolvePlan {
+    keys: Vec<Vec<u8>>,
+    /// The encountered key, unless it needs no request.
+    key: Option<Vec<u8>>,
+    /// Resolve `key` alone (`Keys = [l.Key]`) instead of its whole region.
+    lite: bool,
+}
+
+impl ResolvePlan {
+    // glue: client-go resolveLock's lite decision
+    fn new(lock: &kvrpcpb::LockInfo, keys: Vec<Vec<u8>>, lite: bool) -> ResolvePlan {
+        // lock_resolver.go:1208: `resolveLite := lite || l.TxnSize < resolveLockLiteThreshold`
+        // (only for a 2PC transaction: async commit resolves every key it recovered).
+        let lite = keys.is_empty() && (lite || lock.txn_size < RESOLVE_LOCK_LITE_THRESHOLD);
+        // :1210: "The lock has been resolved by getTxnStatusFromLock": CheckTxnStatus on the
+        // primary already committed or rolled it back.
+        let key = (!(lite && lock.key == lock.primary_lock)).then(|| lock.key.clone());
+        ResolvePlan { keys, key, lite }
+    }
+
+    /// (key, lite) of each request, in order.
+    // glue: client-go resolveLock / resolveAsyncResolveData
+    fn requests(&self) -> impl Iterator<Item = (&Vec<u8>, bool)> {
+        self.keys
+            .iter()
+            .map(|k| (k, false))
+            .chain(self.key.iter().map(move |k| (k, self.lite)))
+    }
+}
 
 /// Resolve the locks of a settled transaction in a background task, for a read
 /// (client-go: the goroutines of lock_resolver.go:587 and :1094). `keys` are the other keys of
@@ -508,20 +563,22 @@ fn resolve_in_background(
     lock: &kvrpcpb::LockInfo,
     keys: Vec<Vec<u8>>,
     commit_version: u64,
+    lite: bool,
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
 ) {
     let start_version = lock.lock_version;
     let is_txn_file = lock.is_txn_file;
-    let key = lock.key.clone();
+    let plan = ResolvePlan::new(lock, keys, lite);
     tokio::spawn(async move {
         let mut regions = HashSet::new();
-        for k in keys.iter().chain([&key]) {
+        for (k, lite) in plan.requests() {
             if let Err(e) = resolve_lock_with_retry(
                 k.into(),
                 start_version,
                 commit_version,
                 is_txn_file,
+                lite,
                 pd_client.clone(),
                 keyspace,
                 ASYNC_RESOLVE_LOCK_BACKOFF,
@@ -574,12 +631,16 @@ async fn pessimistic_rollback_lock(
 /// Resolve every lock of transaction `start_version` in the region holding `key`, unless that
 /// region is already in `clean_regions`. ResolveLock sweeps the whole region, so one successful
 /// request per region is enough no matter how many of the transaction's keys point to it.
+///
+/// `lite`: resolve `key` alone (`ResolveLockRequest.keys = [key]`, client-go
+/// lock_resolver.go:1230-1235); the region is then not recorded as clean (:1267).
 #[allow(clippy::too_many_arguments)]
 async fn resolve_lock_with_retry(
     key: &Key,
     start_version: u64,
     commit_version: u64,
     is_txn_file: bool,
+    lite: bool,
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
     mut backoff: Backoff,
@@ -595,8 +656,12 @@ async fn resolve_lock_with_retry(
         if clean_regions.contains(&ver_id) {
             return Ok(());
         }
-        let request =
+        let mut request =
             requests::new_resolve_lock_request(start_version, commit_version, is_txn_file);
+        if lite {
+            metrics::lock_resolver(LockMetric::ResolveLockLite);
+            request.keys = vec![key.to_vec()];
+        }
         metrics::lock_resolver(LockMetric::QueryResolveLocks);
         let plan_builder =
             match crate::request::PlanBuilder::new(pd_client.clone(), keyspace, request)
@@ -620,7 +685,9 @@ async fn resolve_lock_with_retry(
         let plan = plan_builder.extract_error().plan();
         match plan.execute().await {
             Ok(_) => {
-                clean_regions.insert(ver_id);
+                if !lite {
+                    clean_regions.insert(ver_id);
+                }
                 return Ok(());
             }
             // Retry on region error. `ResolveLockResponse` can have at most 1 error, and
@@ -1242,6 +1309,9 @@ mod tests {
             min_commit_ts,
             use_async_commit: true,
             secondaries,
+            // Not lite: these tests count region-wide ResolveLock requests (R5 tests the
+            // lite mode separately).
+            txn_size: 100,
             ..Default::default()
         }
     }
@@ -1354,6 +1424,7 @@ mod tests {
             primary_lock: vec![1],
             lock_version: 1,
             lock_ttl: 100,
+            txn_size: 100, // not lite
             ..Default::default()
         };
         let lock_captured = lock.clone();
@@ -1383,6 +1454,7 @@ mod tests {
             Timestamp::from_version(10),
             client,
             Keyspace::Disable,
+            false,
         )
         .await
         .unwrap();
@@ -1436,6 +1508,7 @@ mod tests {
             primary_lock: vec![1],
             lock_version: 1,
             lock_ttl: 100,
+            txn_size: 100, // not lite
             ..Default::default()
         };
         let read = resolve_locks_for_read(
@@ -1443,6 +1516,7 @@ mod tests {
             Timestamp::from_version(10),
             client,
             Keyspace::Disable,
+            false,
         )
         .await
         .unwrap();
@@ -1499,6 +1573,7 @@ mod tests {
             Timestamp::from_version(100),
             client,
             Keyspace::Disable,
+            false,
         )
         .await
         .unwrap();
@@ -1565,6 +1640,7 @@ mod tests {
             Timestamp::from_version(10),
             client,
             Keyspace::Disable,
+            false,
         )
         .await
         .unwrap();
@@ -1590,6 +1666,86 @@ mod tests {
             Some(std::time::Duration::from_millis(200))
         );
         assert_eq!(lock_backoff_sleep(&mut backoff, 10_000), None);
+    }
+
+    /// R5: lite resolution (client-go `resolveLock`, lock_resolver.go:1204-1271). A
+    /// committed 2PC transaction is met through three locks in one region: its primary (key
+    /// [1]) and two secondaries ([2], [3]). Each case gives the `ResolveLock` requests sent,
+    /// as their `keys` (empty = the whole region):
+    /// - small transaction (`txn_size < 16`), or `lite` asked for: the primary needs no request
+    ///   (CheckTxnStatus resolved it), each secondary is resolved alone, and nothing is
+    ///   recorded as clean, so the second secondary gets its own request;
+    /// - big transaction, not lite: one region-wide request, the region is then clean.
+    #[rstest::rstest]
+    #[case::small_txn(3, false, vec![vec![vec![2u8]], vec![vec![3u8]]])]
+    #[case::lite_asked(100, true, vec![vec![vec![2u8]], vec![vec![3u8]]])]
+    #[case::big_txn(100, false, vec![vec![]])]
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_lock_lite(
+        #[case] txn_size: u64,
+        #[case] lite: bool,
+        #[case] expected: Vec<Vec<Vec<u8>>>,
+    ) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<Vec<Vec<u8>>>::new()));
+        let requests_captured = requests.clone();
+        let client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.is::<kvrpcpb::CheckTxnStatusRequest>() {
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        commit_version: 5,
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                if let Some(req) = req.downcast_ref::<kvrpcpb::ResolveLockRequest>() {
+                    requests_captured.lock().unwrap().push(req.keys.clone());
+                    return Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>);
+                }
+                panic!("unexpected request type: {:?}", req.type_id());
+            },
+        )));
+        let lock = |key: u8| kvrpcpb::LockInfo {
+            key: vec![key],
+            primary_lock: vec![1],
+            lock_version: 1,
+            lock_ttl: 100,
+            txn_size,
+            ..Default::default()
+        };
+        let locks = vec![lock(1), lock(2), lock(3)];
+        if lite {
+            // Only reads ask for lite (a snapshot's point get); the cleanup then runs in the
+            // background.
+            resolve_locks_for_read(
+                locks,
+                Timestamp::from_version(10),
+                client,
+                Keyspace::Disable,
+                true,
+            )
+            .await
+            .unwrap();
+            for _ in 0..200 {
+                if requests.lock().unwrap().len() >= expected.len() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let mut got = requests.lock().unwrap().clone();
+            got.sort();
+            assert_eq!(got, expected);
+        } else {
+            resolve_locks(
+                locks,
+                Timestamp::from_version(10),
+                client,
+                Keyspace::Disable,
+            )
+            .await
+            .unwrap();
+            assert_eq!(*requests.lock().unwrap(), expected);
+        }
     }
 
     /// `ReadLockHints` (client-go `util.TSSet` pair): `get_all` is `None` while empty, the
@@ -1652,6 +1808,7 @@ mod tests {
             1,
             2,
             false,
+            false,
             client.clone(),
             keyspace,
             backoff.clone(),
@@ -1672,6 +1829,7 @@ mod tests {
             (&key).into(),
             3,
             4,
+            false,
             false,
             client,
             keyspace,
@@ -1714,6 +1872,7 @@ mod tests {
         lock.primary_lock = vec![1];
         lock.lock_version = 1;
         lock.lock_ttl = 100; // not expired under MockPdClient's Timestamp::default()
+        lock.txn_size = 100; // not lite: the resolve is counted
 
         let live_locks = resolve_locks(vec![lock], Timestamp::default(), client, Keyspace::Disable)
             .await

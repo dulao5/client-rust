@@ -174,7 +174,14 @@ impl<PdC: PdClient> Transaction<PdC> {
                 let request = new_get_request(key, timestamp.clone());
                 let plan = PlanBuilder::new(rpc, keyspace, request)
                     .read_lock_hints(hints.clone())
-                    .resolve_lock_for_read(timestamp, retry_options.lock_backoff, keyspace, hints)
+                    // `NewClientHelper(.., resolveLite = true)` (snapshot.go:786).
+                    .resolve_lock_for_read(
+                        timestamp,
+                        retry_options.lock_backoff,
+                        keyspace,
+                        hints,
+                        true,
+                    )
                     .retry_multi_region(DEFAULT_REGION_BACKOFF)
                     .merge(CollectSingle)
                     .post_process_default()
@@ -313,7 +320,14 @@ impl<PdC: PdClient> Transaction<PdC> {
                 let request = new_batch_get_request(keys, timestamp.clone());
                 let plan = PlanBuilder::new(rpc, keyspace, request)
                     .read_lock_hints(hints.clone())
-                    .resolve_lock_for_read(timestamp, retry_options.lock_backoff, keyspace, hints)
+                    // `NewClientHelper(.., resolveLite = false)` (snapshot.go:591).
+                    .resolve_lock_for_read(
+                        timestamp,
+                        retry_options.lock_backoff,
+                        keyspace,
+                        hints,
+                        false,
+                    )
                     .retry_multi_region(retry_options.region_backoff)
                     .merge(Collect)
                     .plan();
@@ -1216,6 +1230,8 @@ async fn get_at_max_ts<PdC: PdClient>(
             Timestamp::from_version(u64::MAX),
             rpc.clone(),
             keyspace,
+            // `KVSnapshot.get`'s helper resolves lite (snapshot.go:786).
+            true,
         )
         .await?;
         hints.record(u64::MAX, &outcome);
