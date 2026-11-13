@@ -1264,4 +1264,202 @@ mod test {
         ));
         assert_eq!(updated_leader_store_id.load(Ordering::SeqCst), 44);
     }
+
+    /// A cluster where store 41 (the cached leader) is down until `down` is cleared, store 44
+    /// is a follower and store 45 the new leader, with a liveness probe that answers from
+    /// `down` and counts its calls.
+    struct DeadLeaderCluster {
+        down: Arc<AtomicBool>,
+        accesses: Arc<std::sync::Mutex<Vec<StoreId>>>,
+        probes: Arc<AtomicUsize>,
+        pd_client: Arc<MockPdClient>,
+    }
+
+    fn dead_leader_cluster(probe_delay: Duration) -> DeadLeaderCluster {
+        use futures::FutureExt;
+
+        use crate::store::Liveness;
+        use crate::store::StoreLiveness;
+
+        let down = Arc::new(AtomicBool::new(true));
+        let accesses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probes = Arc::new(AtomicUsize::new(0));
+
+        let dispatch_down = down.clone();
+        let dispatch_accesses = accesses.clone();
+        let client = MockKvClient::with_dispatch_hook(move |request: &dyn Any| {
+            let store_id = fallback_get_context(request)
+                .peer
+                .as_ref()
+                .expect("target peer")
+                .store_id;
+            dispatch_accesses.lock().unwrap().push(store_id);
+            match store_id {
+                41 if dispatch_down.load(Ordering::SeqCst) => Err(Error::GrpcAPI(
+                    tonic::Status::unavailable("connection refused"),
+                )),
+                44 => Ok(Box::new(kvrpcpb::GetResponse {
+                    region_error: Some(crate::proto::errorpb::Error {
+                        not_leader: Some(crate::proto::errorpb::NotLeader {
+                            region_id: 1,
+                            leader: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }) as Box<dyn Any>),
+                _ => Ok(Box::new(kvrpcpb::GetResponse::default()) as Box<dyn Any>),
+            }
+        });
+
+        let probe_down = down.clone();
+        let probe_count = probes.clone();
+        let store_liveness = StoreLiveness::new(Arc::new(move |store_id| {
+            probe_count.fetch_add(1, Ordering::SeqCst);
+            let down = probe_down.clone();
+            async move {
+                tokio::time::sleep(probe_delay).await;
+                Some(if store_id == 41 && down.load(Ordering::SeqCst) {
+                    Liveness::Unreachable
+                } else {
+                    Liveness::Reachable
+                })
+            }
+            .boxed()
+        }));
+
+        // PD keeps reporting the dead store as the leader.
+        let region = fallback_region(&[44, 45]);
+        let pd_client = Arc::new(
+            MockPdClient::new(client)
+                .with_region_for_key_hook(move |_| Ok(region.clone()))
+                .with_update_leader_hook(|_, _| Ok(()))
+                .with_store_liveness(store_liveness),
+        );
+        DeadLeaderCluster {
+            down,
+            accesses,
+            probes,
+            pd_client,
+        }
+    }
+
+    impl DeadLeaderCluster {
+        fn take_accesses(&self) -> Vec<StoreId> {
+            std::mem::take(&mut *self.accesses.lock().unwrap())
+        }
+    }
+
+    /// client-go store liveness: a dead leader store is tried once, found unreachable, and
+    /// skipped by later requests (`isLeaderCandidate`) instead of each request rediscovering
+    /// it; the health-check loop marks it reachable again and requests go back to it.
+    #[tokio::test(start_paused = true)]
+    async fn test_dead_leader_is_tried_once_then_skipped_until_reachable() {
+        let cluster = dead_leader_cluster(Duration::ZERO);
+        let liveness = crate::pd::PdClient::store_liveness(&*cluster.pd_client).unwrap();
+
+        let response = execute_fallback_get(cluster.pd_client.clone(), Backoff::no_backoff()).await;
+        assert!(response.is_ok());
+        assert_eq!(cluster.take_accesses(), [41, 44, 45]);
+        assert_eq!(cluster.probes.load(Ordering::SeqCst), 1);
+        assert_eq!(liveness.get(41), crate::store::Liveness::Unreachable);
+
+        // While store 41 is unreachable it is not a leader candidate.
+        for _ in 0..3 {
+            let response =
+                execute_fallback_get(cluster.pd_client.clone(), Backoff::no_backoff()).await;
+            assert!(response.is_ok());
+            assert_eq!(cluster.take_accesses(), [44, 45]);
+        }
+        assert_eq!(
+            cluster.probes.load(Ordering::SeqCst),
+            1,
+            "no probe per request"
+        );
+
+        // The loop probes once a second while it stays down.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(cluster.probes.load(Ordering::SeqCst), 2);
+        assert_eq!(liveness.get(41), crate::store::Liveness::Unreachable);
+
+        // It comes back: the next tick flips it to reachable and requests return to it.
+        cluster.down.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(cluster.probes.load(Ordering::SeqCst), 3);
+        assert_eq!(liveness.get(41), crate::store::Liveness::Reachable);
+        let response = execute_fallback_get(cluster.pd_client.clone(), Backoff::no_backoff()).await;
+        assert!(response.is_ok());
+        assert_eq!(cluster.take_accesses(), [41]);
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(
+            cluster.probes.load(Ordering::SeqCst),
+            3,
+            "the loop has stopped"
+        );
+    }
+
+    /// Requests failing on the dead store at the same time share one liveness probe.
+    #[tokio::test(start_paused = true)]
+    async fn test_concurrent_failures_share_one_liveness_probe() {
+        let cluster = dead_leader_cluster(Duration::from_millis(200));
+        let requests = (0..8)
+            .map(|_| execute_fallback_get(cluster.pd_client.clone(), Backoff::no_backoff()))
+            .collect::<Vec<_>>();
+        for response in futures::future::join_all(requests).await {
+            assert!(response.is_ok());
+        }
+        assert_eq!(cluster.probes.load(Ordering::SeqCst), 1);
+        let accesses = cluster.take_accesses();
+        assert_eq!(accesses.iter().filter(|s| **s == 41).count(), 8);
+
+        let response = execute_fallback_get(cluster.pd_client.clone(), Backoff::no_backoff()).await;
+        assert!(response.is_ok());
+        assert_eq!(cluster.take_accesses(), [44, 45]);
+        assert_eq!(cluster.probes.load(Ordering::SeqCst), 1);
+    }
+
+    /// A store that fails a request but answers its health check stays a candidate: the
+    /// order of the peers is what it was without liveness.
+    #[tokio::test(start_paused = true)]
+    async fn test_reachable_store_after_a_failure_is_still_tried_first() {
+        use futures::FutureExt;
+
+        let flaky = Arc::new(AtomicBool::new(true));
+        let client_flaky = flaky.clone();
+        let accesses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatch_accesses = accesses.clone();
+        let client = MockKvClient::with_dispatch_hook(move |request: &dyn Any| {
+            let store_id = fallback_get_context(request)
+                .peer
+                .as_ref()
+                .expect("target peer")
+                .store_id;
+            dispatch_accesses.lock().unwrap().push(store_id);
+            if store_id == 41 && client_flaky.swap(false, Ordering::SeqCst) {
+                return Err(Error::GrpcAPI(tonic::Status::unavailable("reset")));
+            }
+            Ok(Box::new(kvrpcpb::GetResponse::default()) as Box<dyn Any>)
+        });
+        let region = fallback_region(&[44, 45]);
+        let probes = Arc::new(AtomicUsize::new(0));
+        let probe_count = probes.clone();
+        let pd_client = Arc::new(
+            MockPdClient::new(client)
+                .with_region_for_key_hook(move |_| Ok(region.clone()))
+                .with_update_leader_hook(|_, _| Ok(()))
+                .with_store_liveness(crate::store::StoreLiveness::new(Arc::new(move |_| {
+                    probe_count.fetch_add(1, Ordering::SeqCst);
+                    futures::future::ready(Some(crate::store::Liveness::Reachable)).boxed()
+                }))),
+        );
+
+        let response = execute_fallback_get(pd_client.clone(), Backoff::no_backoff()).await;
+        assert!(response.is_ok());
+        assert_eq!(std::mem::take(&mut *accesses.lock().unwrap()), [41, 44]);
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        let response = execute_fallback_get(pd_client, Backoff::no_backoff()).await;
+        assert!(response.is_ok());
+        assert_eq!(std::mem::take(&mut *accesses.lock().unwrap()), [41]);
+    }
 }
