@@ -77,6 +77,9 @@ pub struct MockCluster;
 #[derive(new)]
 pub struct MockPdClient {
     client: MockKvClient,
+    /// Shared lock-resolution state, as the real client has one per cluster client.
+    #[new(default)]
+    lock_resolver: crate::transaction::LockResolverState,
     /// Optional override for `map_region_to_store`.
     #[new(default)]
     map_region_to_store_hook:
@@ -217,6 +220,10 @@ impl MockPdClient {
 #[async_trait]
 impl PdClient for MockPdClient {
     type KvClient = MockKvClient;
+
+    fn lock_resolver_state(&self) -> Option<&crate::transaction::LockResolverState> {
+        Some(&self.lock_resolver)
+    }
 
     async fn map_region_to_store(self: Arc<Self>, region: RegionWithLeader) -> Result<RegionStore> {
         if let Some(hook) = &self.map_region_to_store_hook {

@@ -774,6 +774,20 @@ impl TransactionStatus {
     pub fn is_cacheable(&self) -> bool {
         self.is_determined()
     }
+
+    /// client-go `TxnStatus.HasSameDeterminedStatus` (txnlock/lock_resolver.go:178): both
+    /// committed at the same timestamp, or both rolled back.
+    pub fn has_same_determined_status(&self, other: &TransactionStatus) -> bool {
+        match (&self.kind, &other.kind) {
+            (TransactionStatusKind::Committed(a), TransactionStatusKind::Committed(b)) => {
+                a.version() == b.version()
+            }
+            (TransactionStatusKind::RolledBack, TransactionStatusKind::RolledBack) => {
+                self.is_determined() && other.is_determined()
+            }
+            _ => false,
+        }
+    }
 }
 
 /// The status told by the `commit_version`, `lock_ttl` and `lock_info` fields of a

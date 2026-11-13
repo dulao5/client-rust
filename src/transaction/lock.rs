@@ -2,8 +2,11 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+
+use futures::FutureExt;
 
 use fail::fail_point;
 use log::debug;
@@ -683,8 +686,15 @@ async fn resolve_lock_with_retry(
                 Err(err) => return Err(err),
             };
         let plan = plan_builder.extract_error().plan();
-        match plan.execute().await {
-            Ok(_) => {
+        let sent = async { plan.execute().await.map(|_| ()) };
+        // R12: concurrent region-wide resolves of one transaction in one region are sent once
+        // (client-go `reqCollapse`; lite requests carry keys and are never collapsed).
+        let result = match pd_client.lock_resolver_state() {
+            Some(state) if !lite => state.collapse_resolve(ver_id.id, start_version, sent).await,
+            _ => sent.await,
+        };
+        match result {
+            Ok(()) => {
                 if !lite {
                     clean_regions.insert(ver_id);
                 }
@@ -739,6 +749,156 @@ async fn resolve_lock_with_retry(
                 None => return Err(e),
             },
             Err(e) => return Err(e),
+        }
+    }
+}
+
+/// client-go `ResolvedCacheSize` (txnlock/lock_resolver.go:44).
+pub const RESOLVED_CACHE_SIZE: usize = 2048;
+
+/// The lock-resolution state that client-go keeps per `KVStore`, shared by every request of
+/// one cluster client (reached through [`PdClient::lock_resolver_state`]):
+///
+/// - the settled transaction statuses, `LockResolver.mu.resolved` with its FIFO of
+///   [`RESOLVED_CACHE_SIZE`] (txnlock/lock_resolver.go:61-76, `saveResolved` :236,
+///   `getResolved` :265) — R6;
+/// - the region-wide `ResolveLock` requests in flight, client-go's `resolveRegionSf`
+///   singleflight (internal/client/client_collapse.go:82, keyed by region and start_ts),
+///   so that concurrent readers of one locked region send one request — R12.
+#[derive(Default)]
+pub struct LockResolverState {
+    resolved: std::sync::Mutex<ResolvedCache>,
+    in_flight: std::sync::Mutex<HashMap<(u64, u64), InFlight>>,
+}
+
+type InFlight = futures::future::Shared<futures::future::BoxFuture<'static, bool>>;
+
+#[derive(Default)]
+struct ResolvedCache {
+    map: HashMap<u64, Arc<TransactionStatus>>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl LockResolverState {
+    /// client-go `getResolved`.
+    pub fn get_resolved(&self, txn_id: u64) -> Option<Arc<TransactionStatus>> {
+        let cache = self.resolved.lock().unwrap_or_else(|e| e.into_inner());
+        cache.map.get(&txn_id).cloned()
+    }
+
+    /// client-go `saveResolved` (lock_resolver.go:236-263): only settled statuses; a second
+    /// save of a transaction must agree with the first (`HasSameDeterminedStatus`). As in
+    /// client-go v8.5.8 (c3b5079), a violation panics in every build: the cache would
+    /// otherwise make reads resolve the transaction's locks both ways.
+    ///
+    /// What the panic does differs from client-go: there, one in a session goroutine is
+    /// recovered by the connection loop (the statement fails), and one in a background
+    /// cleanup goroutine kills the process. Here a panic ends only the task it happens in (a
+    /// statement's task, or a background cleanup task), so in practice it is "fail loudly";
+    /// a build with `panic = "abort"` would turn every one into a process exit.
+    ///
+    /// The key is the start_ts alone, as in client-go. With API v2 one client may serve
+    /// several keyspaces (`api_v2_no_prefix`); if they belong to different TSO keyspace
+    /// groups, two transactions can share a start_ts and a legitimate pair of statuses would
+    /// trip the conflict panic. tidb-rs uses one keyspace per client.
+    pub fn save_resolved(&self, txn_id: u64, status: Arc<TransactionStatus>) {
+        if !status.is_determined() {
+            error!(
+                "unexpected undetermined status saved to cache, txn_id: {}, status: {:?}",
+                txn_id, status
+            );
+            panic!("unexpected undetermined status saved to cache");
+        }
+        let mut cache = self.resolved.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(saved) = cache.map.get(&txn_id) {
+            if !saved.has_same_determined_status(&status) {
+                error!(
+                    "unexpected txn status saving to the cache, the existing status is not equal to the new one, txn_id: {}, existing: {:?}, new: {:?}",
+                    txn_id, saved, status
+                );
+                panic!("unexpected txn status saved to cache with existing different entry");
+            }
+            return;
+        }
+        cache.map.insert(txn_id, status);
+        cache.order.push_back(txn_id);
+        if cache.map.len() > RESOLVED_CACHE_SIZE {
+            if let Some(front) = cache.order.pop_front() {
+                cache.map.remove(&front);
+            }
+        }
+    }
+
+    /// Run `send` (a region-wide `ResolveLock` of transaction `start_version` in region
+    /// `region_id`) unless the same request is already in flight; then wait for that one
+    /// instead (client-go `resolveRegionSf.DoChan`). Only success is shared: if the request
+    /// in flight fails, a waiting caller sends its own, so it sees its own error (client-rust
+    /// errors are not `Clone`; client-go shares the error).
+    pub(crate) async fn collapse_resolve<F>(
+        &self,
+        region_id: u64,
+        start_version: u64,
+        send: F,
+    ) -> Result<()>
+    where
+        F: Future<Output = Result<()>>,
+    {
+        let key = (region_id, start_version);
+        // Look up or register in one critical section: two callers must never both become
+        // the sender for one key (#6 review).
+        let registered = {
+            let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            match in_flight.get(&key) {
+                Some(waiting) => Err(waiting.clone()),
+                None => {
+                    let (tx, rx) = futures::channel::oneshot::channel::<bool>();
+                    let entry: InFlight = rx.map(|r| r.unwrap_or(false)).boxed().shared();
+                    in_flight.insert(key, entry.clone());
+                    Ok((tx, entry))
+                }
+            }
+        };
+        let (tx, entry) = match registered {
+            Ok(registered) => registered,
+            Err(waiting) => {
+                if waiting.await {
+                    return Ok(());
+                }
+                return send.await;
+            }
+        };
+        // Removes this caller's entry even if the future is dropped mid-request; waiters then
+        // see a dropped sender (false) and send their own.
+        let _guard = InFlightGuard {
+            state: self,
+            key,
+            entry,
+        };
+        let result = send.await;
+        let _ = tx.send(result.is_ok());
+        result
+    }
+}
+
+struct InFlightGuard<'a> {
+    state: &'a LockResolverState,
+    key: (u64, u64),
+    /// This caller's entry: removed only if it is still the one in the map.
+    entry: InFlight,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .state
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if in_flight
+            .get(&self.key)
+            .is_some_and(|e| e.ptr_eq(&self.entry))
+        {
+            in_flight.remove(&self.key);
         }
     }
 }
@@ -900,12 +1060,13 @@ impl LockResolver {
             secondary_status.resolved_commit_version(primary_lock.min_commit_ts)?;
         // The recovered status is final: cache it so further locks of this transaction skip
         // the recovery, as client-go's `resolveAsyncCommitLock` does with `saveResolved`.
+        let recovered = Arc::new(TransactionStatus::from_commit_version(commit_version));
         self.ctx
-            .save_resolved(
-                lock.lock_version,
-                Arc::new(TransactionStatus::from_commit_version(commit_version)),
-            )
+            .save_resolved(lock.lock_version, recovered.clone())
             .await;
+        if let Some(state) = pd_client.lock_resolver_state() {
+            state.save_resolved(lock.lock_version, recovered);
+        }
         // Every lock of the transaction is resolved, not only the encountered one.
         let mut keys = primary_lock.secondaries.clone();
         keys.push(primary_lock.key.clone());
@@ -1063,6 +1224,13 @@ impl LockResolver {
         if let Some(txn_status) = self.ctx.get_resolved(txn_id).await {
             return Ok(txn_status);
         }
+        // R6: the cluster client's cache, shared across requests (client-go `getResolved`).
+        if let Some(txn_status) = pd_client
+            .lock_resolver_state()
+            .and_then(|state| state.get_resolved(txn_id))
+        {
+            return Ok(txn_status);
+        }
 
         // CheckTxnStatus may meet the following cases:
         // 1. LOCK
@@ -1129,6 +1297,9 @@ impl LockResolver {
         let res = Arc::new(status);
         if res.is_cacheable() {
             self.ctx.save_resolved(txn_id, res.clone()).await;
+            if let Some(state) = pd_client.lock_resolver_state() {
+                state.save_resolved(txn_id, res.clone());
+            }
         }
         Ok(res)
     }
@@ -1746,6 +1917,235 @@ mod tests {
             .unwrap();
             assert_eq!(*requests.lock().unwrap(), expected);
         }
+    }
+
+    /// R6: settled statuses are shared across requests of one cluster client: a second,
+    /// separate `resolve_locks` call for the same transaction sends no `CheckTxnStatus`
+    /// (client-go `getResolved` on the store's `LockResolver`).
+    #[tokio::test]
+    #[serial]
+    async fn test_resolved_status_shared_across_calls() {
+        let checks = Arc::new(AtomicUsize::new(0));
+        let checks_captured = checks.clone();
+        let client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.is::<kvrpcpb::CheckTxnStatusRequest>() {
+                    checks_captured.fetch_add(1, Ordering::SeqCst);
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        commit_version: 5,
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                if req.is::<kvrpcpb::ResolveLockRequest>() {
+                    return Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>);
+                }
+                panic!("unexpected request type: {:?}", req.type_id());
+            },
+        )));
+        let lock = |key: u8| kvrpcpb::LockInfo {
+            key: vec![key],
+            primary_lock: vec![1],
+            lock_version: 1,
+            lock_ttl: 100,
+            txn_size: 100,
+            ..Default::default()
+        };
+        for key in [2, 3] {
+            resolve_locks(
+                vec![lock(key)],
+                Timestamp::from_version(10),
+                client.clone(),
+                Keyspace::Disable,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        assert!(client
+            .lock_resolver_state()
+            .unwrap()
+            .get_resolved(1)
+            .is_some());
+    }
+
+    fn committed(ts: u64) -> Arc<TransactionStatus> {
+        Arc::new(TransactionStatus::from_commit_version(ts))
+    }
+
+    /// R6: the cache keeps the last `RESOLVED_CACHE_SIZE` transactions (FIFO), and a
+    /// consistent second save is a no-op.
+    #[test]
+    fn resolved_cache_is_fifo_bounded() {
+        let state = LockResolverState::default();
+        for txn in 1..=(RESOLVED_CACHE_SIZE as u64 + 1) {
+            state.save_resolved(txn, committed(txn + 1_000_000));
+        }
+        assert!(state.get_resolved(1).is_none());
+        assert!(state.get_resolved(2).is_some());
+        assert!(state.get_resolved(RESOLVED_CACHE_SIZE as u64 + 1).is_some());
+        // Same status again: kept, no panic.
+        state.save_resolved(2, committed(2 + 1_000_000));
+    }
+
+    /// R6: as client-go v8.5.8 (`saveResolved`, lock_resolver.go:247-253), a different
+    /// settled status for a cached transaction panics.
+    #[test]
+    #[should_panic(expected = "existing different entry")]
+    fn resolved_cache_panics_on_conflicting_status() {
+        let state = LockResolverState::default();
+        state.save_resolved(7, committed(10));
+        state.save_resolved(7, Arc::new(TransactionStatus::from_commit_version(0)));
+    }
+
+    /// R6: only settled statuses may be cached (lock_resolver.go:237-241).
+    #[test]
+    #[should_panic(expected = "undetermined status")]
+    fn resolved_cache_panics_on_undetermined_status() {
+        let state = LockResolverState::default();
+        state.save_resolved(
+            7,
+            Arc::new(TransactionStatus {
+                kind: TransactionStatusKind::RolledBack,
+                action: kvrpcpb::Action::LockNotExistDoNothing,
+                is_expired: false,
+            }),
+        );
+    }
+
+    /// R12: a region-wide resolve already in flight for the same (region, start_ts) is not
+    /// sent again: the second caller waits for it (client-go `resolveRegionSf`). If the one
+    /// in flight fails, the waiter sends its own; another key is never collapsed.
+    #[rstest::rstest]
+    #[case::collapsed(true, 1, 1)]
+    #[case::leader_failed(false, 1, 2)]
+    #[case::other_txn(true, 2, 2)]
+    #[tokio::test]
+    async fn test_collapse_resolve(
+        #[case] leader_ok: bool,
+        #[case] follower_txn: u64,
+        #[case] expected_sends: usize,
+    ) {
+        let state = Arc::new(LockResolverState::default());
+        let sends = Arc::new(AtomicUsize::new(0));
+        let (release, released) = futures::channel::oneshot::channel::<()>();
+        let leader = {
+            let (state, sends) = (state.clone(), sends.clone());
+            tokio::spawn(async move {
+                state
+                    .collapse_resolve(9, 1, async move {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        let _ = released.await;
+                        if leader_ok {
+                            Ok(())
+                        } else {
+                            Err(Error::StringError("injected".to_owned()))
+                        }
+                    })
+                    .await
+            })
+        };
+        // Let the leader register its request.
+        while sends.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let follower = {
+            let (state, sends) = (state.clone(), sends.clone());
+            tokio::spawn(async move {
+                state
+                    .collapse_resolve(9, follower_txn, async move {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        release.send(()).unwrap();
+        assert_eq!(leader.await.unwrap().is_ok(), leader_ok);
+        assert!(follower.await.unwrap().is_ok());
+        assert_eq!(sends.load(Ordering::SeqCst), expected_sends);
+        // Nothing left in flight.
+        assert!(state.in_flight.lock().unwrap().is_empty());
+    }
+
+    /// R12 (#6 review): the lookup and the registration are one critical section, so of many
+    /// callers starting at once exactly one sends; the others wait and share its success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_collapse_resolve_concurrent_leaders() {
+        const CALLERS: usize = 16;
+        let state = Arc::new(LockResolverState::default());
+        let sends = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let tasks: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let (state, sends, barrier, gate) =
+                    (state.clone(), sends.clone(), barrier.clone(), gate.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    state
+                        .collapse_resolve(9, 1, async move {
+                            sends.fetch_add(1, Ordering::SeqCst);
+                            gate.notified().await;
+                            Ok(())
+                        })
+                        .await
+                })
+            })
+            .collect();
+        while sends.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // Give every caller time to reach the in-flight map.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        gate.notify_waiters();
+        for t in tasks {
+            assert!(t.await.unwrap().is_ok());
+        }
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert!(state.in_flight.lock().unwrap().is_empty());
+    }
+
+    /// R12: a sender dropped mid-request (its task cancelled) removes its own entry; a waiter
+    /// then sends its own request, and a later caller registers afresh.
+    #[tokio::test]
+    async fn test_collapse_resolve_cancelled_leader() {
+        let state = Arc::new(LockResolverState::default());
+        let sends = Arc::new(AtomicUsize::new(0));
+        let leader = {
+            let (state, sends) = (state.clone(), sends.clone());
+            tokio::spawn(async move {
+                state
+                    .collapse_resolve(9, 1, async move {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        futures::future::pending::<Result<()>>().await
+                    })
+                    .await
+            })
+        };
+        while sends.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let waiter = {
+            let (state, sends) = (state.clone(), sends.clone());
+            tokio::spawn(async move {
+                state
+                    .collapse_resolve(9, 1, async move {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        leader.abort();
+        assert!(waiter.await.unwrap().is_ok());
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        assert!(state.in_flight.lock().unwrap().is_empty());
     }
 
     /// `ReadLockHints` (client-go `util.TSSet` pair): `get_all` is `None` while empty, the
