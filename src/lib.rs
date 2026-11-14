@@ -95,6 +95,14 @@
 
 pub mod backoff;
 pub mod metrics;
+/// The kvproto messages (prost) that requests and responses are made of.
+///
+/// tidb-rs ports TiDB's `store/copr` function by function (block D07.2) and builds
+/// `coprocessor.Request`, `coprocessor.KeyRange`, `coprocessor.StoreBatchTask`,
+/// `kvrpcpb.Context` and reads `metapb.Buckets` itself, so it needs the same message types
+/// this client sends. Re-exported as is; no API of its own.
+#[doc(hidden)]
+pub mod proto;
 #[doc(hidden)]
 pub mod raw;
 pub mod request;
@@ -106,7 +114,6 @@ mod compat;
 mod config;
 mod kv;
 mod pd;
-mod proto;
 mod region;
 mod region_cache;
 mod stats;
