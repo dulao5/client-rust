@@ -10,10 +10,6 @@
 
 pub use client::Client;
 pub use client::ProtoLockInfo;
-pub use coprocessor::CopRequest;
-pub use coprocessor::CopResponse;
-pub use coprocessor::CopResponseStream;
-pub use coprocessor::DEFAULT_COPROCESSOR_CONCURRENCY;
 pub use coprocessor::DEFAULT_COPROCESSOR_TIMEOUT;
 pub use coprocessor::REQ_TYPE_ANALYZE;
 pub use coprocessor::REQ_TYPE_CHECKSUM;
