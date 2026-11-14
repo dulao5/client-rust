@@ -158,6 +158,8 @@ pub use crate::raw::Client as RawClient;
 #[doc(inline)]
 pub use crate::raw::ColumnFamily;
 #[doc(inline)]
+pub use crate::region::RegionVerId;
+#[doc(inline)]
 pub use crate::request::RetryOptions;
 #[doc(inline)]
 pub use crate::timestamp::Timestamp;
@@ -175,6 +177,8 @@ pub use crate::transaction::CopRequest;
 pub use crate::transaction::CopResponse;
 #[doc(inline)]
 pub use crate::transaction::CopResponseStream;
+#[doc(inline)]
+pub use crate::transaction::CopSender;
 #[doc(inline)]
 pub use crate::transaction::ProtoLockInfo;
 #[doc(inline)]

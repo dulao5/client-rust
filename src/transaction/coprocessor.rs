@@ -343,9 +343,9 @@ struct CopContext<PdC: PdClient> {
 
 /// The RPC wrapper: carries the coprocessor-specific timeout.
 #[derive(Clone)]
-struct CoprocessorRpc {
-    inner: coprocessor::Request,
-    timeout: Duration,
+pub(crate) struct CoprocessorRpc {
+    pub(crate) inner: coprocessor::Request,
+    pub(crate) timeout: Duration,
 }
 
 #[async_trait]
