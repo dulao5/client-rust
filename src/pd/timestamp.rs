@@ -19,7 +19,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::pin_mut;
 use futures::prelude::*;
 use futures::task::AtomicWaker;
 use futures::task::Context;
@@ -29,7 +28,6 @@ use log::info;
 use log::warn;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-use tokio::sync::Mutex;
 use tonic::transport::Channel;
 
 use crate::internal_err;
@@ -111,7 +109,13 @@ struct Shared {
     /// Requests sent on a stream that broke before answering them, sent first on the next.
     retry: std::sync::Mutex<VecDeque<TimestampRequest>>,
     /// The `TimestampRequest`s which are waiting for the responses from the PD server.
-    pending_requests: Mutex<VecDeque<RequestGroup>>,
+    ///
+    /// A blocking mutex, never held across an `.await`: `run_tso` and the request stream only
+    /// hold it to look at, push or pop a group. An async mutex let `poll_next` return `Pending`
+    /// when `run_tso` held the lock, after the request channel had spent its waker on the
+    /// arrival of the request; nothing woke the stream again (no batch was in flight, so no
+    /// response came), and the request waited for `TSO_WAIT_LIMIT` (tidb-rs#225).
+    pending_requests: std::sync::Mutex<VecDeque<RequestGroup>>,
     /// When there are too many pending requests, the `send_request` future will refuse to fetch
     /// more requests from the bounded channel. This waker is used to wake up the sending future
     /// if the queue containing pending requests is no longer full.
@@ -126,6 +130,12 @@ struct Shared {
 }
 
 impl Shared {
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, VecDeque<RequestGroup>> {
+        self.pending_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Stop taking requests for good and fail the ones still buffered in the channel: the
     /// oracle gives up or is dropped. Closing explicitly matters because tonic may keep an old
     /// request stream (and with it `Shared` and the receiver) alive: new requests would then
@@ -146,7 +156,7 @@ async fn run_tso(
     let shared = Arc::new(Shared {
         request_rx: std::sync::Mutex::new(request_rx),
         retry: std::sync::Mutex::new(VecDeque::new()),
-        pending_requests: Mutex::new(VecDeque::with_capacity(MAX_PENDING_COUNT)),
+        pending_requests: std::sync::Mutex::new(VecDeque::with_capacity(MAX_PENDING_COUNT)),
         sending_future_waker: AtomicWaker::new(),
         generation: AtomicU64::new(0),
         closed: AtomicBool::new(false),
@@ -167,7 +177,7 @@ async fn run_tso(
                 let mut responses = responses.into_inner();
                 loop {
                     // The deadline of the oldest unanswered batch (TSO_BATCH_DEADLINE).
-                    let oldest = shared.pending_requests.lock().await.front().map(|g| g.sent);
+                    let oldest = shared.lock_pending().front().map(|g| g.sent);
                     let wait = oldest.map_or(TSO_BATCH_DEADLINE, |sent| {
                         TSO_BATCH_DEADLINE.saturating_sub(sent.elapsed())
                     });
@@ -185,7 +195,7 @@ async fn run_tso(
                     match next {
                         Some(Ok(resp)) => {
                             let allocated = {
-                                let mut pending = shared.pending_requests.lock().await;
+                                let mut pending = shared.lock_pending();
                                 allocate_timestamps(&resp, &mut pending)
                             };
                             if let Err(e) = allocated {
@@ -210,8 +220,7 @@ async fn run_tso(
         // Retire this stream; what it sent and PD did not answer goes out again on the next
         // one. Sending a request twice is safe: PD only ever hands out larger timestamps.
         shared.generation.fetch_add(1, Ordering::AcqRel);
-        let unanswered: Vec<RequestGroup> =
-            shared.pending_requests.lock().await.drain(..).collect();
+        let unanswered: Vec<RequestGroup> = shared.lock_pending().drain(..).collect();
         {
             let mut retry = shared.retry.lock().unwrap_or_else(|e| e.into_inner());
             for group in unanswered.into_iter().rev() {
@@ -276,15 +285,7 @@ impl Stream for TsoRequestStream {
             hook();
         }
 
-        let pending_requests = shared.pending_requests.lock();
-        pin_mut!(pending_requests);
-        let mut pending_requests = if let Poll::Ready(pending_requests) = pending_requests.poll(cx)
-        {
-            pending_requests
-        } else {
-            shared.sending_future_waker.register(cx.waker());
-            return Poll::Pending;
-        };
+        let mut pending_requests = shared.lock_pending();
         // Invariant: a group is only pushed into `pending_requests` under its lock, by the
         // stream of the current generation. `run_tso` retires a stream (bumps the generation)
         // and then drains under the same lock, so checking again here closes the window
@@ -544,7 +545,7 @@ mod tests {
         Arc::new(Shared {
             request_rx: std::sync::Mutex::new(rx),
             retry: std::sync::Mutex::new(VecDeque::new()),
-            pending_requests: Mutex::new(VecDeque::new()),
+            pending_requests: std::sync::Mutex::new(VecDeque::new()),
             sending_future_waker: AtomicWaker::new(),
             generation: AtomicU64::new(0),
             closed: AtomicBool::new(false),
@@ -572,9 +573,58 @@ mod tests {
             shared: shared.clone(),
         };
         assert_eq!(futures::poll!(old.next()), Poll::Ready(None));
-        assert!(shared.pending_requests.lock().await.is_empty());
+        assert!(shared.lock_pending().is_empty());
         // The request is still in the channel, for the new stream.
         assert!(shared.request_rx.lock().unwrap().try_recv().is_ok());
+    }
+
+    /// #225 (tidb-rs): `run_tso` holds the `pending_requests` lock (its per-response check of
+    /// the oldest batch) just when a request arrives and tonic polls the request stream. The
+    /// stream must not give up on that poll without a way to be woken again: the channel's
+    /// waker was spent on the arrival, and no TSO response will come since nothing is in
+    /// flight, so the request would sit in the channel until `TSO_WAIT_LIMIT` (15 s).
+    #[tokio::test]
+    async fn busy_pending_lock_does_not_strand_a_request() {
+        let (tx, rx) = mpsc::channel(MAX_BATCH_SIZE);
+        let shared = shared(rx);
+        let mut stream = TsoRequestStream {
+            cluster_id: 1,
+            generation: 0,
+            shared: shared.clone(),
+        };
+        let woken = Arc::new(Flag(AtomicBool::new(false)));
+        let waker = futures::task::waker(woken.clone());
+        let mut cx = Context::from_waker(&waker);
+        // Idle: the stream waits on the request channel.
+        assert!(Pin::new(&mut stream).poll_next(&mut cx).is_pending());
+        // A request arrives and wakes the stream (spending the channel's waker).
+        let (request, _response) = oneshot::channel();
+        tx.send(request).await.unwrap();
+        assert!(woken.0.swap(false, Ordering::SeqCst));
+        // `run_tso` holds the lock on another thread while tonic polls the stream.
+        let holder_shared = shared.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let guard = holder_shared.lock_pending();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            drop(guard);
+        });
+        locked_rx.recv().unwrap();
+        let polled = Pin::new(&mut stream).poll_next(&mut cx);
+        holder.join().unwrap();
+        assert!(
+            polled.is_ready() || woken.0.load(Ordering::SeqCst),
+            "the request is stranded: the stream returned Pending and nothing will wake it"
+        );
+    }
+
+    struct Flag(AtomicBool);
+
+    impl futures::task::ArcWake for Flag {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.store(true, Ordering::SeqCst);
+        }
     }
 
     /// #17 review item 2: giving up closes the request channel even while an old request
