@@ -111,6 +111,52 @@ impl Backoff {
         Some(Duration::from_millis(ms))
     }
 
+    /// client-go `Backoffer.Backoff(cfg, err)`: sleeps for the next delay of kind `t`, or
+    /// returns `err` as this budget's exhaustion ([`exhausted`](Backoff::exhausted)).
+    pub async fn backoff(&mut self, t: BackoffType, err: crate::Error) -> crate::Result<()> {
+        match self.next_delay_for(t) {
+            Some(delay) => {
+                crate::metrics::backoff(t, delay);
+                tokio::time::sleep(delay).await;
+                Ok(())
+            }
+            None => Err(self.exhausted(err)),
+        }
+    }
+
+    /// client-go `Backoffer.BackoffWithMaxSleepTxnLockFast(maxSleepMs, err)`.
+    pub async fn backoff_with_max_sleep_txn_lock_fast(
+        &mut self,
+        max_sleep_ms: u64,
+        err: crate::Error,
+    ) -> crate::Result<()> {
+        let t = BackoffType::TikvLockFast;
+        match self.next_delay_capped(t, Some(Duration::from_millis(max_sleep_ms))) {
+            Some(delay) => {
+                crate::metrics::backoff(t, delay);
+                tokio::time::sleep(delay).await;
+                Ok(())
+            }
+            None => Err(self.exhausted(err)),
+        }
+    }
+
+    /// client-go `Backoffer.GetTotalSleep()` in ms: what a time budget has slept so far
+    /// (0 for other backoffs or before any sleep).
+    pub fn total_sleep_ms(&self) -> u64 {
+        match &self.kind {
+            BackoffKind::TimeBudget(TimeBudget {
+                state: Some(state), ..
+            }) => {
+                state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .total_sleep_ms
+            }
+            _ => 0,
+        }
+    }
+
     /// Whether this is a [`time_budget`](Backoff::time_budget) backoff.
     pub fn is_time_budget(&self) -> bool {
         matches!(self.kind, BackoffKind::TimeBudget(_))

@@ -103,4 +103,11 @@ impl Snapshot {
         debug!("invoking coprocessor request on snapshot");
         self.transaction.coprocessor(request).await
     }
+
+    /// A [`CopSender`](crate::CopSender) reading at the snapshot's timestamp: one
+    /// coprocessor RPC per region with client-go `SendReqCtx` semantics, for callers that
+    /// build and schedule the tasks themselves.
+    pub fn cop_sender(&self) -> Result<crate::CopSender> {
+        self.transaction.cop_sender()
+    }
 }

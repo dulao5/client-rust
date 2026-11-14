@@ -544,6 +544,11 @@ impl<PdC: PdClient> Transaction<PdC> {
         .await
     }
 
+    /// A [`CopSender`](crate::CopSender) reading at the transaction's timestamp.
+    pub fn cop_sender(&self) -> Result<super::CopSender<PdC>> {
+        super::CopSender::new(self.rpc.clone(), self.keyspace, self.timestamp.clone())
+    }
+
     /// Sets the value associated with the given key.
     ///
     /// # Examples

@@ -39,7 +39,12 @@ pub use transaction::TransactionOptions;
 
 mod buffer;
 mod client;
+mod copr_sender;
 mod coprocessor;
+pub use copr_sender::CopRpcContext;
+pub use copr_sender::CopSendResult;
+pub use copr_sender::CopSender;
+pub use copr_sender::RegionLocation;
 mod lock;
 pub mod lowering;
 mod requests;
