@@ -592,6 +592,7 @@ where
         context: RetryContext<PdC>,
         current_plan: P,
         backoff: Backoff,
+        first_attempt: bool,
     ) -> Result<<Self as Plan>::Result> {
         let shards = current_plan
             .shards(&context.pd_client)
@@ -599,24 +600,29 @@ where
             .await;
         let shards_len = shards.len();
         debug!("single_plan_handler, shards: {}", shards_len);
-        // One shard (a point get, a batch within one region): run it on this task. Spawning
-        // it costs a task, a join set and two cross-thread wake-ups per request, which is a
-        // visible share of a point get's latency; with one shard nothing runs in parallel.
-        // client-go sends a single-region request from the calling goroutine too.
-        if shards_len == 1 {
+        // The first attempt of a plan with one shard (a point get, a batch within one region):
+        // run it on this task. Spawning it costs a task, a join set and two cross-thread
+        // wake-ups per request, which is a visible share of a point get's latency; with one
+        // shard nothing runs in parallel. client-go sends a single-region request from the
+        // calling goroutine too. Retries after a region error (which re-enter this function
+        // from the shard handler) spawn as before: run inline, every retry would nest one
+        // more level of polls on the caller's stack.
+        if shards_len == 1 && first_attempt {
             let (shard, region) = shards.into_iter().next().expect("one shard")?;
             let mut plan = current_plan.clone_then_apply_shard(shard);
             // A single region keeps the budget itself (see below).
             if backoff.is_time_budget() {
                 plan.use_budget(&backoff);
             }
-            let result = Self::single_shard_handler(
+            // Boxed as the spawned task was: the handler's future is large, and polling it
+            // inline on the caller's stack can overflow small stacks (debug builds, tests).
+            let result = Box::pin(Self::single_shard_handler(
                 context.clone(),
                 plan,
                 region,
                 backoff,
                 CandidateState::default(),
-            )
+            ))
             .await;
             return Self::merge_shard_results(&context, vec![result]);
         }
@@ -1212,7 +1218,7 @@ where
                     metrics::backoff(backoff_type, duration);
                     sleep(duration).await;
                 }
-                Self::single_plan_handler(context, plan, backoff).await
+                Self::single_plan_handler(context, plan, backoff, false).await
             }
             None => {
                 warn!(
@@ -1252,7 +1258,7 @@ where
             Some(duration) => {
                 metrics::backoff(t, duration);
                 sleep(duration).await;
-                Self::single_plan_handler(context, plan, backoff).await
+                Self::single_plan_handler(context, plan, backoff, false).await
             }
             None => Err(backoff.exhausted(error)),
         }
@@ -1414,7 +1420,7 @@ where
             backoff = backoff.start();
             inner.use_budget(&backoff);
         }
-        Self::single_plan_handler(context, inner, backoff).await
+        Self::single_plan_handler(context, inner, backoff, true).await
     }
 }
 
