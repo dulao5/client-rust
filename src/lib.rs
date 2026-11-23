@@ -94,6 +94,15 @@
 #![allow(clippy::result_large_err)]
 
 pub mod backoff;
+pub mod metrics;
+/// The kvproto messages (prost) that requests and responses are made of.
+///
+/// tidb-rs ports TiDB's `store/copr` function by function (block D07.2) and builds
+/// `coprocessor.Request`, `coprocessor.KeyRange`, `coprocessor.StoreBatchTask`,
+/// `kvrpcpb.Context` and reads `metapb.Buckets` itself, so it needs the same message types
+/// this client sends. Re-exported as is; no API of its own.
+#[doc(hidden)]
+pub mod proto;
 #[doc(hidden)]
 pub mod raw;
 pub mod request;
@@ -105,7 +114,6 @@ mod compat;
 mod config;
 mod kv;
 mod pd;
-mod proto;
 mod region;
 mod region_cache;
 mod stats;
@@ -150,6 +158,8 @@ pub use crate::raw::Client as RawClient;
 #[doc(inline)]
 pub use crate::raw::ColumnFamily;
 #[doc(inline)]
+pub use crate::region::RegionVerId;
+#[doc(inline)]
 pub use crate::request::RetryOptions;
 #[doc(inline)]
 pub use crate::timestamp::Timestamp;
@@ -161,6 +171,8 @@ pub use crate::transaction::lowering as transaction_lowering;
 pub use crate::transaction::CheckLevel;
 #[doc(inline)]
 pub use crate::transaction::Client as TransactionClient;
+#[doc(inline)]
+pub use crate::transaction::CopSender;
 #[doc(inline)]
 pub use crate::transaction::ProtoLockInfo;
 #[doc(inline)]

@@ -3,6 +3,8 @@ on:
   push:
     branches:
       - master
+      # dulao5/client-rust: the branches tidb-rs pins (stacked fork branches).
+      - 'tidb-rs/**'
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
@@ -27,6 +29,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: make check
         run: make check
+      # tidb-rs builds this crate with `default-features = false, features =
+      # ["client-go-metrics"]`; `make check` does not cover that feature set.
+      - name: clippy (tidb-rs feature set)
+        run: cargo clippy --all-targets --no-default-features --features client-go-metrics -- -D clippy::all
       - name: Catch unexpected changes in the generated code
         run: |
           git diff --exit-code
@@ -53,6 +59,9 @@ jobs:
 
   integration-test:
     name: integration test
+    # The fork's `tidb-rs/*` branches run fmt / clippy / unit tests only (dulao5/tidb-rs#101):
+    # the integration tests need a tiup cluster and are run upstream.
+    if: ${{ !startsWith(github.base_ref, 'tidb-rs/') && !startsWith(github.ref_name, 'tidb-rs/') }}
     strategy:
       fail-fast: false
       matrix:

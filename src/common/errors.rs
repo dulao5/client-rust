@@ -78,6 +78,16 @@ pub enum Error {
     /// Errors caused by changes of region information
     #[error("Region error: {0:?}")]
     RegionError(Box<ProtoRegionError>),
+    /// A read's retry budget ([`Backoff::time_budget`](crate::Backoff::time_budget)) ran out.
+    /// `kind` is the kind of error it slept on longest, which client-go turns into the error
+    /// it returns (`longestSleepCfg`, config/retry/backoff.go:175-180; see
+    /// [`BackoffType::go_config`](crate::metrics::BackoffType::go_config)); `last` is the
+    /// error the last attempt met.
+    #[error("{} backoff budget exceeded, last error: {last}", kind.go_config())]
+    BackoffExhausted {
+        kind: crate::metrics::BackoffType,
+        last: Box<Error>,
+    },
     /// Whether the transaction is committed or not is undetermined
     #[error("Whether the transaction is committed or not is undetermined")]
     UndeterminedError(Box<Error>),
@@ -150,6 +160,18 @@ pub enum Error {
 Use the async TransactionClient instead, or create and use SyncTransactionClient outside of any Tokio runtime.{0}"
     )]
     NestedRuntimeError(String),
+}
+
+impl Error {
+    /// The error itself, or for [`Error::BackoffExhausted`] the last error met before the
+    /// budget ran out: what decides how the failure is classified (e.g. whether a commit's
+    /// outcome is unknown), independently of how it is reported.
+    pub fn root(&self) -> &Error {
+        match self {
+            Error::BackoffExhausted { last, .. } => last.root(),
+            e => e,
+        }
+    }
 }
 
 impl From<ProtoRegionError> for Error {

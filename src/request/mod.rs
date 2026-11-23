@@ -78,6 +78,26 @@ impl RetryOptions {
         }
     }
 
+    /// The options of one read (a point get, a BatchGet, a scan batch, a coprocessor task),
+    /// taken from these at its start. A [`Backoff::time_budget`] region backoff is
+    /// [started](Backoff::start) here: client-go gives each read a new `Backoffer`
+    /// (`NewBackofferWithVars`) that its region retries, its lock resolution and its lock
+    /// waits all draw from. A time-budget lock backoff therefore shares the region one (its
+    /// own `max_sleep_ms` is not used); any other lock backoff stays separate, as before.
+    pub fn for_read(&self) -> RetryOptions {
+        let region_backoff = self.region_backoff.start();
+        let lock_backoff = if region_backoff.is_time_budget() && self.lock_backoff.is_time_budget()
+        {
+            region_backoff.clone()
+        } else {
+            self.lock_backoff.start()
+        };
+        RetryOptions {
+            region_backoff,
+            lock_backoff,
+        }
+    }
+
     pub const fn none() -> RetryOptions {
         RetryOptions {
             region_backoff: Backoff::no_backoff(),
@@ -113,6 +133,190 @@ mod test {
     use crate::Error;
     use crate::Key;
     use crate::Result;
+
+    #[tokio::test]
+    async fn a_single_shard_runs_on_the_calling_task() {
+        #[derive(Debug, Clone)]
+        struct MockRpcResponse;
+
+        impl HasKeyErrors for MockRpcResponse {
+            fn key_errors(&mut self) -> Option<Vec<Error>> {
+                None
+            }
+        }
+
+        impl HasRegionError for MockRpcResponse {
+            fn region_error(&mut self) -> Option<crate::proto::errorpb::Error> {
+                None
+            }
+        }
+
+        impl HasLocks for MockRpcResponse {}
+
+        #[derive(Clone)]
+        struct MockKvRequest;
+
+        #[async_trait]
+        impl Request for MockKvRequest {
+            async fn dispatch(&self, _: &TikvClient<Channel>, _: Duration) -> Result<Box<dyn Any>> {
+                Ok(Box::new(MockRpcResponse {}))
+            }
+
+            fn label(&self) -> &'static str {
+                "mock"
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            fn set_leader(&mut self, _: &RegionWithLeader) -> Result<()> {
+                Ok(())
+            }
+
+            fn set_api_version(&mut self, _: kvrpcpb::ApiVersion) {}
+        }
+
+        #[async_trait]
+        impl KvRequest for MockKvRequest {
+            type Response = MockRpcResponse;
+        }
+
+        impl Shardable for MockKvRequest {
+            type Shard = Vec<Vec<u8>>;
+
+            fn shards(
+                &self,
+                pd_client: &std::sync::Arc<impl crate::pd::PdClient>,
+            ) -> futures::stream::BoxStream<
+                'static,
+                crate::Result<(Self::Shard, crate::region::RegionWithLeader)>,
+            > {
+                region_stream_for_keys(
+                    Some(Key::from("mock_key".to_owned())).into_iter(),
+                    pd_client.clone(),
+                )
+            }
+
+            fn apply_shard(&mut self, _shard: Self::Shard) {}
+
+            fn apply_store(&mut self, _store: &crate::store::RegionStore) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        // The test body is not a spawned task (`block_on`): a dispatch on a spawned task
+        // sees a task id.
+        let spawned = Arc::new(AtomicBool::new(true));
+        let seen = spawned.clone();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |_: &dyn Any| {
+                seen.store(tokio::task::try_id().is_some(), Ordering::SeqCst);
+                Ok(Box::new(MockRpcResponse) as Box<dyn Any>)
+            },
+        )));
+        let plan = crate::request::PlanBuilder::new(pd_client, Keyspace::Disable, MockKvRequest)
+            .retry_multi_region(Backoff::no_jitter_backoff(1, 1, 3))
+            .extract_error()
+            .plan();
+        assert_eq!(plan.execute().await.unwrap().len(), 1);
+        assert!(!spawned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_a_region_error_of_the_inline_attempt_is_spawned() {
+        #[derive(Debug, Clone)]
+        struct MockRpcResponse {
+            region_error: bool,
+        }
+
+        impl HasKeyErrors for MockRpcResponse {
+            fn key_errors(&mut self) -> Option<Vec<Error>> {
+                None
+            }
+        }
+
+        impl HasRegionError for MockRpcResponse {
+            fn region_error(&mut self) -> Option<crate::proto::errorpb::Error> {
+                self.region_error
+                    .then(crate::proto::errorpb::Error::default)
+            }
+        }
+
+        impl HasLocks for MockRpcResponse {}
+
+        #[derive(Clone)]
+        struct MockKvRequest;
+
+        #[async_trait]
+        impl Request for MockKvRequest {
+            async fn dispatch(&self, _: &TikvClient<Channel>, _: Duration) -> Result<Box<dyn Any>> {
+                unreachable!("dispatched through the mock client's hook")
+            }
+
+            fn label(&self) -> &'static str {
+                "mock"
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            fn set_leader(&mut self, _: &RegionWithLeader) -> Result<()> {
+                Ok(())
+            }
+
+            fn set_api_version(&mut self, _: kvrpcpb::ApiVersion) {}
+        }
+
+        #[async_trait]
+        impl KvRequest for MockKvRequest {
+            type Response = MockRpcResponse;
+        }
+
+        impl Shardable for MockKvRequest {
+            type Shard = Vec<Vec<u8>>;
+
+            fn shards(
+                &self,
+                pd_client: &std::sync::Arc<impl crate::pd::PdClient>,
+            ) -> futures::stream::BoxStream<
+                'static,
+                crate::Result<(Self::Shard, crate::region::RegionWithLeader)>,
+            > {
+                region_stream_for_keys(
+                    Some(Key::from("mock_key".to_owned())).into_iter(),
+                    pd_client.clone(),
+                )
+            }
+
+            fn apply_shard(&mut self, _shard: Self::Shard) {}
+
+            fn apply_store(&mut self, _store: &crate::store::RegionStore) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        // Per dispatch: whether it ran on a spawned task. The first answers a region error.
+        let on_spawned_task = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = on_spawned_task.clone();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |_: &dyn Any| {
+                let mut seen = seen.lock().unwrap();
+                seen.push(tokio::task::try_id().is_some());
+                Ok(Box::new(MockRpcResponse {
+                    region_error: seen.len() == 1,
+                }) as Box<dyn Any>)
+            },
+        )));
+        let plan = crate::request::PlanBuilder::new(pd_client, Keyspace::Disable, MockKvRequest)
+            .retry_multi_region(Backoff::no_jitter_backoff(1, 1, 3))
+            .extract_error()
+            .plan();
+        assert_eq!(plan.execute().await.unwrap().len(), 1);
+        // The first attempt on the calling task, the retry on a spawned one.
+        assert_eq!(*on_spawned_task.lock().unwrap(), vec![false, true]);
+    }
 
     #[tokio::test]
     async fn test_region_retry() {
@@ -1243,5 +1447,203 @@ mod test {
             [Err(Error::MultipleKeyErrors(_))]
         ));
         assert_eq!(updated_leader_store_id.load(Ordering::SeqCst), 44);
+    }
+
+    /// A cluster where store 41 (the cached leader) is down until `down` is cleared, store 44
+    /// is a follower and store 45 the new leader, with a liveness probe that answers from
+    /// `down` and counts its calls.
+    struct DeadLeaderCluster {
+        down: Arc<AtomicBool>,
+        accesses: Arc<std::sync::Mutex<Vec<StoreId>>>,
+        probes: Arc<AtomicUsize>,
+        pd_client: Arc<MockPdClient>,
+    }
+
+    fn dead_leader_cluster(probe_delay: Duration) -> DeadLeaderCluster {
+        use futures::FutureExt;
+
+        use crate::store::Liveness;
+        use crate::store::StoreLiveness;
+
+        let down = Arc::new(AtomicBool::new(true));
+        let accesses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probes = Arc::new(AtomicUsize::new(0));
+
+        let dispatch_down = down.clone();
+        let dispatch_accesses = accesses.clone();
+        let client = MockKvClient::with_dispatch_hook(move |request: &dyn Any| {
+            let store_id = fallback_get_context(request)
+                .peer
+                .as_ref()
+                .expect("target peer")
+                .store_id;
+            dispatch_accesses.lock().unwrap().push(store_id);
+            match store_id {
+                41 if dispatch_down.load(Ordering::SeqCst) => Err(Error::GrpcAPI(
+                    tonic::Status::unavailable("connection refused"),
+                )),
+                44 => Ok(Box::new(kvrpcpb::GetResponse {
+                    region_error: Some(crate::proto::errorpb::Error {
+                        not_leader: Some(crate::proto::errorpb::NotLeader {
+                            region_id: 1,
+                            leader: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }) as Box<dyn Any>),
+                _ => Ok(Box::new(kvrpcpb::GetResponse::default()) as Box<dyn Any>),
+            }
+        });
+
+        let probe_down = down.clone();
+        let probe_count = probes.clone();
+        let store_liveness = StoreLiveness::new(Arc::new(move |store_id| {
+            probe_count.fetch_add(1, Ordering::SeqCst);
+            let down = probe_down.clone();
+            async move {
+                tokio::time::sleep(probe_delay).await;
+                Some(if store_id == 41 && down.load(Ordering::SeqCst) {
+                    Liveness::Unreachable
+                } else {
+                    Liveness::Reachable
+                })
+            }
+            .boxed()
+        }));
+
+        // PD keeps reporting the dead store as the leader.
+        let region = fallback_region(&[44, 45]);
+        let pd_client = Arc::new(
+            MockPdClient::new(client)
+                .with_region_for_key_hook(move |_| Ok(region.clone()))
+                .with_update_leader_hook(|_, _| Ok(()))
+                .with_store_liveness(store_liveness),
+        );
+        DeadLeaderCluster {
+            down,
+            accesses,
+            probes,
+            pd_client,
+        }
+    }
+
+    impl DeadLeaderCluster {
+        fn take_accesses(&self) -> Vec<StoreId> {
+            std::mem::take(&mut *self.accesses.lock().unwrap())
+        }
+    }
+
+    /// client-go store liveness: a dead leader store is tried once, found unreachable, and
+    /// skipped by later requests (`isLeaderCandidate`) instead of each request rediscovering
+    /// it; the health-check loop marks it reachable again and requests go back to it.
+    #[tokio::test(start_paused = true)]
+    async fn test_dead_leader_is_tried_once_then_skipped_until_reachable() {
+        let cluster = dead_leader_cluster(Duration::ZERO);
+        let liveness = crate::pd::PdClient::store_liveness(&*cluster.pd_client).unwrap();
+
+        let response = execute_fallback_get(cluster.pd_client.clone(), Backoff::no_backoff()).await;
+        assert!(response.is_ok());
+        assert_eq!(cluster.take_accesses(), [41, 44, 45]);
+        assert_eq!(cluster.probes.load(Ordering::SeqCst), 1);
+        assert_eq!(liveness.get(41), crate::store::Liveness::Unreachable);
+
+        // While store 41 is unreachable it is not a leader candidate.
+        for _ in 0..3 {
+            let response =
+                execute_fallback_get(cluster.pd_client.clone(), Backoff::no_backoff()).await;
+            assert!(response.is_ok());
+            assert_eq!(cluster.take_accesses(), [44, 45]);
+        }
+        assert_eq!(
+            cluster.probes.load(Ordering::SeqCst),
+            1,
+            "no probe per request"
+        );
+
+        // The loop probes once a second while it stays down.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(cluster.probes.load(Ordering::SeqCst), 2);
+        assert_eq!(liveness.get(41), crate::store::Liveness::Unreachable);
+
+        // It comes back: the next tick flips it to reachable and requests return to it.
+        cluster.down.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(cluster.probes.load(Ordering::SeqCst), 3);
+        assert_eq!(liveness.get(41), crate::store::Liveness::Reachable);
+        let response = execute_fallback_get(cluster.pd_client.clone(), Backoff::no_backoff()).await;
+        assert!(response.is_ok());
+        assert_eq!(cluster.take_accesses(), [41]);
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(
+            cluster.probes.load(Ordering::SeqCst),
+            3,
+            "the loop has stopped"
+        );
+    }
+
+    /// Requests failing on the dead store at the same time share one liveness probe.
+    #[tokio::test(start_paused = true)]
+    async fn test_concurrent_failures_share_one_liveness_probe() {
+        let cluster = dead_leader_cluster(Duration::from_millis(200));
+        let requests = (0..8)
+            .map(|_| execute_fallback_get(cluster.pd_client.clone(), Backoff::no_backoff()))
+            .collect::<Vec<_>>();
+        for response in futures::future::join_all(requests).await {
+            assert!(response.is_ok());
+        }
+        assert_eq!(cluster.probes.load(Ordering::SeqCst), 1);
+        let accesses = cluster.take_accesses();
+        assert_eq!(accesses.iter().filter(|s| **s == 41).count(), 8);
+
+        let response = execute_fallback_get(cluster.pd_client.clone(), Backoff::no_backoff()).await;
+        assert!(response.is_ok());
+        assert_eq!(cluster.take_accesses(), [44, 45]);
+        assert_eq!(cluster.probes.load(Ordering::SeqCst), 1);
+    }
+
+    /// A store that fails a request but answers its health check stays a candidate: the
+    /// order of the peers is what it was without liveness.
+    #[tokio::test(start_paused = true)]
+    async fn test_reachable_store_after_a_failure_is_still_tried_first() {
+        use futures::FutureExt;
+
+        let flaky = Arc::new(AtomicBool::new(true));
+        let client_flaky = flaky.clone();
+        let accesses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatch_accesses = accesses.clone();
+        let client = MockKvClient::with_dispatch_hook(move |request: &dyn Any| {
+            let store_id = fallback_get_context(request)
+                .peer
+                .as_ref()
+                .expect("target peer")
+                .store_id;
+            dispatch_accesses.lock().unwrap().push(store_id);
+            if store_id == 41 && client_flaky.swap(false, Ordering::SeqCst) {
+                return Err(Error::GrpcAPI(tonic::Status::unavailable("reset")));
+            }
+            Ok(Box::new(kvrpcpb::GetResponse::default()) as Box<dyn Any>)
+        });
+        let region = fallback_region(&[44, 45]);
+        let probes = Arc::new(AtomicUsize::new(0));
+        let probe_count = probes.clone();
+        let pd_client = Arc::new(
+            MockPdClient::new(client)
+                .with_region_for_key_hook(move |_| Ok(region.clone()))
+                .with_update_leader_hook(|_, _| Ok(()))
+                .with_store_liveness(crate::store::StoreLiveness::new(Arc::new(move |_| {
+                    probe_count.fetch_add(1, Ordering::SeqCst);
+                    futures::future::ready(Some(crate::store::Liveness::Reachable)).boxed()
+                }))),
+        );
+
+        let response = execute_fallback_get(pd_client.clone(), Backoff::no_backoff()).await;
+        assert!(response.is_ok());
+        assert_eq!(std::mem::take(&mut *accesses.lock().unwrap()), [41, 44]);
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+        let response = execute_fallback_get(pd_client, Backoff::no_backoff()).await;
+        assert!(response.is_ok());
+        assert_eq!(std::mem::take(&mut *accesses.lock().unwrap()), [41]);
     }
 }

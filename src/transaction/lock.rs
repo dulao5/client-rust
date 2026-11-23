@@ -2,22 +2,30 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
+
+use futures::FutureExt;
 
 use fail::fail_point;
 use log::debug;
 use log::error;
+use log::info;
 use log::warn;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
 use crate::backoff::Backoff;
 use crate::backoff::DEFAULT_REGION_BACKOFF;
-use crate::backoff::OPTIMISTIC_BACKOFF;
 use crate::kv::HexRepr;
+use crate::pd::LowResolutionTs;
 use crate::pd::PdClient;
 use crate::Key;
 
+use crate::metrics;
+use crate::metrics::BackoffType;
+use crate::metrics::LockAction as LockMetric;
 use crate::proto::kvrpcpb;
 use crate::proto::kvrpcpb::TxnInfo;
 use crate::proto::pdpb::Timestamp;
@@ -44,33 +52,52 @@ pub(crate) fn format_key_for_log(key: &[u8]) -> String {
     format!("len={}, prefix={}", key.len(), HexRepr(&key[..prefix_len]))
 }
 
-/// Refuse to resolve SHARED locks — loudly, before any of them can be mis-handled.
+/// Refuse to resolve a SHARED lock wrapper, as client-go does (`resolveLocks` /
+/// `BatchResolveLocks`: "misuse ... trying to resolve a shared lock directly",
+/// txnlock/lock_resolver.go:291, :605; `Lock.IsShared` is `Op_SharedLock`, :207).
 ///
-/// The contract (`kvrpcpb.LockInfo.shared_lock_infos`) is explicit: a shared lock's
-/// real holders live ONLY in `shared_lock_infos` — "DO NOT read from the wrapper
-/// LockInfo", whose own `key`/`lock_version` are unset. This client does not implement
-/// shared-lock resolution yet, and every partial handling is worse than none:
-/// resolving the wrapper checks transaction 0; filtering on wrapper fields silently
-/// drops the members; and the pessimistic-lock special cases in this resolver do not
-/// know `SharedPessimisticLock`. Until support lands, an explicit error is the only
-/// answer that cannot roll back a live transaction or skip a dead one.
+/// The contract (`kvrpcpb.LockInfo.shared_lock_infos`) is explicit: a shared lock's real
+/// holders live ONLY in `shared_lock_infos` — "DO NOT read from the wrapper LockInfo",
+/// whose own `lock_version` is unset; resolving the wrapper would check transaction 0.
+/// The one reader that expands a wrapper into its members is the coprocessor
+/// ([`expand_shared_lock`], as TiDB's `copIteratorWorker.handleLockErr`); snapshot reads and
+/// GC refuse it, as client-go. The members themselves are ordinary prewrite or pessimistic
+/// locks (`SharedPessimisticLock` counts as pessimistic, [`is_pessimistic`]) and are not
+/// refused.
 ///
-/// Servers that predate shared locks never produce them, so this is a no-op there.
+/// TiKV v8.5.8 never returns a wrapper to a read: `check_ts_conflict` ignores shared locks
+/// (components/txn_types/src/lock.rs:370-373, :431-434). Wrappers appear on write paths,
+/// in `scan_lock`, and in a `PrimaryMismatch` from `CheckTxnStatus`.
 pub(crate) fn reject_shared_locks(locks: &[kvrpcpb::LockInfo]) -> Result<()> {
-    let shared = |l: &kvrpcpb::LockInfo| {
-        !l.shared_lock_infos.is_empty()
-            || l.lock_type == kvrpcpb::Op::SharedLock as i32
-            || l.lock_type == kvrpcpb::Op::SharedPessimisticLock as i32
+    let wrapper = |l: &kvrpcpb::LockInfo| {
+        !l.shared_lock_infos.is_empty() || l.lock_type == kvrpcpb::Op::SharedLock as i32
     };
-    if locks.iter().any(shared) {
+    if locks.iter().any(wrapper) {
         return Err(Error::StringError(
-            "shared locks (SharedLock/SharedPessimisticLock) are not supported by this \
-             client yet; refusing to resolve them — resolving the wrapper would target \
-             the wrong transaction"
+            "misuse of resolve locks: trying to resolve a shared lock directly; its member \
+             locks must be extracted and resolved one by one"
                 .to_owned(),
         ));
     }
     Ok(())
+}
+
+/// The locks to resolve for a lock met by a coprocessor request: the members of a shared
+/// lock wrapper, or the lock itself (TiDB `copIteratorWorker.handleLockErr`,
+/// store/copr/coprocessor.go:1824-1831).
+pub(crate) fn expand_shared_lock(lock: kvrpcpb::LockInfo) -> Vec<kvrpcpb::LockInfo> {
+    if lock.shared_lock_infos.is_empty() {
+        vec![lock]
+    } else {
+        lock.shared_lock_infos
+    }
+}
+
+/// client-go `Lock.IsPessimistic` (txnlock/lock_resolver.go:201): a pessimistic lock, or the
+/// pessimistic member of a shared lock.
+pub(crate) fn is_pessimistic(lock: &kvrpcpb::LockInfo) -> bool {
+    lock.lock_type == kvrpcpb::Op::PessimisticLock as i32
+        || lock.lock_type == kvrpcpb::Op::SharedPessimisticLock as i32
 }
 
 /// _Resolves_ the given locks. Returns locks still live. When there is no live locks, all the given locks are resolved.
@@ -83,22 +110,348 @@ pub(crate) fn reject_shared_locks(locks: &[kvrpcpb::LockInfo]) -> Result<()> {
 /// An expired async-commit lock needs an extra step in between: TiKV refuses to roll it back
 /// via `CheckTxnStatus`, so the transaction's final status is first recovered from all of its
 /// secondary locks (`CheckSecondaryLocks`), and then every lock of the transaction is resolved.
+/// [`resolve_locks`] that also reports how long until the first live lock expires
+/// ([`ReadLocks::ms_before_expired`]), for callers that back off (client-go `ResolveLocks`
+/// returns that TTL).
+///
+/// `region_backoff`: region-error retries of the resolution's own requests, the caller's
+/// `RetryOptions::region_backoff` (client-go resolves with the read's `Backoffer`).
+pub(crate) async fn resolve_locks_with_expiry(
+    locks: Vec<kvrpcpb::LockInfo>,
+    timestamp: Timestamp,
+    pd_client: Arc<impl PdClient>,
+    keyspace: Keyspace,
+    region_backoff: Backoff,
+) -> Result<ReadLocks> {
+    resolve_locks_impl(
+        locks,
+        timestamp,
+        pd_client,
+        keyspace,
+        false,
+        false,
+        region_backoff,
+    )
+    .await
+}
+
 pub async fn resolve_locks(
     locks: Vec<kvrpcpb::LockInfo>,
     timestamp: Timestamp,
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
 ) -> Result<Vec<kvrpcpb::LockInfo> /* live_locks */> {
+    Ok(resolve_locks_impl(
+        locks,
+        timestamp,
+        pd_client,
+        keyspace,
+        false,
+        false,
+        DEFAULT_REGION_BACKOFF,
+    )
+    .await?
+    .live)
+}
+
+/// What [`resolve_locks_for_read`] found out about the encountered locks: client-go's
+/// `ResolveLockResult` (txnlock/lock_resolver.go:415) without the TTL.
+#[derive(Debug, Default)]
+pub(crate) struct ReadLocks {
+    /// Locks of transactions that are still alive and must be waited for.
+    pub live: Vec<kvrpcpb::LockInfo>,
+    /// Start timestamps of transactions whose locks the read may ignore (`canIgnore`, sent as
+    /// `Context.resolved_locks`): rolled back, committed after the read's timestamp, or alive
+    /// with their `min_commit_ts` pushed past it.
+    pub ignorable: Vec<u64>,
+    /// Start timestamps of transactions committed at or before the read's timestamp
+    /// (`canAccess`, sent as `Context.committed_locks`): TiKV reads through their locks.
+    pub accessible: Vec<u64>,
+    /// Milliseconds until the first of the `live` locks expires, 0 if none or already
+    /// expired: client-go `msBeforeTxnExpired` (`txnExpireTime`, lock_resolver.go:671), the
+    /// `TTL` of `ResolveLockResult`. Callers cap each lock-backoff sleep with it
+    /// ([`lock_backoff_sleep`]).
+    pub ms_before_expired: i64,
+}
+
+impl ReadLocks {
+    /// client-go `txnExpireTime.update` (lock_resolver.go:676): keep the minimum, negatives
+    /// as 0.
+    fn update_expire(&mut self, ms: i64) {
+        let ms = ms.max(0);
+        if self.live.is_empty() || ms < self.ms_before_expired {
+            self.ms_before_expired = ms;
+        }
+    }
+}
+
+/// The lock backoff of one read: how long to sleep before retrying after meeting live locks,
+/// given what [`resolve_locks_for_read`] / [`resolve_locks_with_expiry`] found. client-go
+/// calls `bo.BackoffWithMaxSleepTxnLockFast(msBeforeExpired)` when `msBeforeExpired > 0`
+/// (txnsnapshot/snapshot.go:582, :927; TiDB store/copr/coprocessor.go:1843): the next delay,
+/// capped at the time left until the first live lock expires, charged to a budget of total
+/// **sleep time** (config/retry/backoff.go).
+///
+/// `Backoff` counts attempts instead, so the budget is kept in time here: a capped sleep
+/// takes only part of the current step (the delay `Backoff` handed out), and an attempt is
+/// spent only once the sleeps add up to a whole step. Without this, a read whose time left
+/// stays short (the low-resolution timestamp, R7, changes only when refreshed) would burn one
+/// attempt per millisecond-long sleep and fail long before client-go gives up (#8 review).
+///
+/// No time left: the retry is immediate, as client-go. Two such retries in a row mean the
+/// low-resolution timestamp and TiKV disagree right at the lock's expiry; the second one
+/// therefore asks the caller to refresh the timestamp with a TSO first
+/// ([`LockWait::refresh_ts`]), so the read does not fail where client-go would not (#3 / #8
+/// review). That round also sleeps [`Self::REFRESH_SLEEP`], charged to the budget like any
+/// sleep (#8 review, non-blocking): if TiKV keeps the lock live even after fresh timestamps,
+/// the read retries at most once per millisecond per two rounds instead of spinning, and
+/// gives up only after the whole budget's worth of such rounds. (The alternative, spending
+/// one attempt every 8 refreshes, would bound the count but not the rate: 8 × 2 back-to-back
+/// CheckTxnStatus + TSO round trips per attempt.)
+#[derive(Clone, Debug)]
+pub(crate) struct LockBackoff {
+    backoff: Backoff,
+    /// What is left of the current step, if one is open.
+    step_left: Option<Duration>,
+    zero_streak: u32,
+}
+
+impl LockBackoff {
+    /// The error to return when the lock backoff gives up after `error`
+    /// ([`Backoff::exhausted`]).
+    pub(crate) fn exhausted(&self, error: Error) -> Error {
+        self.backoff.exhausted(error)
+    }
+
+    /// The sleep of a round that refreshes the low-resolution timestamp.
+    pub(crate) const REFRESH_SLEEP: Duration = Duration::from_millis(1);
+
+    // glue: lock backoff with a time budget
+    pub(crate) fn new(backoff: Backoff) -> LockBackoff {
+        LockBackoff {
+            backoff,
+            step_left: None,
+            zero_streak: 0,
+        }
+    }
+
+    /// What to do before the next retry, or `None` when the budget is spent.
+    pub(crate) fn next_wait(&mut self, ms_before_expired: i64) -> Option<LockWait> {
+        if ms_before_expired <= 0 {
+            self.zero_streak += 1;
+            if !self.zero_streak.is_multiple_of(2) {
+                return Some(LockWait {
+                    sleep: Duration::ZERO,
+                    refresh_ts: false,
+                });
+            }
+            let sleep = self.charge(Self::REFRESH_SLEEP)?;
+            return Some(LockWait {
+                sleep,
+                refresh_ts: true,
+            });
+        }
+        self.zero_streak = 0;
+        let sleep = self.charge(Duration::from_millis(ms_before_expired as u64))?;
+        Some(LockWait {
+            sleep,
+            refresh_ts: false,
+        })
+    }
+
+    /// Take up to `cap` of sleep from the current step (opening the next one if needed),
+    /// or `None` when the budget is spent.
+    fn charge(&mut self, cap: Duration) -> Option<Duration> {
+        if self.backoff.is_time_budget() {
+            // client-go `BackoffWithMaxSleepTxnLockFast(msBeforeExpired)`: the `txnLockFast`
+            // curve, capped, and the capped sleep charged to the read's shared budget
+            // (backoff.go:127). No steps to keep: the budget is time.
+            return self
+                .backoff
+                .next_delay_capped(BackoffType::TikvLockFast, Some(cap));
+        }
+        let left = match self.step_left {
+            Some(left) => left,
+            None => self.backoff.next_delay_duration()?,
+        };
+        let sleep = left.min(cap);
+        let rest = left - sleep;
+        self.step_left = (!rest.is_zero()).then_some(rest);
+        Some(sleep)
+    }
+}
+
+/// See [`LockBackoff::next_wait`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LockWait {
+    /// Sleep this long before retrying (possibly zero).
+    pub sleep: Duration,
+    /// Fetch a TSO before retrying, which refreshes the low-resolution timestamp.
+    pub refresh_ts: bool,
+}
+
+impl LockWait {
+    /// Sleep, refresh the low-resolution timestamp if asked, and record the backoff metric.
+    // glue: the retry wait of a read that met live locks
+    pub(crate) async fn wait(self, pd_client: Arc<impl PdClient>) -> Result<()> {
+        if !self.sleep.is_zero() {
+            metrics::backoff(BackoffType::TikvLockFast, self.sleep);
+            sleep(self.sleep).await;
+        }
+        if self.refresh_ts {
+            pd_client.get_timestamp().await?;
+        }
+        Ok(())
+    }
+}
+
+/// The lock hints of a snapshot or of one coprocessor request: client-go's pair of
+/// `util.TSSet`s, `KVSnapshot.resolvedLocks` / `committedLocks`
+/// (txnsnapshot/snapshot.go:124) and TiDB's `copIterator.resolvedLocks` / `committedLocks`
+/// (store/copr/coprocessor.go:708). A read that resolves locks for read adds the
+/// transactions it may ignore or read through; every later request of the same snapshot (or
+/// coprocessor request) sends the whole sets in `Context.resolved_locks` /
+/// `Context.committed_locks`, as `ClientHelper.SendReqCtx` does with `GetAll()`
+/// (txnsnapshot/client_helper.go). Cheap to clone: the sets are shared.
+///
+/// **The sets are only valid for one fixed read timestamp.** Whether a transaction may be
+/// ignored (committed after the read, min_commit_ts pushed past it) or read through
+/// (committed at or before it) depends on the read's timestamp, so the hints must never be
+/// shared by reads at different timestamps: a future read-committed mode, a pessimistic
+/// `for_update_ts` read or a stale read needs its own hints. The timestamp is recorded at
+/// creation and checked (`debug_assert`) whenever results are recorded.
+#[derive(Clone, Debug)]
+pub struct ReadLockHints {
+    read_ts: u64,
+    sets: Arc<std::sync::RwLock<HintSets>>,
+}
+
+#[derive(Debug, Default)]
+struct HintSets {
+    resolved: HashSet<u64>,
+    committed: HashSet<u64>,
+}
+
+impl ReadLockHints {
+    /// Empty hints for reads at `read_ts`.
+    pub fn new(read_ts: u64) -> ReadLockHints {
+        ReadLockHints {
+            read_ts,
+            sets: Arc::default(),
+        }
+    }
+
+    /// The read timestamp these hints are valid for.
+    pub fn read_ts(&self) -> u64 {
+        self.read_ts
+    }
+
+    /// Add transactions whose locks the read may ignore (`resolvedLocks.Put`).
+    pub fn put_resolved(&self, txns: impl IntoIterator<Item = u64>) {
+        let mut sets = self.sets.write().unwrap_or_else(|e| e.into_inner());
+        sets.resolved.extend(txns);
+    }
+
+    /// Add transactions the read may read through (`committedLocks.Put`).
+    pub fn put_committed(&self, txns: impl IntoIterator<Item = u64>) {
+        let mut sets = self.sets.write().unwrap_or_else(|e| e.into_inner());
+        sets.committed.extend(txns);
+    }
+
+    /// Record what [`resolve_locks_for_read`] found at `read_ts` (client-go
+    /// `ClientHelper.ResolveLocksWithOpts`). Done before the read retries, so the retry
+    /// already carries them; the cleanup itself may still be running in the background.
+    pub(crate) fn record(&self, read_ts: u64, locks: &ReadLocks) {
+        debug_assert_eq!(
+            read_ts, self.read_ts,
+            "lock hints recorded by a read at another timestamp"
+        );
+        if locks.ignorable.is_empty() && locks.accessible.is_empty() {
+            return;
+        }
+        let mut sets = self.sets.write().unwrap_or_else(|e| e.into_inner());
+        sets.resolved.extend(locks.ignorable.iter().copied());
+        sets.committed.extend(locks.accessible.iter().copied());
+    }
+
+    /// Both sets (sorted), or `None` while both are empty (`GetAll()`).
+    pub fn get_all(&self) -> Option<(Vec<u64>, Vec<u64>)> {
+        let sets = self.sets.read().unwrap_or_else(|e| e.into_inner());
+        if sets.resolved.is_empty() && sets.committed.is_empty() {
+            return None;
+        }
+        let mut resolved: Vec<u64> = sets.resolved.iter().copied().collect();
+        let mut committed: Vec<u64> = sets.committed.iter().copied().collect();
+        resolved.sort_unstable();
+        committed.sort_unstable();
+        Some((resolved, committed))
+    }
+}
+
+/// [`resolve_locks`] for a read: client-go's `resolveLocks` with `ForRead` (lock_resolver.go:
+/// 497, reached through `ClientHelper.ResolveLocksWithOpts`). The transactions of the
+/// encountered locks are classified as in lock_resolver.go:624-639, and the read may then
+/// ignore or read through their locks instead of waiting (see [`ReadLocks`]). The locks of
+/// transactions whose fate is settled are resolved in the background
+/// ([`resolve_in_background`], a `tokio::spawn`ed task: call this from within a Tokio
+/// runtime), as client-go does for reads; stale pessimistic locks are
+/// still rolled back before returning (client-go: "pessimistic locks don't block read so it
+/// needn't be async", lock_resolver.go:572).
+///
+/// TiDB's autocommit point get at `u64::MAX` uses this with `timestamp = u64::MAX`, as
+/// client-go does (`KVSnapshot.get` goes through the same `ClientHelper`): `CheckTxnStatus`
+/// then answers `MinCommitTsPushed` for a live transaction that is not committed, and every
+/// committed one can be read through.
+///
+/// `lite`: client-go's `ResolveLocksOptions.Lite`, set by a snapshot's point get
+/// (`NewClientHelper(.., resolveLite = true)`, txnsnapshot/snapshot.go:786): resolve only the
+/// encountered key instead of the whole region (see [`RESOLVE_LOCK_LITE_THRESHOLD`]).
+///
+/// `region_backoff`: as for [`resolve_locks_with_expiry`].
+pub(crate) async fn resolve_locks_for_read(
+    locks: Vec<kvrpcpb::LockInfo>,
+    timestamp: Timestamp,
+    pd_client: Arc<impl PdClient>,
+    keyspace: Keyspace,
+    lite: bool,
+    region_backoff: Backoff,
+) -> Result<ReadLocks> {
+    resolve_locks_impl(
+        locks,
+        timestamp,
+        pd_client,
+        keyspace,
+        true,
+        lite,
+        region_backoff,
+    )
+    .await
+}
+
+async fn resolve_locks_impl(
+    locks: Vec<kvrpcpb::LockInfo>,
+    timestamp: Timestamp,
+    pd_client: Arc<impl PdClient>,
+    keyspace: Keyspace,
+    for_read: bool,
+    lite: bool,
+    region_backoff: Backoff,
+) -> Result<ReadLocks> {
     debug!("resolving locks");
     reject_shared_locks(&locks)?;
-    let ts = pd_client.clone().get_timestamp().await?;
+    if !locks.is_empty() {
+        metrics::lock_resolver(LockMetric::Resolve);
+    }
+    // client-go `getTxnStatusFromLock`: `GetLowResolutionTimestamp` (lock_resolver.go:723).
+    let ts = low_resolution_timestamp(pd_client.clone()).await?;
     let caller_start_ts = timestamp.version();
     let current_ts = ts.version();
 
-    let mut live_locks = Vec::new();
+    let mut out = ReadLocks::default();
     // Final transaction statuses are cached in the resolver's context, so a transaction met
     // through several locks is queried (or recovered) only once.
-    let mut lock_resolver = LockResolver::new(ResolveLocksContext::default());
+    let mut lock_resolver = LockResolver::new(ResolveLocksContext::default())
+        .with_region_backoff(region_backoff.clone());
     // Regions already swept by ResolveLock, per transaction.
     let mut clean_regions: HashMap<u64, HashSet<RegionVerId>> = HashMap::new();
     // We must check txn status for *all* locks, not only TTL-expired ones.
@@ -125,29 +478,121 @@ pub async fn resolve_locks(
             LockAction::Resolve {
                 commit_version,
                 keys,
-            } => (commit_version, keys),
-            LockAction::Live(primary_lock) => {
-                live_locks.push(primary_lock);
+            } => {
+                metrics::lock_resolver(LockMetric::Expired);
+                if for_read {
+                    // lock_resolver.go:624-634: rolled back, or committed after the read →
+                    // ignore; committed at or before it → read through.
+                    let verdict = if commit_version == 0 || commit_version > caller_start_ts {
+                        ReadVerdict::Ignore
+                    } else {
+                        ReadVerdict::Access
+                    };
+                    out.classify(lock.lock_version, verdict);
+                }
+                (commit_version, keys)
+            }
+            LockAction::Live {
+                primary_lock,
+                ttl,
+                min_commit_ts_pushed,
+            } => {
+                // lock_resolver.go:616-624: a live transaction is waited for, unless the read
+                // may ignore it because its min_commit_ts was pushed past the read.
+                if for_read && min_commit_ts_pushed {
+                    out.ignorable.push(lock.lock_version);
+                } else {
+                    metrics::lock_resolver(LockMetric::NotExpired);
+                    // lock_resolver.go:619 / :637: `UntilExpired(l.TxnID, status.ttl)`.
+                    out.update_expire(lock_until_expired_ms(lock.lock_version, ttl, ts.clone()));
+                    out.live.push(primary_lock);
+                }
                 continue;
             }
-            LockAction::Done => continue,
+            LockAction::Done { read } => {
+                metrics::lock_resolver(LockMetric::Expired);
+                if for_read {
+                    out.classify(lock.lock_version, read);
+                }
+                continue;
+            }
         };
+        if for_read {
+            // A read does not wait for the cleanup: it already knows how to treat the
+            // transaction's locks (client-go lock_resolver.go:584-596, and :1092 for an
+            // async-commit transaction, `asyncResolveAll = forRead`).
+            resolve_in_background(
+                &lock,
+                keys,
+                commit_version,
+                lite,
+                pd_client.clone(),
+                keyspace,
+            );
+            continue;
+        }
         let regions = clean_regions.entry(lock.lock_version).or_default();
-        for key in keys.iter().chain([&lock.key]) {
+        let plan = ResolvePlan::new(&lock, keys, lite);
+        for (key, lite) in plan.requests() {
             resolve_lock_with_retry(
                 key.into(),
                 lock.lock_version,
                 commit_version,
                 lock.is_txn_file,
+                lite,
                 pd_client.clone(),
                 keyspace,
-                OPTIMISTIC_BACKOFF,
+                region_backoff.clone(),
                 regions,
             )
             .await?;
         }
     }
-    Ok(live_locks)
+    if !out.live.is_empty() {
+        metrics::lock_resolver(LockMetric::WaitExpired);
+    }
+    Ok(out)
+}
+
+impl ReadLocks {
+    // glue: lock_resolver.go:624-639 (the canIgnore / canAccess lists)
+    fn classify(&mut self, txn: u64, verdict: ReadVerdict) {
+        match verdict {
+            ReadVerdict::Ignore => self.ignorable.push(txn),
+            ReadVerdict::Access => self.accessible.push(txn),
+            ReadVerdict::Neither => {}
+        }
+    }
+}
+
+/// How a read may treat the locks of a transaction whose lock was dealt with on its own
+/// (lock_resolver.go:624-639).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadVerdict {
+    /// `canIgnore`.
+    Ignore,
+    /// `canAccess`.
+    Access,
+    /// Neither: the read retries and meets the lock again (lock_resolver.go:635, with no
+    /// time to wait).
+    Neither,
+}
+
+impl ReadVerdict {
+    /// The classification of a settled status for a read at `caller_start_ts`.
+    // glue: lock_resolver.go:624-639
+    fn of(status: &TransactionStatus, caller_start_ts: u64) -> ReadVerdict {
+        match &status.kind {
+            TransactionStatusKind::Committed(ts) if ts.version() > caller_start_ts => {
+                ReadVerdict::Ignore
+            }
+            TransactionStatusKind::Committed(_) => ReadVerdict::Access,
+            // `IsRolledBack` (lock_resolver.go:127) is `is_determined` for this kind.
+            TransactionStatusKind::RolledBack if status.is_determined() => ReadVerdict::Ignore,
+            _ if status.action == kvrpcpb::Action::MinCommitTsPushed => ReadVerdict::Ignore,
+            _ => ReadVerdict::Neither,
+        }
+    }
 }
 
 /// What `resolve_locks` has to do about one encountered lock.
@@ -159,10 +604,17 @@ enum LockAction {
         keys: Vec<Vec<u8>>,
     },
     /// The transaction is still alive; its primary lock is reported back to the caller.
-    Live(kvrpcpb::LockInfo),
+    /// `min_commit_ts_pushed`: `CheckTxnStatus` answered `MinCommitTsPushed`.
+    Live {
+        primary_lock: kvrpcpb::LockInfo,
+        /// The TTL `CheckTxnStatus` answered (client-go `status.ttl`).
+        ttl: u64,
+        min_commit_ts_pushed: bool,
+    },
     /// The lock has been dealt with on its own (a stale pessimistic lock rolled back by
-    /// itself) and nothing else needs resolving.
-    Done,
+    /// itself) and nothing else needs resolving. `read`: how a read may treat the
+    /// transaction's locks.
+    Done { read: ReadVerdict },
 }
 
 impl LockAction {
@@ -177,11 +629,107 @@ impl LockAction {
                 commit_version: 0,
                 keys: Vec::new(),
             },
-            TransactionStatusKind::Locked(_, primary_lock) => {
-                LockAction::Live(primary_lock.clone())
-            }
+            TransactionStatusKind::Locked(ttl, primary_lock) => LockAction::Live {
+                primary_lock: primary_lock.clone(),
+                ttl: *ttl,
+                min_commit_ts_pushed: status.action == kvrpcpb::Action::MinCommitTsPushed,
+            },
         }
     }
+}
+
+/// client-go `TiKVClient.ResolveLockLiteThreshold` (config/client.go:193, default 16): a lock
+/// of a transaction with fewer keys is resolved "lite", for its own key only
+/// (lock_resolver.go:1208). TiDB's `tikv-client.resolve-lock-lite-threshold`; not
+/// configurable here yet.
+pub(crate) const RESOLVE_LOCK_LITE_THRESHOLD: u64 = 16;
+
+/// Backoff of a background lock cleanup: client-go gives it its own backoffer of
+/// `asyncResolveLockMaxBackoff` = 40 s (lock_resolver.go:48, :586, :1093). Here an attempt
+/// budget with about the same total sleep: 2, 4, ..., 256 ms, then 80 × 500 ms ≈ 40.5 s.
+pub(crate) const ASYNC_RESOLVE_LOCK_BACKOFF: Backoff = Backoff::no_jitter_backoff(2, 500, 88);
+
+/// Which `ResolveLock` requests settle a transaction met through `lock`: client-go
+/// `resolveLock` (lock_resolver.go:1204-1271) for a 2PC transaction, or every key of an
+/// async-commit one (`keys`, from its primary; region-wide, see R8 in tidb-rs's
+/// specs/D07.1-store/lock-resolver.md).
+struct ResolvePlan {
+    keys: Vec<Vec<u8>>,
+    /// The encountered key, unless it needs no request.
+    key: Option<Vec<u8>>,
+    /// Resolve `key` alone (`Keys = [l.Key]`) instead of its whole region.
+    lite: bool,
+}
+
+impl ResolvePlan {
+    // glue: client-go resolveLock's lite decision
+    fn new(lock: &kvrpcpb::LockInfo, keys: Vec<Vec<u8>>, lite: bool) -> ResolvePlan {
+        // lock_resolver.go:1208: `resolveLite := lite || l.TxnSize < resolveLockLiteThreshold`
+        // (only for a 2PC transaction: async commit resolves every key it recovered).
+        let lite = keys.is_empty() && (lite || lock.txn_size < RESOLVE_LOCK_LITE_THRESHOLD);
+        // :1210: "The lock has been resolved by getTxnStatusFromLock": CheckTxnStatus on the
+        // primary already committed or rolled it back.
+        let key = (!(lite && lock.key == lock.primary_lock)).then(|| lock.key.clone());
+        ResolvePlan { keys, key, lite }
+    }
+
+    /// (key, lite) of each request, in order.
+    // glue: client-go resolveLock / resolveAsyncResolveData
+    fn requests(&self) -> impl Iterator<Item = (&Vec<u8>, bool)> {
+        self.keys
+            .iter()
+            .map(|k| (k, false))
+            .chain(self.key.iter().map(move |k| (k, self.lite)))
+    }
+}
+
+/// Resolve the locks of a settled transaction in a background task, for a read
+/// (client-go: the goroutines of lock_resolver.go:587 and :1094). `keys` are the other keys of
+/// an async-commit transaction (empty otherwise); the encountered lock's key is always
+/// resolved. The task does not share the read's cleaned regions (client-go passes an empty
+/// map, lock_resolver.go:588) and only logs its failure: the read has already moved on, and
+/// a later reader resolves again.
+///
+/// The task is started with `tokio::spawn`, so this must be called from within a Tokio
+/// runtime (every client-rust request path is). Unlike client-go there is no
+/// `LockResolver.Close` to cancel these tasks; each ends when its backoff runs out (about
+/// 40 s at most) or with the runtime.
+// glue: client-go `go func() { lr.resolveLock(asyncBo, ...) }()`
+fn resolve_in_background(
+    lock: &kvrpcpb::LockInfo,
+    keys: Vec<Vec<u8>>,
+    commit_version: u64,
+    lite: bool,
+    pd_client: Arc<impl PdClient>,
+    keyspace: Keyspace,
+) {
+    let start_version = lock.lock_version;
+    let is_txn_file = lock.is_txn_file;
+    let plan = ResolvePlan::new(lock, keys, lite);
+    tokio::spawn(async move {
+        let mut regions = HashSet::new();
+        for (k, lite) in plan.requests() {
+            if let Err(e) = resolve_lock_with_retry(
+                k.into(),
+                start_version,
+                commit_version,
+                is_txn_file,
+                lite,
+                pd_client.clone(),
+                keyspace,
+                ASYNC_RESOLVE_LOCK_BACKOFF,
+                &mut regions,
+            )
+            .await
+            {
+                info!(
+                    "failed to resolve lock asynchronously, start_ts: {}, commit_ts: {}, error: {:?}",
+                    start_version, commit_version, e
+                );
+                return;
+            }
+        }
+    });
 }
 
 /// Roll back one pessimistic lock, leaving the rest of its transaction alone. This is
@@ -190,6 +738,7 @@ async fn pessimistic_rollback_lock(
     lock: &kvrpcpb::LockInfo,
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
+    region_backoff: Backoff,
 ) -> Result<()> {
     if lock.key == lock.primary_lock {
         // The lock is its transaction's primary: the CheckTxnStatus just sent to this very
@@ -209,7 +758,7 @@ async fn pessimistic_rollback_lock(
         for_update_ts,
     );
     let plan = crate::request::PlanBuilder::new(pd_client, keyspace, req)
-        .retry_multi_region(DEFAULT_REGION_BACKOFF)
+        .retry_multi_region(region_backoff)
         .extract_error()
         .plan();
     plan.execute().await?;
@@ -219,12 +768,16 @@ async fn pessimistic_rollback_lock(
 /// Resolve every lock of transaction `start_version` in the region holding `key`, unless that
 /// region is already in `clean_regions`. ResolveLock sweeps the whole region, so one successful
 /// request per region is enough no matter how many of the transaction's keys point to it.
+///
+/// `lite`: resolve `key` alone (`ResolveLockRequest.keys = [key]`, client-go
+/// lock_resolver.go:1230-1235); the region is then not recorded as clean (:1267).
 #[allow(clippy::too_many_arguments)]
 async fn resolve_lock_with_retry(
     key: &Key,
     start_version: u64,
     commit_version: u64,
     is_txn_file: bool,
+    lite: bool,
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
     mut backoff: Backoff,
@@ -240,8 +793,13 @@ async fn resolve_lock_with_retry(
         if clean_regions.contains(&ver_id) {
             return Ok(());
         }
-        let request =
+        let mut request =
             requests::new_resolve_lock_request(start_version, commit_version, is_txn_file);
+        if lite {
+            metrics::lock_resolver(LockMetric::ResolveLockLite);
+            request.keys = vec![key.to_vec()];
+        }
+        metrics::lock_resolver(LockMetric::QueryResolveLocks);
         let plan_builder =
             match crate::request::PlanBuilder::new(pd_client.clone(), keyspace, request)
                 .single_region_with_store(store.clone())
@@ -250,37 +808,51 @@ async fn resolve_lock_with_retry(
                 Ok(plan_builder) => plan_builder,
                 Err(Error::LeaderNotFound { region }) => {
                     pd_client.invalidate_region_cache(region.clone()).await;
-                    match backoff.next_delay_duration() {
+                    match backoff.next_delay_for(BackoffType::RegionScheduling) {
                         Some(duration) => {
+                            metrics::backoff(BackoffType::RegionScheduling, duration);
                             sleep(duration).await;
                             continue;
                         }
-                        None => return Err(Error::LeaderNotFound { region }),
+                        None => return Err(backoff.exhausted(Error::LeaderNotFound { region })),
                     }
                 }
                 Err(err) => return Err(err),
             };
         let plan = plan_builder.extract_error().plan();
-        match plan.execute().await {
-            Ok(_) => {
-                clean_regions.insert(ver_id);
+        let sent = async { plan.execute().await.map(|_| ()) };
+        // R12: concurrent region-wide resolves of one transaction in one region are sent once
+        // (client-go `reqCollapse`; lite requests carry keys and are never collapsed).
+        let result = match pd_client.lock_resolver_state() {
+            Some(state) if !lite => state.collapse_resolve(ver_id.id, start_version, sent).await,
+            _ => sent.await,
+        };
+        match result {
+            Ok(()) => {
+                if !lite {
+                    clean_regions.insert(ver_id);
+                }
                 return Ok(());
             }
             // Retry on region error. `ResolveLockResponse` can have at most 1 error, and
             // the variant now says which kind it is rather than requiring a type test on
             // a popped element.
             Err(Error::MultipleRegionErrors(mut errors)) => match errors.pop() {
-                Some(Error::RegionError(e)) => match backoff.next_delay_duration() {
-                    Some(duration) => {
-                        let region_error_resolved =
-                            handle_region_error(pd_client.clone(), *e, store.clone()).await?;
-                        if !region_error_resolved {
-                            sleep(duration).await;
+                Some(Error::RegionError(e)) => {
+                    match backoff.next_delay_for(metrics::backoff_type_for_region_error(&e)) {
+                        Some(duration) => {
+                            let backoff_type = metrics::backoff_type_for_region_error(&e);
+                            let region_error_resolved =
+                                handle_region_error(pd_client.clone(), *e, store.clone()).await?;
+                            if !region_error_resolved {
+                                metrics::backoff(backoff_type, duration);
+                                sleep(duration).await;
+                            }
+                            continue;
                         }
-                        continue;
+                        None => return Err(backoff.exhausted(Error::RegionError(e))),
                     }
-                    None => return Err(Error::RegionError(e)),
-                },
+                }
                 Some(e) => return Err(e),
                 None => unreachable!(),
             },
@@ -300,18 +872,187 @@ async fn resolve_lock_with_retry(
                 Some(e) => return Err(e),
                 None => unreachable!(),
             },
-            Err(e) if is_grpc_error(&e) => match backoff.next_delay_duration() {
+            Err(e) if is_grpc_error(&e) => match backoff.next_delay_for(BackoffType::TikvRpc) {
                 Some(duration) => {
                     pd_client.invalidate_region_cache(ver_id.clone()).await;
                     if let Ok(store_id) = store.region_with_leader.get_store_id() {
                         pd_client.invalidate_store_cache(store_id).await;
                     }
+                    metrics::backoff(BackoffType::TikvRpc, duration);
                     sleep(duration).await;
                     continue;
                 }
-                None => return Err(e),
+                None => return Err(backoff.exhausted(e)),
             },
             Err(e) => return Err(e),
+        }
+    }
+}
+
+/// client-go `ResolvedCacheSize` (txnlock/lock_resolver.go:44).
+pub const RESOLVED_CACHE_SIZE: usize = 2048;
+
+/// The lock-resolution state that client-go keeps per `KVStore`, shared by every request of
+/// one cluster client (reached through [`PdClient::lock_resolver_state`]):
+///
+/// - the settled transaction statuses, `LockResolver.mu.resolved` with its FIFO of
+///   [`RESOLVED_CACHE_SIZE`] (txnlock/lock_resolver.go:61-76, `saveResolved` :236,
+///   `getResolved` :265) — R6;
+/// - the region-wide `ResolveLock` requests in flight, client-go's `resolveRegionSf`
+///   singleflight (internal/client/client_collapse.go:82, keyed by region and start_ts),
+///   so that concurrent readers of one locked region send one request — R12.
+#[derive(Default)]
+pub struct LockResolverState {
+    resolved: std::sync::Mutex<ResolvedCache>,
+    in_flight: std::sync::Mutex<HashMap<(u64, u64), InFlight>>,
+}
+
+/// The low-resolution timestamp (client-go `GetLowResolutionTimestamp`, pd.go:577): the
+/// latest TSO this cluster client has fetched, refreshed by every TSO fetch (`setLastTS` in
+/// `GetTimestamp`, pd.go:220). Lock resolution uses it as CheckTxnStatus's `current_ts` and
+/// for lock expiry (`IsExpired` / `UntilExpired`, pd.go:206, :514), so resolving a lock costs
+/// no PD round trip. A read that fetched no TSO (a max-ts point get) may therefore see a
+/// timestamp up to [`LowResolutionTs::MAX_AGE`] old and treat a just-expired lock as live, as
+/// client-go does. When none is fresh (or the client keeps none: test doubles), a TSO is
+/// fetched, which refreshes it.
+pub(crate) async fn low_resolution_timestamp(pd_client: Arc<impl PdClient>) -> Result<Timestamp> {
+    if let Some(ts) = pd_client
+        .low_resolution_ts()
+        .and_then(LowResolutionTs::low_resolution_ts)
+    {
+        return Ok(ts);
+    }
+    pd_client.get_timestamp().await
+}
+
+type InFlight = futures::future::Shared<futures::future::BoxFuture<'static, bool>>;
+
+#[derive(Default)]
+struct ResolvedCache {
+    map: HashMap<u64, Arc<TransactionStatus>>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl LockResolverState {
+    /// client-go `getResolved`.
+    pub fn get_resolved(&self, txn_id: u64) -> Option<Arc<TransactionStatus>> {
+        let cache = self.resolved.lock().unwrap_or_else(|e| e.into_inner());
+        cache.map.get(&txn_id).cloned()
+    }
+
+    /// client-go `saveResolved` (lock_resolver.go:236-263): only settled statuses; a second
+    /// save of a transaction must agree with the first (`HasSameDeterminedStatus`). As in
+    /// client-go v8.5.8 (c3b5079), a violation panics in every build: the cache would
+    /// otherwise make reads resolve the transaction's locks both ways.
+    ///
+    /// What the panic does differs from client-go: there, one in a session goroutine is
+    /// recovered by the connection loop (the statement fails), and one in a background
+    /// cleanup goroutine kills the process. Here a panic ends only the task it happens in (a
+    /// statement's task, or a background cleanup task), so in practice it is "fail loudly";
+    /// a build with `panic = "abort"` would turn every one into a process exit.
+    ///
+    /// The key is the start_ts alone, as in client-go. With API v2 one client may serve
+    /// several keyspaces (`api_v2_no_prefix`); if they belong to different TSO keyspace
+    /// groups, two transactions can share a start_ts and a legitimate pair of statuses would
+    /// trip the conflict panic. tidb-rs uses one keyspace per client.
+    pub fn save_resolved(&self, txn_id: u64, status: Arc<TransactionStatus>) {
+        if !status.is_determined() {
+            error!(
+                "unexpected undetermined status saved to cache, txn_id: {}, status: {:?}",
+                txn_id, status
+            );
+            panic!("unexpected undetermined status saved to cache");
+        }
+        let mut cache = self.resolved.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(saved) = cache.map.get(&txn_id) {
+            if !saved.has_same_determined_status(&status) {
+                error!(
+                    "unexpected txn status saving to the cache, the existing status is not equal to the new one, txn_id: {}, existing: {:?}, new: {:?}",
+                    txn_id, saved, status
+                );
+                panic!("unexpected txn status saved to cache with existing different entry");
+            }
+            return;
+        }
+        cache.map.insert(txn_id, status);
+        cache.order.push_back(txn_id);
+        if cache.map.len() > RESOLVED_CACHE_SIZE {
+            if let Some(front) = cache.order.pop_front() {
+                cache.map.remove(&front);
+            }
+        }
+    }
+
+    /// Run `send` (a region-wide `ResolveLock` of transaction `start_version` in region
+    /// `region_id`) unless the same request is already in flight; then wait for that one
+    /// instead (client-go `resolveRegionSf.DoChan`). Only success is shared: if the request
+    /// in flight fails, a waiting caller sends its own, so it sees its own error (client-rust
+    /// errors are not `Clone`; client-go shares the error).
+    pub(crate) async fn collapse_resolve<F>(
+        &self,
+        region_id: u64,
+        start_version: u64,
+        send: F,
+    ) -> Result<()>
+    where
+        F: Future<Output = Result<()>>,
+    {
+        let key = (region_id, start_version);
+        // Look up or register in one critical section: two callers must never both become
+        // the sender for one key (#6 review).
+        let registered = {
+            let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            match in_flight.get(&key) {
+                Some(waiting) => Err(waiting.clone()),
+                None => {
+                    let (tx, rx) = futures::channel::oneshot::channel::<bool>();
+                    let entry: InFlight = rx.map(|r| r.unwrap_or(false)).boxed().shared();
+                    in_flight.insert(key, entry.clone());
+                    Ok((tx, entry))
+                }
+            }
+        };
+        let (tx, entry) = match registered {
+            Ok(registered) => registered,
+            Err(waiting) => {
+                if waiting.await {
+                    return Ok(());
+                }
+                return send.await;
+            }
+        };
+        // Removes this caller's entry even if the future is dropped mid-request; waiters then
+        // see a dropped sender (false) and send their own.
+        let _guard = InFlightGuard {
+            state: self,
+            key,
+            entry,
+        };
+        let result = send.await;
+        let _ = tx.send(result.is_ok());
+        result
+    }
+}
+
+struct InFlightGuard<'a> {
+    state: &'a LockResolverState,
+    key: (u64, u64),
+    /// This caller's entry: removed only if it is still the one in the map.
+    entry: InFlight,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .state
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if in_flight
+            .get(&self.key)
+            .is_some_and(|e| e.ptr_eq(&self.entry))
+        {
+            in_flight.remove(&self.key);
         }
     }
 }
@@ -368,11 +1109,25 @@ impl ResolveLocksContext {
 
 pub struct LockResolver {
     ctx: ResolveLocksContext,
+    /// Region-error retries of the resolver's requests (default [`DEFAULT_REGION_BACKOFF`]).
+    region_backoff: Backoff,
 }
 
 impl LockResolver {
     pub fn new(ctx: ResolveLocksContext) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            region_backoff: DEFAULT_REGION_BACKOFF,
+        }
+    }
+
+    /// Retry the resolver's requests (CheckTxnStatus, CheckSecondaryLocks,
+    /// PessimisticRollback) on region errors with `backoff`: a reader passes its own
+    /// `RetryOptions::region_backoff`, as client-go resolves with the read's `Backoffer`.
+    #[must_use]
+    pub fn with_region_backoff(mut self, backoff: Backoff) -> Self {
+        self.region_backoff = backoff;
+        self
     }
 
     /// Decide what `resolve_locks` has to do about `lock`: query its transaction's status and,
@@ -388,7 +1143,10 @@ impl LockResolver {
     ) -> Result<LockAction> {
         let status = match self
             .get_txn_status_from_lock(
-                OPTIMISTIC_BACKOFF,
+                // client-go: the reader's `bo` with `BoTxnNotFound` (lock_resolver.go
+                // getTxnStatusFromLock). With the default `region_backoff` this is
+                // `DEFAULT_REGION_BACKOFF`, the same 2/500 ms × 10 as `OPTIMISTIC_BACKOFF`.
+                self.region_backoff.clone(),
                 lock,
                 caller_start_ts,
                 current_ts,
@@ -400,15 +1158,19 @@ impl LockResolver {
         {
             Ok(status) => status,
             Err(Error::KeyError(key_err))
-                if key_err.primary_mismatch.is_some()
-                    && lock.lock_type == kvrpcpb::Op::PessimisticLock as i32 =>
+                if key_err.primary_mismatch.is_some() && is_pessimistic(lock) =>
             {
                 // The encountered pessimistic lock points at a stale primary: the transaction
                 // changed its primary after writing this lock (pingcap/tidb#42937). Roll back
                 // only this stale lock — the transaction itself may still be alive, and a
                 // region-wide ResolveLock could roll back its other, legitimate locks.
-                pessimistic_rollback_lock(lock, pd_client, keyspace).await?;
-                return Ok(LockAction::Done);
+                pessimistic_rollback_lock(lock, pd_client, keyspace, self.region_backoff.clone())
+                    .await?;
+                // client-go goes on with the zero `TxnStatus{}` (lock_resolver.go:533), which
+                // `IsRolledBack`: a read ignores the transaction (lock_resolver.go:624).
+                return Ok(LockAction::Done {
+                    read: ReadVerdict::Ignore,
+                });
             }
             Err(err) => return Err(err),
         };
@@ -420,7 +1182,7 @@ impl LockResolver {
                 primary_lock
             }
             TransactionStatusKind::Locked(..) => return Ok(LockAction::from_status(&status)),
-            _ if lock.lock_type == kvrpcpb::Op::PessimisticLock as i32 => {
+            _ if is_pessimistic(lock) => {
                 // The primary named by this pessimistic lock is gone, but that does not settle
                 // the transaction's fate: when resolving a pessimistic lock TiKV deliberately
                 // writes no rollback record (`LockNotExistDoNothing`,
@@ -429,14 +1191,19 @@ impl LockResolver {
                 // encountered lock itself may be removed — a region-wide ResolveLock could roll
                 // back the transaction's legitimate locks, prewrite locks included. Pessimistic
                 // locks never block reads, so nothing else is waiting on this region either.
-                pessimistic_rollback_lock(lock, pd_client, keyspace).await?;
-                return Ok(LockAction::Done);
+                pessimistic_rollback_lock(lock, pd_client, keyspace, self.region_backoff.clone())
+                    .await?;
+                // lock_resolver.go:571 then :624 with the status as answered.
+                return Ok(LockAction::Done {
+                    read: ReadVerdict::of(&status, caller_start_ts),
+                });
             }
             _ => return Ok(LockAction::from_status(&status)),
         };
 
         // TiKV will not roll back an expired async-commit primary: the transaction's decision
         // has to be recovered from its secondaries instead.
+        metrics::lock_resolver(LockMetric::ResolveAsyncCommit);
         let secondary_status = self
             .check_all_secondaries(
                 pd_client.clone(),
@@ -450,7 +1217,7 @@ impl LockResolver {
             // this time letting TiKV roll back the expired primary.
             let status = self
                 .get_txn_status_from_lock(
-                    OPTIMISTIC_BACKOFF,
+                    self.region_backoff.clone(),
                     lock,
                     caller_start_ts,
                     current_ts,
@@ -466,12 +1233,13 @@ impl LockResolver {
             secondary_status.resolved_commit_version(primary_lock.min_commit_ts)?;
         // The recovered status is final: cache it so further locks of this transaction skip
         // the recovery, as client-go's `resolveAsyncCommitLock` does with `saveResolved`.
+        let recovered = Arc::new(TransactionStatus::from_commit_version(commit_version));
         self.ctx
-            .save_resolved(
-                lock.lock_version,
-                Arc::new(TransactionStatus::from_commit_version(commit_version)),
-            )
+            .save_resolved(lock.lock_version, recovered.clone())
             .await;
+        if let Some(state) = pd_client.lock_resolver_state() {
+            state.save_resolved(lock.lock_version, recovered);
+        }
         // Every lock of the transaction is resolved, not only the encountered one.
         let mut keys = primary_lock.secondaries.clone();
         keys.push(primary_lock.key.clone());
@@ -510,6 +1278,7 @@ impl LockResolver {
                 continue;
             }
 
+            let l_is_pessimistic = is_pessimistic(&l);
             // Use currentTS = math.MaxUint64 means rollback the txn, no matter the lock is expired or not!
             let mut status = self
                 .check_txn_status(
@@ -521,7 +1290,7 @@ impl LockResolver {
                     u64::MAX,
                     true,
                     false,
-                    l.lock_type == kvrpcpb::Op::PessimisticLock as i32,
+                    l_is_pessimistic,
                     l.is_txn_file,
                 )
                 .await?;
@@ -557,7 +1326,7 @@ impl LockResolver {
                             u64::MAX,
                             true,
                             true,
-                            l.lock_type == kvrpcpb::Op::PessimisticLock as i32,
+                            l_is_pessimistic,
                             l.is_txn_file,
                         )
                         .await?;
@@ -628,6 +1397,13 @@ impl LockResolver {
         if let Some(txn_status) = self.ctx.get_resolved(txn_id).await {
             return Ok(txn_status);
         }
+        // R6: the cluster client's cache, shared across requests (client-go `getResolved`).
+        if let Some(txn_status) = pd_client
+            .lock_resolver_state()
+            .and_then(|state| state.get_resolved(txn_id))
+        {
+            return Ok(txn_status);
+        }
 
         // CheckTxnStatus may meet the following cases:
         // 1. LOCK
@@ -637,6 +1413,7 @@ impl LockResolver {
         // 2.1 Txn Committed
         // 2.2 Txn Rollbacked -- rollback itself, rollback by others, GC tomb etc.
         // 2.3 No lock -- pessimistic lock rollback, concurrence prewrite.
+        metrics::lock_resolver(LockMetric::QueryTxnStatus);
         let req = new_check_txn_status_request(
             primary,
             txn_id,
@@ -648,7 +1425,7 @@ impl LockResolver {
             is_txn_file,
         );
         let plan = crate::request::PlanBuilder::new(pd_client.clone(), keyspace, req)
-            .retry_multi_region(DEFAULT_REGION_BACKOFF)
+            .retry_multi_region(self.region_backoff.clone())
             .merge(CollectSingle)
             .extract_error()
             .post_process_default()
@@ -679,11 +1456,24 @@ impl LockResolver {
             Err(err) => return Err(err),
         };
 
-        let current = pd_client.clone().get_timestamp().await?;
+        // client-go `IsExpired` on the low-resolution timestamp (lock_resolver.go:537).
+        let current = low_resolution_timestamp(pd_client.clone()).await?;
         status.check_ttl(current);
+        match status.kind {
+            TransactionStatusKind::Committed(_) => {
+                metrics::lock_resolver(LockMetric::QueryTxnStatusCommitted)
+            }
+            TransactionStatusKind::RolledBack => {
+                metrics::lock_resolver(LockMetric::QueryTxnStatusRolledBack)
+            }
+            TransactionStatusKind::Locked(..) => {}
+        }
         let res = Arc::new(status);
         if res.is_cacheable() {
             self.ctx.save_resolved(txn_id, res.clone()).await;
+            if let Some(state) = pd_client.lock_resolver_state() {
+                state.save_resolved(txn_id, res.clone());
+            }
         }
         Ok(res)
     }
@@ -695,10 +1485,11 @@ impl LockResolver {
         keys: Vec<Vec<u8>>,
         txn_id: u64,
     ) -> Result<SecondaryLocksStatus> {
+        metrics::lock_resolver(LockMetric::QueryCheckSecondaryLocks);
         let req = new_check_secondary_locks_request(keys, txn_id);
         let plan = crate::request::PlanBuilder::new(pd_client.clone(), keyspace, req)
             .preserve_shard()
-            .retry_multi_region(DEFAULT_REGION_BACKOFF)
+            .retry_multi_region(self.region_backoff.clone())
             .extract_error()
             .merge(CollectSecondaryLocks {
                 start_version: txn_id,
@@ -715,6 +1506,7 @@ impl LockResolver {
         txn_infos: Vec<TxnInfo>,
     ) -> Result<RegionVerId> {
         let ver_id = store.region_with_leader.ver_id();
+        metrics::lock_resolver(LockMetric::BatchResolve);
         let request = requests::new_batch_resolve_lock_request(txn_infos.clone());
         let plan = crate::request::PlanBuilder::new(pd_client.clone(), keyspace, request)
             .single_region_with_store(store.clone())
@@ -758,14 +1550,15 @@ impl LockResolver {
                     current_ts,
                     rollback_if_not_exist,
                     force_sync_commit,
-                    lock.lock_type == kvrpcpb::Op::PessimisticLock as i32,
+                    is_pessimistic(lock),
                     lock.is_txn_file,
                 )
                 .await
             {
                 Ok(status) => return Ok(status),
                 Err(Error::TxnNotFound(txn_not_found)) => {
-                    let current = pd_client.clone().get_timestamp().await?;
+                    // client-go `UntilExpired` on the low-resolution timestamp (:748).
+                    let current = low_resolution_timestamp(pd_client.clone()).await?;
                     if lock_until_expired_ms(lock.lock_version, lock.lock_ttl, current) <= 0 {
                         warn!(
                             "lock txn not found, lock has expired, lock {:?}, caller_start_ts {}, current_ts {}",
@@ -773,7 +1566,7 @@ impl LockResolver {
                         );
                         rollback_if_not_exist = true;
                         continue;
-                    } else if lock.lock_type == kvrpcpb::Op::PessimisticLock as i32 {
+                    } else if is_pessimistic(lock) {
                         let status = TransactionStatus {
                             kind: TransactionStatusKind::Locked(lock.lock_ttl, lock.clone()),
                             action: kvrpcpb::Action::NoAction,
@@ -782,11 +1575,12 @@ impl LockResolver {
                         return Ok(Arc::new(status));
                     }
 
-                    if let Some(duration) = backoff.next_delay_duration() {
+                    if let Some(duration) = backoff.next_delay_for(BackoffType::TxnNotFound) {
+                        metrics::backoff(BackoffType::TxnNotFound, duration);
                         sleep(duration).await;
                         continue;
                     }
-                    return Err(Error::TxnNotFound(txn_not_found));
+                    return Err(backoff.exhausted(Error::TxnNotFound(txn_not_found)));
                 }
                 Err(err) => return Err(err),
             }
@@ -861,6 +1655,9 @@ mod tests {
             min_commit_ts,
             use_async_commit: true,
             secondaries,
+            // Not lite: these tests count region-wide ResolveLock requests (R5 tests the
+            // lite mode separately).
+            txn_size: 100,
             ..Default::default()
         }
     }
@@ -897,7 +1694,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_locks_are_refused_never_misresolved() {
+    fn shared_lock_wrappers_are_refused_members_are_not() {
         let plain = kvrpcpb::LockInfo {
             key: b"k1".to_vec(),
             lock_version: 7,
@@ -917,12 +1714,745 @@ mod tests {
         };
         assert!(reject_shared_locks(&[plain.clone(), wrapper]).is_err());
 
-        // Also refused when only the op marks it shared (empty member list).
+        // Also refused when only the op marks it a wrapper (empty member list).
         let by_op = kvrpcpb::LockInfo {
-            lock_type: kvrpcpb::Op::SharedPessimisticLock as i32,
+            lock_type: kvrpcpb::Op::SharedLock as i32,
             ..Default::default()
         };
         assert!(reject_shared_locks(&[by_op]).is_err());
+
+        // A member: the pessimistic lock of one holder, resolved like any pessimistic lock
+        // (client-go `IsShared` is only `Op_SharedLock`; `IsPessimistic` covers this one).
+        let member = kvrpcpb::LockInfo {
+            key: b"k2".to_vec(),
+            lock_version: 8,
+            lock_type: kvrpcpb::Op::SharedPessimisticLock as i32,
+            ..Default::default()
+        };
+        assert!(reject_shared_locks(std::slice::from_ref(&member)).is_ok());
+        assert!(is_pessimistic(&member));
+
+        // The coprocessor expands a wrapper into its members.
+        let wrapper = kvrpcpb::LockInfo {
+            lock_type: kvrpcpb::Op::SharedLock as i32,
+            shared_lock_infos: vec![member.clone(), plain.clone()],
+            ..Default::default()
+        };
+        assert_eq!(expand_shared_lock(wrapper), vec![member, plain.clone()]);
+        assert_eq!(expand_shared_lock(plain.clone()), vec![plain]);
+    }
+
+    /// The read's view of `CheckTxnStatus` (lock_resolver.go:624-639), for a read at 10 meeting
+    /// a lock of transaction 1 (TTL not expired under the mock PD clock):
+    /// (commit_version, lock_ttl, action) → (live, ignorable, accessible, ResolveLock sent).
+    #[rstest::rstest]
+    // Committed at or before the read: read through it.
+    #[case(5, 0, kvrpcpb::Action::NoAction, (0, vec![], vec![1], true))]
+    #[case(10, 0, kvrpcpb::Action::NoAction, (0, vec![], vec![1], true))]
+    // Committed after the read: ignore it.
+    #[case(20, 0, kvrpcpb::Action::NoAction, (0, vec![1], vec![], true))]
+    // Rolled back: ignore it.
+    #[case(0, 0, kvrpcpb::Action::TtlExpireRollback, (0, vec![1], vec![], true))]
+    // Alive, min_commit_ts pushed past the read: ignore it, nothing to resolve.
+    #[case(0, 100, kvrpcpb::Action::MinCommitTsPushed, (0, vec![1], vec![], false))]
+    // Alive otherwise: wait.
+    #[case(0, 100, kvrpcpb::Action::NoAction, (1, vec![], vec![], false))]
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_locks_for_read_classifies(
+        #[case] commit_version: u64,
+        #[case] lock_ttl: u64,
+        #[case] action: kvrpcpb::Action,
+        #[case] expected: (usize, Vec<u64>, Vec<u64>, bool),
+    ) {
+        let lock = kvrpcpb::LockInfo {
+            key: vec![1],
+            primary_lock: vec![1],
+            lock_version: 1,
+            lock_ttl: 100,
+            txn_size: 100, // not lite
+            ..Default::default()
+        };
+        let lock_captured = lock.clone();
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let resolve_count_captured = resolve_count.clone();
+        let client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if let Some(req) = req.downcast_ref::<kvrpcpb::CheckTxnStatusRequest>() {
+                    assert_eq!(req.caller_start_ts, 10);
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        commit_version,
+                        lock_ttl,
+                        lock_info: (lock_ttl != 0).then(|| lock_captured.clone()),
+                        action: action as i32,
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                if req.is::<kvrpcpb::ResolveLockRequest>() {
+                    resolve_count_captured.fetch_add(1, Ordering::SeqCst);
+                    return Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>);
+                }
+                panic!("unexpected request type: {:?}", req.type_id());
+            },
+        )));
+        let read = resolve_locks_for_read(
+            vec![lock],
+            Timestamp::from_version(10),
+            client,
+            Keyspace::Disable,
+            false,
+            DEFAULT_REGION_BACKOFF,
+        )
+        .await
+        .unwrap();
+        let (live, ignorable, accessible, resolves) = expected;
+        assert_eq!(read.live.len(), live);
+        assert_eq!(read.ignorable, ignorable);
+        assert_eq!(read.accessible, accessible);
+        // A settled transaction's locks are resolved in the background (R2).
+        for _ in 0..200 {
+            if resolve_count.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(resolve_count.load(Ordering::SeqCst) > 0, resolves);
+    }
+
+    /// R2: for a read, the settled transaction's locks are resolved in a background task;
+    /// `resolve_locks_for_read` returns before that cleanup finishes (client-go
+    /// lock_resolver.go:584-596).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_resolve_locks_for_read_does_not_wait_for_cleanup() {
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let gate_captured = gate.clone();
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let resolve_count_captured = resolve_count.clone();
+        let client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.is::<kvrpcpb::CheckTxnStatusRequest>() {
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        commit_version: 5,
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                if req.is::<kvrpcpb::ResolveLockRequest>() {
+                    // Held until the test opens the gate.
+                    let (open, cv) = &*gate_captured;
+                    let mut open = open.lock().unwrap();
+                    while !*open {
+                        open = cv.wait(open).unwrap();
+                    }
+                    resolve_count_captured.fetch_add(1, Ordering::SeqCst);
+                    return Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>);
+                }
+                panic!("unexpected request type: {:?}", req.type_id());
+            },
+        )));
+        let lock = kvrpcpb::LockInfo {
+            key: vec![1],
+            primary_lock: vec![1],
+            lock_version: 1,
+            lock_ttl: 100,
+            txn_size: 100, // not lite
+            ..Default::default()
+        };
+        let read = resolve_locks_for_read(
+            vec![lock],
+            Timestamp::from_version(10),
+            client,
+            Keyspace::Disable,
+            false,
+            DEFAULT_REGION_BACKOFF,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.accessible, vec![1]);
+        assert_eq!(resolve_count.load(Ordering::SeqCst), 0);
+        {
+            let (open, cv) = &*gate;
+            *open.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        for _ in 0..200 {
+            if resolve_count.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
+    }
+
+    /// R2: an expired async-commit transaction met by a read: its status is recovered from the
+    /// secondaries before returning (the read needs it), and all of its locks are then
+    /// resolved in the background (client-go `resolveAsyncCommitLock(.., asyncResolveAll =
+    /// forRead)`, lock_resolver.go:1092).
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_locks_for_read_async_commit_in_background() {
+        let resolved = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let resolved_captured = resolved.clone();
+        let client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.is::<kvrpcpb::CheckTxnStatusRequest>() {
+                    return Ok(Box::new(still_locked_response(async_commit_primary_lock(
+                        PRIMARY_KEY,
+                        44,
+                        vec![SECONDARY_KEY.to_vec()],
+                    ))) as Box<dyn Any>);
+                }
+                if req.is::<kvrpcpb::CheckSecondaryLocksRequest>() {
+                    return Ok(Box::new(kvrpcpb::CheckSecondaryLocksResponse {
+                        locks: vec![async_commit_secondary_lock(SECONDARY_KEY, 43)],
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                if let Some(req) = req.downcast_ref::<kvrpcpb::ResolveLockRequest>() {
+                    resolved_captured.lock().unwrap().push(req.commit_version);
+                    return Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>);
+                }
+                panic!("unexpected request type: {:?}", req.type_id());
+            },
+        )));
+        let lock = async_commit_primary_lock(PRIMARY_KEY, 44, vec![SECONDARY_KEY.to_vec()]);
+        let read = resolve_locks_for_read(
+            vec![lock],
+            Timestamp::from_version(100),
+            client,
+            Keyspace::Disable,
+            false,
+            DEFAULT_REGION_BACKOFF,
+        )
+        .await
+        .unwrap();
+        // Committed at 44, before the read at 100: read through.
+        assert!(read.live.is_empty());
+        assert_eq!(read.accessible, vec![EXPIRED_TXN_VERSION]);
+        for _ in 0..200 {
+            if resolved.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Both regions (secondary and primary), with the recovered commit version.
+        assert_eq!(*resolved.lock().unwrap(), vec![44, 44]);
+    }
+
+    /// R3: the time until the first live lock expires is the minimum over the live locks,
+    /// from the TTL `CheckTxnStatus` answered (client-go `txnExpireTime`,
+    /// lock_resolver.go:617, :671). Under the mock PD clock (physical 0) and lock versions
+    /// with physical 0, it is the TTL itself.
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_locks_reports_time_to_first_expiry() {
+        let client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if let Some(req) = req.downcast_ref::<kvrpcpb::CheckTxnStatusRequest>() {
+                    // Transaction 1 has 3000 ms left, transaction 2 has 1000 ms.
+                    let ttl = if req.lock_ts == 1 { 3000 } else { 1000 };
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        lock_ttl: ttl,
+                        lock_info: Some(kvrpcpb::LockInfo {
+                            key: vec![req.lock_ts as u8],
+                            primary_lock: vec![req.lock_ts as u8],
+                            lock_version: req.lock_ts,
+                            lock_ttl: ttl,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                panic!("unexpected request type: {:?}", req.type_id());
+            },
+        )));
+        let lock = |txn: u64| kvrpcpb::LockInfo {
+            key: vec![txn as u8],
+            primary_lock: vec![txn as u8],
+            lock_version: txn,
+            lock_ttl: 5000,
+            ..Default::default()
+        };
+        let found = resolve_locks_with_expiry(
+            vec![lock(1), lock(2)],
+            Timestamp::from_version(10),
+            client.clone(),
+            Keyspace::Disable,
+            DEFAULT_REGION_BACKOFF,
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.live.len(), 2);
+        assert_eq!(found.ms_before_expired, 1000);
+        // Reads report the same.
+        let read = resolve_locks_for_read(
+            vec![lock(1)],
+            Timestamp::from_version(10),
+            client,
+            Keyspace::Disable,
+            false,
+            DEFAULT_REGION_BACKOFF,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.ms_before_expired, 3000);
+    }
+
+    /// R3: `BackoffWithMaxSleepTxnLockFast(msBeforeExpired)`: the delay is capped at the time
+    /// left; with no time left the retry is immediate and spends no attempt.
+    #[test]
+    fn lock_backoff_charges_sleep_time() {
+        let wait = |sleep_ms: u64, refresh_ts: bool| {
+            Some(LockWait {
+                sleep: std::time::Duration::from_millis(sleep_ms),
+                refresh_ts,
+            })
+        };
+        // Steps of 100, 200, 400 ms.
+        let mut lb = LockBackoff::new(Backoff::no_jitter_backoff(100, 1000, 3));
+        // No time left: immediate; the second in a row refreshes the TSO and sleeps 1 ms,
+        // charged to the first (100 ms) step.
+        assert_eq!(lb.next_wait(0), wait(0, false));
+        assert_eq!(lb.next_wait(0), wait(1, true));
+        assert_eq!(lb.next_wait(0), wait(0, false));
+        assert_eq!(lb.backoff.current_attempts(), 1);
+        // The rest of the 100 ms step (99 ms) in capped sleeps of 30 ms, then the 200 ms step.
+        for _ in 0..3 {
+            assert_eq!(lb.next_wait(30), wait(30, false));
+        }
+        assert_eq!(lb.next_wait(30), wait(9, false));
+        assert_eq!(lb.backoff.current_attempts(), 1);
+        assert_eq!(lb.next_wait(30), wait(30, false));
+        assert_eq!(lb.backoff.current_attempts(), 2);
+        // Uncapped: the rest of the 200 ms step, then the whole 400 ms one, then spent.
+        assert_eq!(lb.next_wait(10_000), wait(170, false));
+        assert_eq!(lb.next_wait(10_000), wait(400, false));
+        assert_eq!(lb.next_wait(10_000), None);
+    }
+
+    /// R5: lite resolution (client-go `resolveLock`, lock_resolver.go:1204-1271). A
+    /// committed 2PC transaction is met through three locks in one region: its primary (key
+    /// [1]) and two secondaries ([2], [3]). Each case gives the `ResolveLock` requests sent,
+    /// as their `keys` (empty = the whole region):
+    /// - small transaction (`txn_size < 16`), or `lite` asked for: the primary needs no request
+    ///   (CheckTxnStatus resolved it), each secondary is resolved alone, and nothing is
+    ///   recorded as clean, so the second secondary gets its own request;
+    /// - big transaction, not lite: one region-wide request, the region is then clean.
+    #[rstest::rstest]
+    #[case::small_txn(3, false, vec![vec![vec![2u8]], vec![vec![3u8]]])]
+    #[case::lite_asked(100, true, vec![vec![vec![2u8]], vec![vec![3u8]]])]
+    #[case::big_txn(100, false, vec![vec![]])]
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_lock_lite(
+        #[case] txn_size: u64,
+        #[case] lite: bool,
+        #[case] expected: Vec<Vec<Vec<u8>>>,
+    ) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<Vec<Vec<u8>>>::new()));
+        let requests_captured = requests.clone();
+        let client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.is::<kvrpcpb::CheckTxnStatusRequest>() {
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        commit_version: 5,
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                if let Some(req) = req.downcast_ref::<kvrpcpb::ResolveLockRequest>() {
+                    requests_captured.lock().unwrap().push(req.keys.clone());
+                    return Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>);
+                }
+                panic!("unexpected request type: {:?}", req.type_id());
+            },
+        )));
+        let lock = |key: u8| kvrpcpb::LockInfo {
+            key: vec![key],
+            primary_lock: vec![1],
+            lock_version: 1,
+            lock_ttl: 100,
+            txn_size,
+            ..Default::default()
+        };
+        let locks = vec![lock(1), lock(2), lock(3)];
+        if lite {
+            // Only reads ask for lite (a snapshot's point get); the cleanup then runs in the
+            // background.
+            resolve_locks_for_read(
+                locks,
+                Timestamp::from_version(10),
+                client,
+                Keyspace::Disable,
+                true,
+                DEFAULT_REGION_BACKOFF,
+            )
+            .await
+            .unwrap();
+            for _ in 0..200 {
+                if requests.lock().unwrap().len() >= expected.len() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let mut got = requests.lock().unwrap().clone();
+            got.sort();
+            assert_eq!(got, expected);
+        } else {
+            resolve_locks(
+                locks,
+                Timestamp::from_version(10),
+                client,
+                Keyspace::Disable,
+            )
+            .await
+            .unwrap();
+            assert_eq!(*requests.lock().unwrap(), expected);
+        }
+    }
+
+    /// R6: settled statuses are shared across requests of one cluster client: a second,
+    /// separate `resolve_locks` call for the same transaction sends no `CheckTxnStatus`
+    /// (client-go `getResolved` on the store's `LockResolver`).
+    #[tokio::test]
+    #[serial]
+    async fn test_resolved_status_shared_across_calls() {
+        let checks = Arc::new(AtomicUsize::new(0));
+        let checks_captured = checks.clone();
+        let client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.is::<kvrpcpb::CheckTxnStatusRequest>() {
+                    checks_captured.fetch_add(1, Ordering::SeqCst);
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        commit_version: 5,
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                if req.is::<kvrpcpb::ResolveLockRequest>() {
+                    return Ok(Box::<kvrpcpb::ResolveLockResponse>::default() as Box<dyn Any>);
+                }
+                panic!("unexpected request type: {:?}", req.type_id());
+            },
+        )));
+        let lock = |key: u8| kvrpcpb::LockInfo {
+            key: vec![key],
+            primary_lock: vec![1],
+            lock_version: 1,
+            lock_ttl: 100,
+            txn_size: 100,
+            ..Default::default()
+        };
+        for key in [2, 3] {
+            resolve_locks(
+                vec![lock(key)],
+                Timestamp::from_version(10),
+                client.clone(),
+                Keyspace::Disable,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        assert!(client
+            .lock_resolver_state()
+            .unwrap()
+            .get_resolved(1)
+            .is_some());
+    }
+
+    fn committed(ts: u64) -> Arc<TransactionStatus> {
+        Arc::new(TransactionStatus::from_commit_version(ts))
+    }
+
+    /// R6: the cache keeps the last `RESOLVED_CACHE_SIZE` transactions (FIFO), and a
+    /// consistent second save is a no-op.
+    #[test]
+    fn resolved_cache_is_fifo_bounded() {
+        let state = LockResolverState::default();
+        for txn in 1..=(RESOLVED_CACHE_SIZE as u64 + 1) {
+            state.save_resolved(txn, committed(txn + 1_000_000));
+        }
+        assert!(state.get_resolved(1).is_none());
+        assert!(state.get_resolved(2).is_some());
+        assert!(state.get_resolved(RESOLVED_CACHE_SIZE as u64 + 1).is_some());
+        // Same status again: kept, no panic.
+        state.save_resolved(2, committed(2 + 1_000_000));
+    }
+
+    /// R6: as client-go v8.5.8 (`saveResolved`, lock_resolver.go:247-253), a different
+    /// settled status for a cached transaction panics.
+    #[test]
+    #[should_panic(expected = "existing different entry")]
+    fn resolved_cache_panics_on_conflicting_status() {
+        let state = LockResolverState::default();
+        state.save_resolved(7, committed(10));
+        state.save_resolved(7, Arc::new(TransactionStatus::from_commit_version(0)));
+    }
+
+    /// R6: only settled statuses may be cached (lock_resolver.go:237-241).
+    #[test]
+    #[should_panic(expected = "undetermined status")]
+    fn resolved_cache_panics_on_undetermined_status() {
+        let state = LockResolverState::default();
+        state.save_resolved(
+            7,
+            Arc::new(TransactionStatus {
+                kind: TransactionStatusKind::RolledBack,
+                action: kvrpcpb::Action::LockNotExistDoNothing,
+                is_expired: false,
+            }),
+        );
+    }
+
+    /// R12: a region-wide resolve already in flight for the same (region, start_ts) is not
+    /// sent again: the second caller waits for it (client-go `resolveRegionSf`). If the one
+    /// in flight fails, the waiter sends its own; another key is never collapsed.
+    #[rstest::rstest]
+    #[case::collapsed(true, 1, 1)]
+    #[case::leader_failed(false, 1, 2)]
+    #[case::other_txn(true, 2, 2)]
+    #[tokio::test]
+    async fn test_collapse_resolve(
+        #[case] leader_ok: bool,
+        #[case] follower_txn: u64,
+        #[case] expected_sends: usize,
+    ) {
+        let state = Arc::new(LockResolverState::default());
+        let sends = Arc::new(AtomicUsize::new(0));
+        let (release, released) = futures::channel::oneshot::channel::<()>();
+        let leader = {
+            let (state, sends) = (state.clone(), sends.clone());
+            tokio::spawn(async move {
+                state
+                    .collapse_resolve(9, 1, async move {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        let _ = released.await;
+                        if leader_ok {
+                            Ok(())
+                        } else {
+                            Err(Error::StringError("injected".to_owned()))
+                        }
+                    })
+                    .await
+            })
+        };
+        // Let the leader register its request.
+        while sends.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let follower = {
+            let (state, sends) = (state.clone(), sends.clone());
+            tokio::spawn(async move {
+                state
+                    .collapse_resolve(9, follower_txn, async move {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        release.send(()).unwrap();
+        assert_eq!(leader.await.unwrap().is_ok(), leader_ok);
+        assert!(follower.await.unwrap().is_ok());
+        assert_eq!(sends.load(Ordering::SeqCst), expected_sends);
+        // Nothing left in flight.
+        assert!(state.in_flight.lock().unwrap().is_empty());
+    }
+
+    /// R12 (#6 review): the lookup and the registration are one critical section, so of many
+    /// callers starting at once exactly one sends; the others wait and share its success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_collapse_resolve_concurrent_leaders() {
+        const CALLERS: usize = 16;
+        let state = Arc::new(LockResolverState::default());
+        let sends = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let tasks: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let (state, sends, barrier, gate) =
+                    (state.clone(), sends.clone(), barrier.clone(), gate.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    state
+                        .collapse_resolve(9, 1, async move {
+                            sends.fetch_add(1, Ordering::SeqCst);
+                            gate.notified().await;
+                            Ok(())
+                        })
+                        .await
+                })
+            })
+            .collect();
+        while sends.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // Give every caller time to reach the in-flight map.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        gate.notify_waiters();
+        for t in tasks {
+            assert!(t.await.unwrap().is_ok());
+        }
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert!(state.in_flight.lock().unwrap().is_empty());
+    }
+
+    /// R12: a sender dropped mid-request (its task cancelled) removes its own entry; a waiter
+    /// then sends its own request, and a later caller registers afresh.
+    #[tokio::test]
+    async fn test_collapse_resolve_cancelled_leader() {
+        let state = Arc::new(LockResolverState::default());
+        let sends = Arc::new(AtomicUsize::new(0));
+        let leader = {
+            let (state, sends) = (state.clone(), sends.clone());
+            tokio::spawn(async move {
+                state
+                    .collapse_resolve(9, 1, async move {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        futures::future::pending::<Result<()>>().await
+                    })
+                    .await
+            })
+        };
+        while sends.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let waiter = {
+            let (state, sends) = (state.clone(), sends.clone());
+            tokio::spawn(async move {
+                state
+                    .collapse_resolve(9, 1, async move {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        leader.abort();
+        assert!(waiter.await.unwrap().is_ok());
+        assert_eq!(sends.load(Ordering::SeqCst), 2);
+        assert!(state.in_flight.lock().unwrap().is_empty());
+    }
+
+    /// R7: lock resolution reads the time from the low-resolution timestamp (the latest TSO
+    /// this client fetched) instead of fetching a TSO, as client-go (`getTxnStatusFromLock`,
+    /// lock_resolver.go:723; `IsExpired`, :537). A max-ts point get fetches no TSO, so the
+    /// timestamp can be stale: here the last TSO is at physical 1000 ms, the PD clock has
+    /// moved to 2000 ms, and a lock that expires at 1100 ms is still treated as live, with
+    /// 100 ms left (client-go behaves the same; see tidb-rs specs/D07.1-store/
+    /// mixed-cluster-locks.md). Once the timestamp is older than `LowResolutionTs::MAX_AGE`, a
+    /// TSO is fetched and the lock is seen as expired.
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn test_lock_resolution_uses_low_resolution_ts() {
+        let physical = Arc::new(AtomicU64::new(1000));
+        let tso_fetches = Arc::new(AtomicUsize::new(0));
+        let current_ts_seen = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        let (physical_c, fetches_c, seen_c) = (
+            physical.clone(),
+            tso_fetches.clone(),
+            current_ts_seen.clone(),
+        );
+        let lock = kvrpcpb::LockInfo {
+            key: vec![1],
+            primary_lock: vec![1],
+            lock_version: Timestamp {
+                physical: 900,
+                ..Default::default()
+            }
+            .version(),
+            lock_ttl: 200,
+            txn_size: 100,
+            ..Default::default()
+        };
+        let lock_c = lock.clone();
+        let client = Arc::new(
+            MockPdClient::new(MockKvClient::with_dispatch_hook(move |req: &dyn Any| {
+                if let Some(req) = req.downcast_ref::<kvrpcpb::CheckTxnStatusRequest>() {
+                    seen_c
+                        .lock()
+                        .unwrap()
+                        .push(Timestamp::from_version(req.current_ts).physical);
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        lock_ttl: 200,
+                        lock_info: Some(lock_c.clone()),
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                panic!("unexpected request type: {:?}", req.type_id());
+            }))
+            .with_timestamp_hook(move || {
+                fetches_c.fetch_add(1, Ordering::SeqCst);
+                Timestamp {
+                    physical: physical_c.load(Ordering::SeqCst) as i64,
+                    ..Default::default()
+                }
+            }),
+        );
+        // Some earlier read fetched a TSO at 1000 ms.
+        client.clone().get_timestamp().await.unwrap();
+        physical.store(2000, Ordering::SeqCst);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+
+        let read = resolve_locks_for_read(
+            vec![lock.clone()],
+            Timestamp::from_version(u64::MAX),
+            client.clone(),
+            Keyspace::Disable,
+            true,
+            DEFAULT_REGION_BACKOFF,
+        )
+        .await
+        .unwrap();
+        // No new TSO: the lock looks live with 100 ms left.
+        assert_eq!(tso_fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(*current_ts_seen.lock().unwrap(), vec![1000]);
+        assert_eq!(read.live.len(), 1);
+        assert_eq!(read.ms_before_expired, 100);
+
+        // Past MAX_AGE the next resolution fetches a TSO (at 3000 ms).
+        physical.store(3000, Ordering::SeqCst);
+        tokio::time::advance(crate::pd::LowResolutionTs::MAX_AGE).await;
+        let read = resolve_locks_for_read(
+            vec![lock],
+            Timestamp::from_version(u64::MAX),
+            client,
+            Keyspace::Disable,
+            true,
+            DEFAULT_REGION_BACKOFF,
+        )
+        .await
+        .unwrap();
+        assert_eq!(tso_fetches.load(Ordering::SeqCst), 2);
+        assert_eq!(*current_ts_seen.lock().unwrap(), vec![1000, 3000]);
+        assert_eq!(read.ms_before_expired, 0);
+    }
+
+    /// `ReadLockHints` (client-go `util.TSSet` pair): `get_all` is `None` while empty, the
+    /// sets deduplicate, and clones share them.
+    #[test]
+    fn read_lock_hints_are_shared_sets() {
+        let hints = ReadLockHints::new(10);
+        assert_eq!(hints.get_all(), None);
+        let clone = hints.clone();
+        clone.record(
+            10,
+            &ReadLocks {
+                live: vec![],
+                ignorable: vec![7, 3],
+                accessible: vec![5],
+                ms_before_expired: 0,
+            },
+        );
+        hints.put_resolved([3]);
+        hints.put_committed([9]);
+        assert_eq!(hints.get_all(), Some((vec![3, 7], vec![5, 9])));
     }
 
     #[rstest::rstest]
@@ -964,6 +2494,7 @@ mod tests {
             1,
             2,
             false,
+            false,
             client.clone(),
             keyspace,
             backoff.clone(),
@@ -984,6 +2515,7 @@ mod tests {
             (&key).into(),
             3,
             4,
+            false,
             false,
             client,
             keyspace,
@@ -1026,6 +2558,7 @@ mod tests {
         lock.primary_lock = vec![1];
         lock.lock_version = 1;
         lock.lock_ttl = 100; // not expired under MockPdClient's Timestamp::default()
+        lock.txn_size = 100; // not lite: the resolve is counted
 
         let live_locks = resolve_locks(vec![lock], Timestamp::default(), client, Keyspace::Disable)
             .await

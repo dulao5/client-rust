@@ -4,8 +4,6 @@
 //! The lower 18 (PHYSICAL_SHIFT_BITS) bits are the logical part of the timestamp.
 //! The higher bits of the version are the physical part of the timestamp.
 
-use std::convert::TryInto;
-
 pub use crate::proto::pdpb::Timestamp;
 
 const PHYSICAL_SHIFT_BITS: i64 = 18;
@@ -26,9 +24,12 @@ pub trait TimestampExt: Sized {
 
 impl TimestampExt for Timestamp {
     fn version(&self) -> u64 {
-        ((self.physical << PHYSICAL_SHIFT_BITS) + self.logical)
-            .try_into()
-            .expect("Overflow converting timestamp to version")
+        // `from_version(u64::MAX)` (TiDB's MaxTS, "read the latest committed version") stores
+        // the bit pattern as i64 -1 parts; compose in u64 so it round-trips instead of
+        // overflowing. Every timestamp PD issues is far below 2^63.
+        let physical = self.physical as u64;
+        let logical = self.logical as u64;
+        (physical << PHYSICAL_SHIFT_BITS).wrapping_add(logical)
     }
 
     fn from_version(version: u64) -> Self {
@@ -46,6 +47,25 @@ impl TimestampExt for Timestamp {
             None
         } else {
             Some(Self::from_version(version))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_round_trip() {
+        for v in [
+            0,
+            1,
+            (1 << 18) - 1,
+            1 << 18,
+            449_000_000_000_000_000,
+            u64::MAX,
+        ] {
+            assert_eq!(Timestamp::from_version(v).version(), v, "{v}");
         }
     }
 }

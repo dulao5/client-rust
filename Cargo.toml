@@ -12,6 +12,9 @@ rust-version = "1.93.0"
 [features]
 default = ["prometheus"]
 prometheus = ["prometheus/push", "prometheus/process"]
+# Record client-go's `tidb_tikvclient_*` and PD client's `pd_client_*` metrics (names, labels,
+# buckets as TiDB v8.5 exports them) in the default prometheus registry; see `src/metrics.rs`.
+client-go-metrics = []
 # Enable integration tests with a running TiKV and PD instance.
 # Use $PD_ADDRS, comma separated, to set the addresses the tests use.
 integration-tests = []
@@ -59,7 +62,7 @@ rstest = "0.18.2"
 serde_json = "1"
 serial_test = "0.5.0"
 tempfile = "=3.14.0"
-tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "test-util"] }
 
 [[test]]
 name = "failpoint_tests"

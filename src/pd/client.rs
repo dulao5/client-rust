@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use futures::prelude::*;
@@ -13,6 +14,7 @@ use crate::compat::stream_fn;
 use crate::kv::codec;
 use crate::pd::retry::RetryClientTrait;
 use crate::pd::Cluster;
+use crate::pd::LowResolutionTs;
 use crate::pd::RetryClient;
 use crate::proto::keyspacepb;
 use crate::proto::kvrpcpb;
@@ -23,9 +25,12 @@ use crate::region::RegionWithLeader;
 use crate::region::StoreId;
 use crate::region_cache::RegionCache;
 use crate::store::KvConnect;
+use crate::store::Liveness;
 use crate::store::RegionStore;
+use crate::store::StoreLiveness;
 use crate::store::TikvConnect;
 use crate::store::{KvClient, Store};
+use crate::transaction::LockResolverState;
 use crate::BoundRange;
 use crate::Config;
 use crate::Key;
@@ -81,6 +86,29 @@ pub trait PdClient: Send + Sync + 'static {
     }
 
     async fn all_stores(&self) -> Result<Vec<Store>>;
+
+    /// The lock-resolution state of this cluster client: client-go keeps it per `KVStore` in
+    /// its `LockResolver` (resolved-status cache, in-flight region resolves). It lives on the
+    /// PD client only because that is what the lock-resolution paths (the `ResolveLock` plan,
+    /// the coprocessor, snapshot reads) are handed; it has nothing to do with PD. `None`: no
+    /// sharing, every resolution starts from scratch (test doubles).
+    fn lock_resolver_state(&self) -> Option<&LockResolverState> {
+        None
+    }
+
+    /// The low-resolution timestamp of this cluster client (client-go `pdOracle`'s last TSO):
+    /// implementors that keep one refresh it in [`PdClient::get_timestamp`]. `None`: callers
+    /// fetch a TSO instead.
+    fn low_resolution_ts(&self) -> Option<&LowResolutionTs> {
+        None
+    }
+
+    /// The store liveness state of this cluster client (client-go keeps it on each `Store` of
+    /// its region cache). `None`: every store is taken as reachable and never probed (test
+    /// doubles).
+    fn store_liveness(&self) -> Option<&StoreLiveness> {
+        None
+    }
 
     fn group_keys_by_region<K, K2>(
         self: Arc<Self>,
@@ -213,10 +241,16 @@ pub trait PdClient: Send + Sync + 'static {
 /// for a single TiKV store using PD and internal logic.
 pub struct PdRpcClient<KvC: KvConnect + Send + Sync + 'static = TikvConnect, Cl = Cluster> {
     pd: Arc<RetryClient<Cl>>,
-    kv_connect: KvC,
+    kv_connect: Arc<KvC>,
     kv_client_cache: Arc<RwLock<HashMap<String, KvC::KvClient>>>,
     enable_codec: bool,
-    region_cache: RegionCache<RetryClient<Cl>>,
+    region_cache: Arc<RegionCache<RetryClient<Cl>>>,
+    /// See [`PdClient::store_liveness`]; built on first use.
+    store_liveness: OnceLock<StoreLiveness>,
+    /// See [`PdClient::lock_resolver_state`].
+    lock_resolver: LockResolverState,
+    /// See [`PdClient::low_resolution_ts`].
+    low_resolution_ts: LowResolutionTs,
 }
 
 #[async_trait]
@@ -247,6 +281,42 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
         Self::decode_region(region, self.enable_codec)
     }
 
+    fn lock_resolver_state(&self) -> Option<&LockResolverState> {
+        Some(&self.lock_resolver)
+    }
+
+    fn low_resolution_ts(&self) -> Option<&LowResolutionTs> {
+        Some(&self.low_resolution_ts)
+    }
+
+    fn store_liveness(&self) -> Option<&StoreLiveness> {
+        Some(self.store_liveness.get_or_init(|| {
+            // The probe resolves the store's current address through the store cache
+            // (reloading it from PD after an invalidation, client-go's `reResolve`) and asks
+            // the store itself.
+            let region_cache = self.region_cache.clone();
+            let kv_connect = self.kv_connect.clone();
+            StoreLiveness::new(Arc::new(move |store_id| {
+                let region_cache = region_cache.clone();
+                let kv_connect = kv_connect.clone();
+                async move {
+                    let store = match region_cache.get_store_by_id(store_id).await {
+                        Ok(store) => store,
+                        Err(e) => {
+                            info!("[health check] failed to resolve store {store_id}: {e:?}");
+                            return Some(Liveness::Unknown);
+                        }
+                    };
+                    if store.state == metapb::StoreState::Tombstone as i32 {
+                        return None;
+                    }
+                    Some(kv_connect.check_liveness(&store.address).await)
+                }
+                .boxed()
+            }))
+        }))
+    }
+
     async fn all_stores(&self) -> Result<Vec<Store>> {
         let pb_stores = self.region_cache.read_through_all_stores().await?;
         let mut stores = Vec::with_capacity(pb_stores.len());
@@ -258,7 +328,10 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
     }
 
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp> {
-        self.pd.clone().get_timestamp().await
+        let ts = self.pd.clone().get_timestamp().await?;
+        // client-go `GetTimestamp` → `setLastTS` (oracle/oracles/pd.go:220).
+        self.low_resolution_ts.set_last_ts(&ts);
+        Ok(ts)
     }
 
     async fn update_safepoint(self: Arc<Self>, safepoint: u64) -> Result<bool> {
@@ -299,6 +372,7 @@ impl PdRpcClient<TikvConnect, Cluster> {
                     config.timeout,
                     config.grpc_max_decoding_message_size,
                 )
+                .with_connection_count(config.grpc_connection_count)
             },
             |security_mgr| RetryClient::connect(pd_endpoints, security_mgr, config.timeout),
             enable_codec,
@@ -334,9 +408,12 @@ impl<KvC: KvConnect + Send + Sync + 'static, Cl> PdRpcClient<KvC, Cl> {
         Ok(PdRpcClient {
             pd: pd.clone(),
             kv_client_cache,
-            kv_connect: kv_connect(security_mgr),
+            kv_connect: Arc::new(kv_connect(security_mgr)),
             enable_codec,
-            region_cache: RegionCache::new(pd),
+            region_cache: Arc::new(RegionCache::new(pd)),
+            store_liveness: OnceLock::new(),
+            lock_resolver: LockResolverState::default(),
+            low_resolution_ts: LowResolutionTs::default(),
         })
     }
 

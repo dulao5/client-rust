@@ -2,10 +2,12 @@
 
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::plan::PreserveShard;
 use super::Keyspace;
 use crate::backoff::Backoff;
+use crate::backoff::DEFAULT_REGION_BACKOFF;
 use crate::pd::PdClient;
 use crate::request::plan::{CleanupLocks, RetryableAllStores};
 use crate::request::shard::HasNextBatch;
@@ -27,6 +29,7 @@ use crate::store::HasRegionError;
 use crate::store::HasRegionErrors;
 use crate::store::RegionStore;
 use crate::transaction::HasLocks;
+use crate::transaction::ReadLockHints;
 use crate::transaction::ResolveLocksContext;
 use crate::transaction::ResolveLocksOptions;
 use crate::Result;
@@ -55,9 +58,29 @@ impl<PdC: PdClient, Req: KvRequest> PlanBuilder<PdC, Dispatch<Req>, NoTarget> {
             plan: Dispatch {
                 request,
                 kv_client: None,
+                lock_hints: None,
+                read_timeout: None,
             },
             phantom: PhantomData,
         }
+    }
+
+    /// Send the current contents of `hints` with every dispatch of this request, retries
+    /// included (client-go `ClientHelper.SendReqCtx`). Pair it with
+    /// [`resolve_lock_for_read`](PlanBuilder::resolve_lock_for_read) on the same hints.
+    pub fn read_lock_hints(mut self, hints: ReadLockHints) -> Self {
+        self.plan.lock_hints = Some(hints);
+        self
+    }
+
+    /// Send the first attempt with `timeout` as its deadline (TiDB's
+    /// `tikv_client_read_timeout`; see [`ReadTimeout`](crate::request::plan::ReadTimeout)):
+    /// the first attempt of the read, or with `per_region` the first one to each region.
+    /// `None` keeps the default timeout.
+    pub fn read_timeout(mut self, timeout: Option<Duration>, per_region: bool) -> Self {
+        self.plan.read_timeout =
+            timeout.map(|t| crate::request::plan::ReadTimeout::new(t, per_region));
+        self
     }
 }
 
@@ -86,11 +109,36 @@ impl<PdC: PdClient, P: Plan, Ph: PlanBuilderPhase> PlanBuilder<PdC, P, Ph> {
                 inner: self.plan,
                 timestamp,
                 backoff,
+                region_backoff: DEFAULT_REGION_BACKOFF,
                 pd_client: self.pd_client,
                 keyspace,
+                read_hints: None,
+                lite: false,
             },
             phantom: PhantomData,
         }
+    }
+
+    /// [`resolve_lock`](PlanBuilder::resolve_lock) for a read (client-go `ForRead`): the
+    /// transactions whose locks the read may ignore or read through are added to `hints`,
+    /// which the request (built with [`read_lock_hints`](PlanBuilder::read_lock_hints) on the
+    /// same hints) sends on its retry. `lite`: resolve only the encountered keys of small
+    /// transactions' locks (client-go `ResolveLocksOptions.Lite`; a snapshot's point get).
+    pub fn resolve_lock_for_read(
+        self,
+        timestamp: Timestamp,
+        backoff: Backoff,
+        keyspace: Keyspace,
+        hints: ReadLockHints,
+        lite: bool,
+    ) -> PlanBuilder<PdC, ResolveLock<P, PdC>, Ph>
+    where
+        P::Result: HasLocks,
+    {
+        let mut builder = self.resolve_lock(timestamp, backoff, keyspace);
+        builder.plan.read_hints = Some(hints);
+        builder.plan.lite = lite;
+        builder
     }
 
     pub fn cleanup_locks(
@@ -245,6 +293,22 @@ where
             },
             phantom: PhantomData,
         }
+    }
+}
+
+impl<PdC: PdClient, P: Plan, Ph: PlanBuilderPhase> PlanBuilder<PdC, ResolveLock<P, PdC>, Ph>
+where
+    P::Result: HasLocks,
+{
+    /// Retry the lock resolution's own requests on region errors with `backoff` instead of
+    /// [`DEFAULT_REGION_BACKOFF`]. A read passes its `RetryOptions::region_backoff`: client-go
+    /// resolves with the read's own `Backoffer` (`ResolveLocks(bo, ..)`), so a lock met while
+    /// a TiKV is down does not fail the read after a fixed ~1.5 s (tidb-rs
+    /// `client-go-parity.md` P0-1).
+    #[must_use]
+    pub fn lock_region_backoff(mut self, backoff: Backoff) -> Self {
+        self.plan.region_backoff = backoff;
+        self
     }
 }
 

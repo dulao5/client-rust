@@ -26,10 +26,18 @@ pub struct Config {
     pub timeout: Duration,
     pub grpc_max_decoding_message_size: usize,
     pub keyspace: Option<String>,
+    /// Number of gRPC connections opened to each TiKV store; requests are spread over them
+    /// round-robin (client-go's `grpc-connection-count`, default 4 there).
+    pub grpc_connection_count: usize,
 }
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-const DEFAULT_GRPC_MAX_DECODING_MESSAGE_SIZE: usize = 4 * 1024 * 1024; // 4MB
+/// No receive limit, as in client-go (`MaxRecvMsgSize = math.MaxInt64 - 1`,
+/// `internal/client/client.go:82`, applied per call at `:318`). tonic's own default is 4 MiB,
+/// which fails coprocessor responses over wide rows and large BatchGets
+/// (`specs/D07.1-store/client-go-parity.md` P0-3 in tidb-rs).
+const DEFAULT_GRPC_MAX_DECODING_MESSAGE_SIZE: usize = usize::MAX;
+const DEFAULT_GRPC_CONNECTION_COUNT: usize = 1;
 
 impl Default for Config {
     fn default() -> Self {
@@ -40,6 +48,7 @@ impl Default for Config {
             timeout: DEFAULT_REQUEST_TIMEOUT,
             grpc_max_decoding_message_size: DEFAULT_GRPC_MAX_DECODING_MESSAGE_SIZE,
             keyspace: None,
+            grpc_connection_count: DEFAULT_GRPC_CONNECTION_COUNT,
         }
     }
 }
@@ -74,11 +83,12 @@ impl Config {
         self
     }
 
-    /// Set the timeout for clients.
+    /// Set the timeout for connecting to TiKV and PD, and for PD requests.
     ///
-    /// The timeout is used for all requests when using or connecting to a TiKV cluster (including
-    /// PD nodes). If the request does not complete within timeout, the request is cancelled and
-    /// an error returned to the user.
+    /// TiKV requests do not use it: like client-go, each has its own RPC timeout, 30 s
+    /// (`ReadTimeoutShort`) or 60 s for BatchGet / Scan / DeleteRange (`ReadTimeoutMedium`)
+    /// and coprocessor requests, unless the request carries its own deadline
+    /// (`TransactionOptions::read_timeout`, TiDB's `tikv_client_read_timeout`).
     ///
     /// The default timeout is two seconds.
     ///
@@ -94,7 +104,8 @@ impl Config {
         self
     }
 
-    /// Set the maximum decoding message size for gRPC.
+    /// Set the maximum size of a gRPC message received from TiKV or PD.
+    /// Default: no limit (`usize::MAX`), as in client-go.
     #[must_use]
     pub fn with_grpc_max_decoding_message_size(mut self, size: usize) -> Self {
         self.grpc_max_decoding_message_size = size;
@@ -104,6 +115,15 @@ impl Config {
     /// Set to use default keyspace.
     ///
     /// Server should enable `storage.api-version = 2` to use this feature.
+    /// Open `count` gRPC connections to each TiKV store (at least one). One HTTP/2 connection
+    /// serialises all its streams on one lock in the client and on one completion queue in
+    /// TiKV, which limits throughput under many concurrent requests.
+    #[must_use]
+    pub fn with_grpc_connection_count(mut self, count: usize) -> Self {
+        self.grpc_connection_count = count.max(1);
+        self
+    }
+
     #[must_use]
     pub fn with_default_keyspace(self) -> Self {
         self.with_keyspace("DEFAULT")
