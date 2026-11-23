@@ -135,6 +135,95 @@ mod test {
     use crate::Result;
 
     #[tokio::test]
+    async fn a_single_shard_runs_on_the_calling_task() {
+        #[derive(Debug, Clone)]
+        struct MockRpcResponse;
+
+        impl HasKeyErrors for MockRpcResponse {
+            fn key_errors(&mut self) -> Option<Vec<Error>> {
+                None
+            }
+        }
+
+        impl HasRegionError for MockRpcResponse {
+            fn region_error(&mut self) -> Option<crate::proto::errorpb::Error> {
+                None
+            }
+        }
+
+        impl HasLocks for MockRpcResponse {}
+
+        #[derive(Clone)]
+        struct MockKvRequest;
+
+        #[async_trait]
+        impl Request for MockKvRequest {
+            async fn dispatch(&self, _: &TikvClient<Channel>, _: Duration) -> Result<Box<dyn Any>> {
+                Ok(Box::new(MockRpcResponse {}))
+            }
+
+            fn label(&self) -> &'static str {
+                "mock"
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            fn set_leader(&mut self, _: &RegionWithLeader) -> Result<()> {
+                Ok(())
+            }
+
+            fn set_api_version(&mut self, _: kvrpcpb::ApiVersion) {}
+        }
+
+        #[async_trait]
+        impl KvRequest for MockKvRequest {
+            type Response = MockRpcResponse;
+        }
+
+        impl Shardable for MockKvRequest {
+            type Shard = Vec<Vec<u8>>;
+
+            fn shards(
+                &self,
+                pd_client: &std::sync::Arc<impl crate::pd::PdClient>,
+            ) -> futures::stream::BoxStream<
+                'static,
+                crate::Result<(Self::Shard, crate::region::RegionWithLeader)>,
+            > {
+                region_stream_for_keys(
+                    Some(Key::from("mock_key".to_owned())).into_iter(),
+                    pd_client.clone(),
+                )
+            }
+
+            fn apply_shard(&mut self, _shard: Self::Shard) {}
+
+            fn apply_store(&mut self, _store: &crate::store::RegionStore) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        // The test body is not a spawned task (`block_on`): a dispatch on a spawned task
+        // sees a task id.
+        let spawned = Arc::new(AtomicBool::new(true));
+        let seen = spawned.clone();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |_: &dyn Any| {
+                seen.store(tokio::task::try_id().is_some(), Ordering::SeqCst);
+                Ok(Box::new(MockRpcResponse) as Box<dyn Any>)
+            },
+        )));
+        let plan = crate::request::PlanBuilder::new(pd_client, Keyspace::Disable, MockKvRequest)
+            .retry_multi_region(Backoff::no_jitter_backoff(1, 1, 3))
+            .extract_error()
+            .plan();
+        assert_eq!(plan.execute().await.unwrap().len(), 1);
+        assert!(!spawned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn test_region_retry() {
         #[derive(Debug, Clone)]
         struct MockRpcResponse;

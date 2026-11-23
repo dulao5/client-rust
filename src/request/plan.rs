@@ -599,6 +599,27 @@ where
             .await;
         let shards_len = shards.len();
         debug!("single_plan_handler, shards: {}", shards_len);
+        // One shard (a point get, a batch within one region): run it on this task. Spawning
+        // it costs a task, a join set and two cross-thread wake-ups per request, which is a
+        // visible share of a point get's latency; with one shard nothing runs in parallel.
+        // client-go sends a single-region request from the calling goroutine too.
+        if shards_len == 1 {
+            let (shard, region) = shards.into_iter().next().expect("one shard")?;
+            let mut plan = current_plan.clone_then_apply_shard(shard);
+            // A single region keeps the budget itself (see below).
+            if backoff.is_time_budget() {
+                plan.use_budget(&backoff);
+            }
+            let result = Self::single_shard_handler(
+                context.clone(),
+                plan,
+                region,
+                backoff,
+                CandidateState::default(),
+            )
+            .await;
+            return Self::merge_shard_results(&context, vec![result]);
+        }
         let mut join_set = JoinSet::new();
         for (idx, shard) in shards.into_iter().enumerate() {
             let (shard, region) = match shard {
@@ -638,7 +659,14 @@ where
         }
 
         let results = collect_join_set_results(join_set, shards_len, "single_plan_handler").await?;
+        Self::merge_shard_results(&context, results)
+    }
 
+    /// The result of a plan from the results of its shards, in shard order.
+    fn merge_shard_results(
+        context: &RetryContext<PdC>,
+        results: Vec<Result<<Self as Plan>::Result>>,
+    ) -> Result<<Self as Plan>::Result> {
         if context.preserve_region_results {
             Ok(results
                 .into_iter()
