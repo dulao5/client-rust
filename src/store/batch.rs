@@ -23,6 +23,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -522,7 +523,7 @@ impl SendLoop {
             if c.available() > 0 {
                 // client-go `tryLockForSend`: wait for the lock, fail if the stream is being
                 // recreated.
-                let state = c.state.lock().unwrap();
+                let state = c.state.lock().unwrap_or_else(PoisonError::into_inner);
                 if !state.recreating {
                     chosen = Some((c, state));
                     break;
@@ -554,7 +555,7 @@ impl SendLoop {
             client_send_time_ns: 0,
         };
         {
-            let mut batched = cli.batched.lock().unwrap();
+            let mut batched = cli.batched.lock().unwrap_or_else(PoisonError::into_inner);
             self.builder.build_with_limit(available, |id, entry| {
                 req.request_ids.push(id);
                 req.requests.push(batch_commands_request::Request {
@@ -574,7 +575,9 @@ impl SendLoop {
 }
 
 /// Fails the requests still waiting on a connection when its receive loop ends, also by a
-/// panic.
+/// panic. The loops' locks ignore poisoning (the maps and the stream state hold only
+/// senders and flags, valid after a panic elsewhere): a second panic here, while unwinding,
+/// would abort the process.
 struct PendingGuard<'a>(&'a BatchCommandsClient);
 
 impl Drop for PendingGuard<'_> {
@@ -685,7 +688,12 @@ impl BatchCommandsClient {
 
     /// client-go `failPendingRequests` (client_batch.go:924-934).
     fn fail_pending_requests(&self, err: &Status) {
-        let pending: Vec<_> = self.batched.lock().unwrap().drain().collect();
+        let pending: Vec<_> = self
+            .batched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .collect();
         self.sent.fetch_sub(pending.len() as i64, Ordering::Relaxed);
         for (_, res) in pending {
             let _ = res.send(Err(err.clone()));
@@ -694,7 +702,7 @@ impl BatchCommandsClient {
 
     /// client-go `failRequestsByIDs` (client_batch.go:950-958).
     fn fail_requests_by_ids(&self, err: &Status, ids: &[u64]) {
-        let mut batched = self.batched.lock().unwrap();
+        let mut batched = self.batched.lock().unwrap_or_else(PoisonError::into_inner);
         for id in ids {
             if let Some(res) = batched.remove(id) {
                 self.sent.fetch_sub(1, Ordering::Relaxed);
@@ -713,7 +721,7 @@ impl BatchCommandsClient {
         } = resp;
         let mut done = Vec::with_capacity(request_ids.len());
         {
-            let mut batched = self.batched.lock().unwrap();
+            let mut batched = self.batched.lock().unwrap_or_else(PoisonError::into_inner);
             for (id, resp) in request_ids.into_iter().zip(responses) {
                 match batched.remove(&id) {
                     Some(res) => done.push((res, resp)),
@@ -807,7 +815,7 @@ impl BatchCommandsClient {
             );
             let unavailable_since = Instant::now();
             {
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
                 state.recreating = true;
                 state.stream = None;
             }
@@ -832,7 +840,7 @@ impl BatchCommandsClient {
             let (tx, new_rx) = stream_mpsc::unbounded();
             rx = Some(new_rx);
             {
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
                 state.stream = Some(tx);
                 state.recreating = false;
             }
@@ -1369,5 +1377,54 @@ mod tests {
         let err = rx.await.unwrap().unwrap_err();
         assert_eq!(err.code(), Code::Unavailable);
         assert_eq!(client.sent.load(Ordering::Relaxed), 0);
+    }
+    /// A lock poisoned by a panic elsewhere (here: a thread that panics while holding the
+    /// `batched` map) neither makes the guard panic again while unwinding, which would abort
+    /// the process, nor strands the waiting requests.
+    #[tokio::test]
+    async fn a_poisoned_lock_does_not_abort_and_waiting_requests_still_fail() {
+        let (_closed_tx, closed) = watch::channel(());
+        let client = Arc::new(BatchCommandsClient {
+            target: "nowhere".to_owned(),
+            grpc: TikvClient::new(Channel::from_static("http://127.0.0.1:1").connect_lazy()),
+            state: Mutex::new(StreamState::default()),
+            batched: Mutex::new(HashMap::new()),
+            sent: AtomicI64::new(1),
+            limit: i64::MAX,
+            tikv_load: Arc::new(AtomicU64::new(0)),
+            track_load: false,
+            closed,
+        });
+        let (res, rx) = oneshot::channel();
+        client.batched.lock().unwrap().insert(7, res);
+        // Poison both locks.
+        for poison in [0, 1] {
+            let c = client.clone();
+            let _ = std::thread::spawn(move || {
+                let _held = (poison == 0).then(|| c.batched.lock().unwrap());
+                let _state = (poison == 1).then(|| c.state.lock().unwrap());
+                panic!("panic while holding the lock");
+            })
+            .join();
+        }
+        assert!(client.batched.is_poisoned() && client.state.is_poisoned());
+        // The guard drops while unwinding from another panic: no double panic.
+        let unwinding = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = PendingGuard(&client);
+            panic!("in the receive loop");
+        }));
+        assert!(unwinding.is_err());
+        let err = rx.await.unwrap().unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+        // The loops' other uses of the locks keep working too.
+        client.fail_requests_by_ids(&Status::unavailable("x"), &[1, 2]);
+        client.on_response(BatchCommandsResponse::default());
+        assert!(
+            !client
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .recreating
+        );
     }
 }
