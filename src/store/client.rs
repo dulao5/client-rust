@@ -18,6 +18,7 @@ use super::liveness::Liveness;
 use super::BatchConfig;
 use super::BatchConn;
 use super::Request;
+use crate::proto::metapb;
 use crate::proto::tikvpb::tikv_client::TikvClient;
 use crate::Result;
 use crate::SecurityManager;
@@ -28,6 +29,13 @@ pub trait KvConnect: Sized + Send + Sync + 'static {
     type KvClient: KvClient + Clone + Send + Sync + 'static;
 
     async fn connect(&self, address: &str) -> Result<Self::KvClient>;
+
+    /// Connect to a store of the given engine. client-go batches requests only to TiKV
+    /// stores (`RPCClient.sendRequest`, internal/client/client.go:586-589); the default
+    /// ignores the engine.
+    async fn connect_store(&self, address: &str, _store_type: StoreType) -> Result<Self::KvClient> {
+        self.connect(address).await
+    }
 
     /// Ask the store at `address` whether it is alive, after a connection-level failure
     /// (client-go `invokeKVStatusAPI`). The caller bounds the call with
@@ -66,11 +74,39 @@ impl TikvConnect {
     }
 }
 
+/// The engine of a store (client-go `tikvrpc.EndpointType`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreType {
+    TiKV,
+    TiFlash,
+    TiFlashCompute,
+}
+
+impl StoreType {
+    /// client-go `tikvrpc.GetStoreTypeByMeta` (tikvrpc/endpoint.go:81-91): by the store's
+    /// `engine` label.
+    pub fn of_store(store: &metapb::Store) -> StoreType {
+        for label in &store.labels {
+            if label.key == "engine" && label.value == "tiflash" {
+                return StoreType::TiFlash;
+            }
+            if label.key == "engine" && label.value == "tiflash_compute" {
+                return StoreType::TiFlashCompute;
+            }
+        }
+        StoreType::TiKV
+    }
+}
+
 #[async_trait]
 impl KvConnect for TikvConnect {
     type KvClient = KvRpcClient;
 
     async fn connect(&self, address: &str) -> Result<KvRpcClient> {
+        self.connect_store(address, StoreType::TiKV).await
+    }
+
+    async fn connect_store(&self, address: &str, store_type: StoreType) -> Result<KvRpcClient> {
         let mut clients = Vec::with_capacity(self.connection_count);
         for _ in 0..self.connection_count.max(1) {
             let client = self
@@ -85,8 +121,9 @@ impl KvConnect for TikvConnect {
         }
         let mut client = KvRpcClient::with_clients(clients);
         // client-go `connArray.Init` (internal/client/client.go:309-311, :386-388): the batch
-        // client runs over the same connections when `max-batch-size > 0`.
-        if self.batch.max_batch_size > 0 {
+        // client runs over the same connections when `max-batch-size > 0`, for TiKV stores
+        // only (`enableBatch := req.StoreTp == tikvrpc.TiKV`, :588).
+        if self.batch.max_batch_size > 0 && store_type == StoreType::TiKV {
             client.batch = Some(Arc::new(BatchConn::start(
                 address,
                 &client.rpc_clients,

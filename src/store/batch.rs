@@ -910,6 +910,7 @@ mod tests {
     use crate::store::KvClient;
     use crate::store::KvConnect;
     use crate::store::Request;
+    use crate::store::StoreType;
     use crate::store::TikvConnect;
     use crate::Error;
     use crate::SecurityManager;
@@ -1238,5 +1239,37 @@ mod tests {
             32 * 200
         );
         assert!(fake.streams.load(Ordering::SeqCst) <= 4);
+    }
+    /// A TiFlash store never gets a batch client (client-go enables batching only for TiKV,
+    /// internal/client/client.go:586-589): a coprocessor request to it is a unary RPC.
+    #[tokio::test]
+    async fn tiflash_stores_are_not_batched() {
+        let fake = FakeTikv::default();
+        let addr = start_fake(fake.clone()).await;
+        for store_type in [StoreType::TiFlash, StoreType::TiFlashCompute] {
+            let client = TikvConnect::new(
+                Arc::new(SecurityManager::default()),
+                Duration::from_secs(10),
+                usize::MAX,
+            )
+            .connect_store(&addr, store_type)
+            .await
+            .unwrap();
+            assert!(client.batch.is_none());
+            let cop = crate::transaction::coprocessor::CoprocessorRpc {
+                inner: Default::default(),
+                timeout: Duration::from_secs(1),
+            };
+            let err = client.dispatch(&cop).await.unwrap_err();
+            assert_eq!(grpc_code(&err), Code::Unimplemented);
+        }
+        assert_eq!(
+            fake.paths.lock().unwrap().clone(),
+            ["/tikvpb.Tikv/Coprocessor", "/tikvpb.Tikv/Coprocessor"]
+        );
+        assert_eq!(fake.streams.load(Ordering::SeqCst), 0);
+        // The same request to a TiKV store goes through the stream.
+        let client = connect(&addr, usize::MAX).await;
+        assert!(client.batch.is_some());
     }
 }

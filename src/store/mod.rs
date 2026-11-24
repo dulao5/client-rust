@@ -20,6 +20,7 @@ pub use self::batch::BatchConn;
 pub use self::batch::BatchRespCmd;
 pub use self::client::KvClient;
 pub use self::client::KvConnect;
+pub use self::client::StoreType;
 pub use self::client::TikvConnect;
 pub use self::errors::HasKeyErrors;
 pub use self::errors::HasRegionError;
