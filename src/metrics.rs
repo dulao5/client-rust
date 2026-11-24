@@ -233,6 +233,132 @@ pub(crate) fn rpc(cmd: CmdType, store_id: u64, elapsed: Duration, tikv_wall_ns: 
 }
 
 // ---------------------------------------------------------------------------------------------
+// The batch client (client-go metrics/metrics.go `TiKVBatch*`).
+
+static BATCH_PENDING_REQUESTS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    histogram_vec(
+        "tidb",
+        "tikvclient",
+        "batch_pending_requests",
+        "number of requests pending in the batch channel",
+        (1.0, 2.0, 11),
+        &["store"],
+    )
+});
+
+static BATCH_REQUESTS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    histogram_vec(
+        "tidb",
+        "tikvclient",
+        "batch_requests",
+        "number of requests in one batch",
+        (1.0, 2.0, 11),
+        &["store"],
+    )
+});
+
+static BATCH_WAIT_OVERLOAD: LazyLock<IntCounter> = LazyLock::new(|| {
+    let c = IntCounter::with_opts(
+        Opts::new(
+            "batch_wait_overload",
+            "event of tikv transport layer overload",
+        )
+        .namespace("tidb")
+        .subsystem("tikvclient"),
+    )
+    .expect("valid metric");
+    let _ = prometheus::register(Box::new(c.clone()));
+    c
+});
+
+static BATCH_NO_AVAILABLE_CONNECTION: LazyLock<IntCounter> = LazyLock::new(|| {
+    let c = IntCounter::with_opts(
+        Opts::new(
+            "batch_client_no_available_connection_total",
+            "Counter of no available batch client.",
+        )
+        .namespace("tidb")
+        .subsystem("tikvclient"),
+    )
+    .expect("valid metric");
+    let _ = prometheus::register(Box::new(c.clone()));
+    c
+});
+
+static BATCH_CLIENT_UNAVAILABLE: LazyLock<Histogram> = LazyLock::new(|| {
+    let h = Histogram::with_opts(
+        HistogramOpts::new(
+            "batch_client_unavailable_seconds",
+            "batch client unavailable",
+        )
+        .namespace("tidb")
+        .subsystem("tikvclient")
+        .buckets(exponential_buckets(0.001, 2.0, 28).expect("buckets")),
+    )
+    .expect("valid metric");
+    let _ = prometheus::register(Box::new(h.clone()));
+    h
+});
+
+/// The batch metrics of one store address (client-go `batchConnMetrics`, labelled with the
+/// target address).
+pub(crate) struct BatchMetrics {
+    pending_requests: Option<Histogram>,
+    batch_size: Option<Histogram>,
+}
+
+impl BatchMetrics {
+    pub(crate) fn new(target: &str) -> BatchMetrics {
+        if !ENABLED {
+            return BatchMetrics {
+                pending_requests: None,
+                batch_size: None,
+            };
+        }
+        BatchMetrics {
+            pending_requests: Some(BATCH_PENDING_REQUESTS.with_label_values(&[target])),
+            batch_size: Some(BATCH_REQUESTS.with_label_values(&[target])),
+        }
+    }
+
+    /// Requests queued plus collected when a batch is sent (`batch_pending_requests`).
+    pub(crate) fn pending(&self, n: usize) {
+        if let Some(h) = &self.pending_requests {
+            h.observe(n as f64);
+        }
+    }
+
+    /// Requests in one sent batch (`batch_requests`).
+    pub(crate) fn batch_size(&self, n: usize) {
+        if let Some(h) = &self.batch_size {
+            h.observe(n as f64);
+        }
+    }
+
+    /// The send loop waited because TiKV reported overload (`batch_wait_overload`).
+    pub(crate) fn wait_overload(&self) {
+        if ENABLED {
+            BATCH_WAIT_OVERLOAD.inc();
+        }
+    }
+}
+
+/// No connection of a store could take a batch (`batch_client_no_available_connection_total`).
+pub(crate) fn batch_no_available_connection() {
+    if ENABLED {
+        BATCH_NO_AVAILABLE_CONNECTION.inc();
+    }
+}
+
+/// A connection's stream was unusable for `d` before being recreated
+/// (`batch_client_unavailable_seconds`).
+pub(crate) fn batch_client_unavailable(d: Duration) {
+    if ENABLED {
+        BATCH_CLIENT_UNAVAILABLE.observe(d.as_secs_f64());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Region errors.
 
 static REGION_ERR: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -686,6 +812,11 @@ pub fn register() {
     LazyLock::force(&REQUEST_SECONDS);
     LazyLock::force(&RPC_NET_LATENCY);
     LazyLock::force(&REGION_ERR);
+    LazyLock::force(&BATCH_PENDING_REQUESTS);
+    LazyLock::force(&BATCH_REQUESTS);
+    LazyLock::force(&BATCH_WAIT_OVERLOAD);
+    LazyLock::force(&BATCH_NO_AVAILABLE_CONNECTION);
+    LazyLock::force(&BATCH_CLIENT_UNAVAILABLE);
     LazyLock::force(&BACKOFF_CHILDREN);
     for op in [
         RegionCacheOp::GetRegionWhenMiss,

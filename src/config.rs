@@ -6,6 +6,8 @@ use std::time::Duration;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
 
+use crate::store::BatchConfig;
+
 /// The configuration for either a [`RawClient`](crate::RawClient) or a
 /// [`TransactionClient`](crate::TransactionClient).
 ///
@@ -29,6 +31,11 @@ pub struct Config {
     /// Number of gRPC connections opened to each TiKV store; requests are spread over them
     /// round-robin (client-go's `grpc-connection-count`, default 4 there).
     pub grpc_connection_count: usize,
+    /// How TiKV requests are batched over `BatchCommands` streams (client-go's
+    /// `max-batch-size`, `batch-policy`, `max-batch-wait-time`, `batch-wait-size`,
+    /// `overload-threshold`, `max-concurrency-request-limit`, with client-go's defaults:
+    /// batching on, up to 128 requests per batch).
+    pub batch: BatchConfig,
 }
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -49,6 +56,7 @@ impl Default for Config {
             grpc_max_decoding_message_size: DEFAULT_GRPC_MAX_DECODING_MESSAGE_SIZE,
             keyspace: None,
             grpc_connection_count: DEFAULT_GRPC_CONNECTION_COUNT,
+            batch: BatchConfig::default(),
         }
     }
 }
@@ -121,6 +129,14 @@ impl Config {
     #[must_use]
     pub fn with_grpc_connection_count(mut self, count: usize) -> Self {
         self.grpc_connection_count = count.max(1);
+        self
+    }
+
+    /// Set how TiKV requests are batched (see [`BatchConfig`]); `max_batch_size = 0` sends
+    /// every request as a unary RPC.
+    #[must_use]
+    pub fn with_batch(mut self, batch: BatchConfig) -> Self {
+        self.batch = batch;
         self
     }
 

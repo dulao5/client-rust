@@ -19,6 +19,8 @@ use crate::proto::coprocessor;
 use crate::proto::kvrpcpb;
 use crate::proto::tikvpb::tikv_client::TikvClient;
 use crate::region::RegionWithLeader;
+use crate::store::BatchCmd;
+use crate::store::BatchRespCmd;
 use crate::store::Request;
 use crate::Error;
 use crate::Result;
@@ -50,13 +52,7 @@ impl Request for CoprocessorRpc {
         // TiKV gives up at the RPC timeout too (client-go `SendReqCtx`,
         // internal/locate/region_request.go:1393-1397), unless the request has a deadline.
         let mut inner = self.inner.clone();
-        let ctx = inner.context.get_or_insert_with(Default::default);
-        let timeout = if ctx.max_execution_duration_ms > 0 {
-            Duration::from_millis(ctx.max_execution_duration_ms)
-        } else {
-            ctx.max_execution_duration_ms = self.timeout.as_millis() as u64;
-            self.timeout
-        };
+        let timeout = crate::store::with_deadline(&mut inner.context, self.timeout);
         let mut req = inner.into_request();
         req.set_timeout(timeout);
         let start = std::time::Instant::now();
@@ -112,5 +108,36 @@ impl Request for CoprocessorRpc {
             .get_or_insert(kvrpcpb::Context::default());
         ctx.resolved_locks = resolved;
         ctx.committed_locks = committed;
+    }
+
+    /// client-go sends coprocessor requests in batches too (`CmdCop`,
+    /// tikvrpc/tikvrpc.go:679-680).
+    fn batch_cmd(&self, _timeout: Duration) -> Option<(BatchCmd, Duration)> {
+        let mut inner = self.inner.clone();
+        let timeout = crate::store::with_deadline(&mut inner.context, self.timeout);
+        Some((BatchCmd::Coprocessor(inner), timeout))
+    }
+
+    fn batch_response(
+        &self,
+        result: std::result::Result<BatchRespCmd, tonic::Status>,
+        elapsed: Duration,
+    ) -> Result<Box<dyn std::any::Any>> {
+        let result = result.and_then(|cmd| match cmd {
+            BatchRespCmd::Coprocessor(resp) => Ok(resp),
+            _ => Err(tonic::Status::internal("mismatched batch response")),
+        });
+        let wall_ns = result.as_ref().map_or(0, |r| {
+            crate::store::exec_details_wall_time_ns(r.exec_details_v2.as_ref())
+        });
+        crate::metrics::rpc(
+            crate::metrics::CmdType::Cop,
+            crate::store::context_store_id(self.inner.context.as_ref()),
+            elapsed,
+            wall_ns,
+        );
+        result
+            .map(|r| Box::new(r) as Box<dyn std::any::Any>)
+            .map_err(Error::from)
     }
 }

@@ -9,6 +9,8 @@ use tonic::IntoRequest;
 
 use crate::proto::kvrpcpb;
 use crate::proto::tikvpb::tikv_client::TikvClient;
+use crate::store::batch::BatchCmd;
+use crate::store::batch::BatchRespCmd;
 use crate::store::RegionWithLeader;
 use crate::Error;
 use crate::Result;
@@ -55,6 +57,40 @@ pub trait Request: Any + Sync + Send + 'static {
     /// deadline TiKV gives up at. A request with a deadline is also sent with it as its RPC
     /// timeout. Requests without a `kvrpcpb::Context` ignore it.
     fn set_max_execution_duration(&mut self, _duration: Duration) {}
+    /// The request as a command of a `BatchCommands` stream, with its RPC timeout, or `None`
+    /// if client-go sends it as a unary RPC (client-go `tikvrpc.Request.ToBatchCommandsRequest`,
+    /// tikvrpc/tikvrpc.go:639-706). `timeout` is the default RPC timeout, as in
+    /// [`Request::dispatch`].
+    fn batch_cmd(&self, _timeout: Duration) -> Option<(BatchCmd, Duration)> {
+        None
+    }
+    /// The response of [`Request::batch_cmd`]'s command, recorded in the RPC metrics like a
+    /// unary response (client-go `tikvrpc.FromBatchCommandsResponse`).
+    fn batch_response(
+        &self,
+        result: std::result::Result<BatchRespCmd, tonic::Status>,
+        _elapsed: Duration,
+    ) -> Result<Box<dyn Any>> {
+        result?;
+        Err(Error::StringError(format!(
+            "{} is not sent in a batch",
+            self.label()
+        )))
+    }
+}
+
+/// client-go `SendReqCtx` (internal/locate/region_request.go:1393-1397): a request without a
+/// deadline gets the RPC timeout as its `MaxExecutionDurationMs`, so TiKV gives up on what
+/// the client no longer waits for; a request with one (`tikv_client_read_timeout`) is sent
+/// with it as its timeout.
+pub(crate) fn with_deadline(ctx: &mut Option<kvrpcpb::Context>, timeout: Duration) -> Duration {
+    let ctx = ctx.get_or_insert_with(Default::default);
+    if ctx.max_execution_duration_ms > 0 {
+        Duration::from_millis(ctx.max_execution_duration_ms)
+    } else {
+        ctx.max_execution_duration_ms = timeout.as_millis() as u64;
+        timeout
+    }
 }
 
 /// TiKV's own handling time of a request (ExecDetailsV2 `total_rpc_wall_time_ns`), which
@@ -132,6 +168,41 @@ pub(crate) fn context_store_id(ctx: Option<&kvrpcpb::Context>) -> u64 {
 
 macro_rules! impl_request {
     ($name: ident, $resp: ident, $fun: ident, $label: literal, $cmd: ident) => {
+        impl_request!(@impl $name, $resp, $fun, $label, $cmd, {});
+    };
+    ($name: ident, $resp: ident, $fun: ident, $label: literal, $cmd: ident, batch $batch: ident) => {
+        impl_request!(@impl $name, $resp, $fun, $label, $cmd, {
+            fn batch_cmd(&self, timeout: Duration) -> Option<(BatchCmd, Duration)> {
+                let mut request = self.clone();
+                let timeout = with_deadline(&mut request.context, timeout);
+                Some((BatchCmd::$batch(request), timeout))
+            }
+
+            fn batch_response(
+                &self,
+                result: std::result::Result<BatchRespCmd, tonic::Status>,
+                elapsed: Duration,
+            ) -> Result<Box<dyn Any>> {
+                let result = result.and_then(|cmd| match cmd {
+                    BatchRespCmd::$batch(resp) => Ok(resp),
+                    _ => Err(tonic::Status::internal("mismatched batch response")),
+                });
+                let wall_ns = result.as_ref().map_or(0, |r| {
+                    <kvrpcpb::$resp as TikvWallTime>::tikv_wall_time_ns(r)
+                });
+                crate::metrics::rpc(
+                    crate::metrics::CmdType::$cmd,
+                    context_store_id(self.context.as_ref()),
+                    elapsed,
+                    wall_ns,
+                );
+                result
+                    .map(|r| Box::new(r) as Box<dyn Any>)
+                    .map_err(Error::from)
+            }
+        });
+    };
+    (@impl $name: ident, $resp: ident, $fun: ident, $label: literal, $cmd: ident, { $($batch_fns: tt)* }) => {
         #[async_trait]
         impl Request for kvrpcpb::$name {
             async fn dispatch(
@@ -139,19 +210,8 @@ macro_rules! impl_request {
                 client: &TikvClient<Channel>,
                 timeout: Duration,
             ) -> Result<Box<dyn Any>> {
-                // client-go `SendReqCtx` (internal/locate/region_request.go:1393-1397): a
-                // request without a deadline gets the RPC timeout as its
-                // `MaxExecutionDurationMs`, so TiKV gives up on what the client no longer
-                // waits for; a request with one (`tikv_client_read_timeout`) is sent with it
-                // as its timeout.
                 let mut request = self.clone();
-                let ctx = request.context.get_or_insert_with(Default::default);
-                let timeout = if ctx.max_execution_duration_ms > 0 {
-                    Duration::from_millis(ctx.max_execution_duration_ms)
-                } else {
-                    ctx.max_execution_duration_ms = timeout.as_millis() as u64;
-                    timeout
-                };
+                let timeout = with_deadline(&mut request.context, timeout);
                 let mut req = request.into_request();
                 req.set_timeout(timeout);
                 let start = std::time::Instant::now();
@@ -204,18 +264,19 @@ macro_rules! impl_request {
                 let ctx = self.context.get_or_insert(kvrpcpb::Context::default());
                 ctx.max_execution_duration_ms = duration.as_millis() as u64;
             }
+
+            $($batch_fns)*
         }
     };
 }
 
-impl_request!(RawGetRequest, RawGetResponse, raw_get, "raw_get", RawGet);
+impl_request!(RawGetRequest, RawGetResponse, raw_get, "raw_get", RawGet, batch RawGet);
 impl_request!(
     RawBatchGetRequest,
     RawBatchGetResponse,
     raw_batch_get,
     "raw_batch_get",
-    RawBatchGet
-);
+    RawBatchGet, batch RawBatchGet);
 impl_request!(
     RawGetKeyTtlRequest,
     RawGetKeyTtlResponse,
@@ -223,35 +284,31 @@ impl_request!(
     "raw_get_key_ttl",
     RawGetKeyTtl
 );
-impl_request!(RawPutRequest, RawPutResponse, raw_put, "raw_put", RawPut);
+impl_request!(RawPutRequest, RawPutResponse, raw_put, "raw_put", RawPut, batch RawPut);
 impl_request!(
     RawBatchPutRequest,
     RawBatchPutResponse,
     raw_batch_put,
     "raw_batch_put",
-    RawBatchPut
-);
+    RawBatchPut, batch RawBatchPut);
 impl_request!(
     RawDeleteRequest,
     RawDeleteResponse,
     raw_delete,
     "raw_delete",
-    RawDelete
-);
+    RawDelete, batch RawDelete);
 impl_request!(
     RawBatchDeleteRequest,
     RawBatchDeleteResponse,
     raw_batch_delete,
     "raw_batch_delete",
-    RawBatchDelete
-);
+    RawBatchDelete, batch RawBatchDelete);
 impl_request!(
     RawScanRequest,
     RawScanResponse,
     raw_scan,
     "raw_scan",
-    RawScan
-);
+    RawScan, batch RawScan);
 impl_request!(
     RawBatchScanRequest,
     RawBatchScanResponse,
@@ -264,8 +321,7 @@ impl_request!(
     RawDeleteRangeResponse,
     raw_delete_range,
     "raw_delete_range",
-    RawDeleteRange
-);
+    RawDeleteRange, batch RawDeleteRange);
 impl_request!(
     RawCasRequest,
     RawCasResponse,
@@ -281,93 +337,81 @@ impl_request!(
     RawCoprocessor
 );
 
-impl_request!(GetRequest, GetResponse, kv_get, "kv_get", Get);
-impl_request!(ScanRequest, ScanResponse, kv_scan, "kv_scan", Scan);
+impl_request!(GetRequest, GetResponse, kv_get, "kv_get", Get, batch Get);
+impl_request!(ScanRequest, ScanResponse, kv_scan, "kv_scan", Scan, batch Scan);
 impl_request!(
     PrewriteRequest,
     PrewriteResponse,
     kv_prewrite,
     "kv_prewrite",
-    Prewrite
-);
+    Prewrite, batch Prewrite);
 impl_request!(
     CommitRequest,
     CommitResponse,
     kv_commit,
     "kv_commit",
-    Commit
-);
+    Commit, batch Commit);
 impl_request!(
     BatchGetRequest,
     BatchGetResponse,
     kv_batch_get,
     "kv_batch_get",
-    BatchGet
-);
+    BatchGet, batch BatchGet);
 impl_request!(
     BatchRollbackRequest,
     BatchRollbackResponse,
     kv_batch_rollback,
     "kv_batch_rollback",
-    BatchRollback
-);
+    BatchRollback, batch BatchRollback);
 impl_request!(
     PessimisticRollbackRequest,
     PessimisticRollbackResponse,
     kv_pessimistic_rollback,
     "kv_pessimistic_rollback",
-    PessimisticRollback
-);
+    PessimisticRollback, batch PessimisticRollback);
 impl_request!(
     ResolveLockRequest,
     ResolveLockResponse,
     kv_resolve_lock,
     "kv_resolve_lock",
-    ResolveLock
-);
+    ResolveLock, batch ResolveLock);
 impl_request!(
     ScanLockRequest,
     ScanLockResponse,
     kv_scan_lock,
     "kv_scan_lock",
-    ScanLock
-);
+    ScanLock, batch ScanLock);
 impl_request!(
     PessimisticLockRequest,
     PessimisticLockResponse,
     kv_pessimistic_lock,
     "kv_pessimistic_lock",
-    PessimisticLock
-);
+    PessimisticLock, batch PessimisticLock);
 impl_request!(
     TxnHeartBeatRequest,
     TxnHeartBeatResponse,
     kv_txn_heart_beat,
     "kv_txn_heart_beat",
-    TxnHeartBeat
-);
+    TxnHeartBeat, batch TxnHeartBeat);
 impl_request!(
     CheckTxnStatusRequest,
     CheckTxnStatusResponse,
     kv_check_txn_status,
     "kv_check_txn_status",
-    CheckTxnStatus
-);
+    CheckTxnStatus, batch CheckTxnStatus);
 impl_request!(
     CheckSecondaryLocksRequest,
     CheckSecondaryLocksResponse,
     kv_check_secondary_locks,
     "kv_check_secondary_locks_request",
-    CheckSecondaryLocks
-);
-impl_request!(GcRequest, GcResponse, kv_gc, "kv_gc", Gc);
+    CheckSecondaryLocks, batch CheckSecondaryLocks);
+impl_request!(GcRequest, GcResponse, kv_gc, "kv_gc", Gc, batch Gc);
 impl_request!(
     DeleteRangeRequest,
     DeleteRangeResponse,
     kv_delete_range,
     "kv_delete_range",
-    DeleteRange
-);
+    DeleteRange, batch DeleteRange);
 impl_request!(
     UnsafeDestroyRangeRequest,
     UnsafeDestroyRangeResponse,

@@ -373,6 +373,7 @@ impl PdRpcClient<TikvConnect, Cluster> {
                     config.grpc_max_decoding_message_size,
                 )
                 .with_connection_count(config.grpc_connection_count)
+                .with_batch_config(config.batch.clone())
             },
             |security_mgr| RetryClient::connect(pd_endpoints, security_mgr, config.timeout),
             enable_codec,
