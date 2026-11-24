@@ -1,5 +1,6 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
+mod batch;
 mod client;
 mod errors;
 pub(crate) mod liveness;
@@ -13,8 +14,13 @@ use derive_new::new;
 use futures::prelude::*;
 use futures::stream::BoxStream;
 
+pub use self::batch::BatchCmd;
+pub use self::batch::BatchConfig;
+pub use self::batch::BatchConn;
+pub use self::batch::BatchRespCmd;
 pub use self::client::KvClient;
 pub use self::client::KvConnect;
+pub use self::client::StoreType;
 pub use self::client::TikvConnect;
 pub use self::errors::HasKeyErrors;
 pub use self::errors::HasRegionError;
@@ -23,6 +29,7 @@ pub use self::liveness::Liveness;
 pub use self::liveness::StoreLiveness;
 pub(crate) use self::request::context_store_id;
 pub(crate) use self::request::exec_details_wall_time_ns;
+pub(crate) use self::request::with_deadline;
 pub use self::request::Request;
 pub(crate) use self::request::READ_TIMEOUT_SHORT;
 use crate::pd::PdClient;

@@ -28,6 +28,7 @@ use crate::store::KvConnect;
 use crate::store::Liveness;
 use crate::store::RegionStore;
 use crate::store::StoreLiveness;
+use crate::store::StoreType;
 use crate::store::TikvConnect;
 use crate::store::{KvClient, Store};
 use crate::transaction::LockResolverState;
@@ -260,7 +261,7 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
     async fn map_region_to_store(self: Arc<Self>, region: RegionWithLeader) -> Result<RegionStore> {
         let store_id = region.get_store_id()?;
         let store = self.region_cache.get_store_by_id(store_id).await?;
-        let kv_client = self.kv_client(&store.address).await?;
+        let kv_client = self.kv_client_for(&store).await?;
         Ok(RegionStore::new(region, Arc::new(kv_client)))
     }
 
@@ -321,7 +322,7 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
         let pb_stores = self.region_cache.read_through_all_stores().await?;
         let mut stores = Vec::with_capacity(pb_stores.len());
         for store in pb_stores {
-            let client = self.kv_client(&store.address).await?;
+            let client = self.kv_client_for(&store).await?;
             stores.push(Store::new(Arc::new(client)));
         }
         Ok(stores)
@@ -373,6 +374,7 @@ impl PdRpcClient<TikvConnect, Cluster> {
                     config.grpc_max_decoding_message_size,
                 )
                 .with_connection_count(config.grpc_connection_count)
+                .with_batch_config(config.batch.clone())
             },
             |security_mgr| RetryClient::connect(pd_endpoints, security_mgr, config.timeout),
             enable_codec,
@@ -417,12 +419,28 @@ impl<KvC: KvConnect + Send + Sync + 'static, Cl> PdRpcClient<KvC, Cl> {
         })
     }
 
+    async fn kv_client_for(&self, store: &metapb::Store) -> Result<KvC::KvClient> {
+        self.kv_client_of_type(&store.address, StoreType::of_store(store))
+            .await
+    }
+
+    #[cfg(test)]
     async fn kv_client(&self, address: &str) -> Result<KvC::KvClient> {
+        self.kv_client_of_type(address, StoreType::TiKV).await
+    }
+
+    /// The client of the store at `address`; a store address belongs to one engine, so the
+    /// cache is keyed by the address alone.
+    async fn kv_client_of_type(
+        &self,
+        address: &str,
+        store_type: StoreType,
+    ) -> Result<KvC::KvClient> {
         if let Some(cached) = self.kv_client_cache.read().await.get(address) {
             return Ok(cached.clone());
         }
         info!("connect to tikv endpoint: {:?}", address);
-        match self.kv_connect.connect(address).await {
+        match self.kv_connect.connect_store(address, store_type).await {
             Ok(client) => {
                 self.kv_client_cache
                     .write()
@@ -470,6 +488,86 @@ pub mod test {
         let kv3 = client.kv_client("bar").await.unwrap();
         assert!(kv1.addr != kv2.addr);
         assert_eq!(kv2.addr, kv3.addr);
+    }
+
+    /// The engine label of the store decides how its client is connected: client-go batches
+    /// only to TiKV stores.
+    #[tokio::test]
+    async fn kv_client_for_connects_by_store_engine() {
+        #[derive(Clone)]
+        struct TypedConnect {
+            seen: Arc<std::sync::Mutex<Vec<(String, StoreType)>>>,
+        }
+
+        #[async_trait]
+        impl KvConnect for TypedConnect {
+            type KvClient = MockKvClient;
+
+            async fn connect(&self, _address: &str) -> Result<Self::KvClient> {
+                unreachable!("connect_store is used")
+            }
+
+            async fn connect_store(
+                &self,
+                address: &str,
+                store_type: StoreType,
+            ) -> Result<Self::KvClient> {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((address.to_owned(), store_type));
+                Ok(MockKvClient::default())
+            }
+        }
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let client = PdRpcClient::new(
+            Config::default(),
+            move |_| TypedConnect {
+                seen: seen_clone.clone(),
+            },
+            |sm| async move {
+                Ok(RetryClient::new_with_cluster(
+                    sm,
+                    Config::default().timeout,
+                    MockCluster,
+                ))
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+        let label = |value: &str| metapb::StoreLabel {
+            key: "engine".to_owned(),
+            value: value.to_owned(),
+        };
+        let tikv = metapb::Store {
+            address: "kv".to_owned(),
+            ..Default::default()
+        };
+        let tiflash = metapb::Store {
+            address: "flash".to_owned(),
+            labels: vec![label("tiflash")],
+            ..Default::default()
+        };
+        let compute = metapb::Store {
+            address: "compute".to_owned(),
+            labels: vec![label("tiflash_compute")],
+            ..Default::default()
+        };
+        for store in [&tikv, &tiflash, &compute] {
+            client.kv_client_for(store).await.unwrap();
+        }
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            [
+                ("kv".to_owned(), StoreType::TiKV),
+                ("flash".to_owned(), StoreType::TiFlash),
+                ("compute".to_owned(), StoreType::TiFlashCompute),
+            ]
+        );
     }
 
     #[tokio::test]

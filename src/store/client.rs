@@ -15,7 +15,10 @@ use tonic::transport::Channel;
 
 use super::liveness;
 use super::liveness::Liveness;
+use super::BatchConfig;
+use super::BatchConn;
 use super::Request;
+use crate::proto::metapb;
 use crate::proto::tikvpb::tikv_client::TikvClient;
 use crate::Result;
 use crate::SecurityManager;
@@ -26,6 +29,13 @@ pub trait KvConnect: Sized + Send + Sync + 'static {
     type KvClient: KvClient + Clone + Send + Sync + 'static;
 
     async fn connect(&self, address: &str) -> Result<Self::KvClient>;
+
+    /// Connect to a store of the given engine. client-go batches requests only to TiKV
+    /// stores (`RPCClient.sendRequest`, internal/client/client.go:586-589); the default
+    /// ignores the engine.
+    async fn connect_store(&self, address: &str, _store_type: StoreType) -> Result<Self::KvClient> {
+        self.connect(address).await
+    }
 
     /// Ask the store at `address` whether it is alive, after a connection-level failure
     /// (client-go `invokeKVStatusAPI`). The caller bounds the call with
@@ -43,6 +53,8 @@ pub struct TikvConnect {
     grpc_max_decoding_message_size: usize,
     #[new(value = "1")]
     connection_count: usize,
+    #[new(default)]
+    batch: BatchConfig,
 }
 
 impl TikvConnect {
@@ -52,6 +64,38 @@ impl TikvConnect {
         self.connection_count = count.max(1);
         self
     }
+
+    /// Batch requests over `BatchCommands` streams as configured (client-go's
+    /// `max-batch-size` and related knobs; `max_batch_size == 0` sends unary RPCs only).
+    #[must_use]
+    pub fn with_batch_config(mut self, batch: BatchConfig) -> Self {
+        self.batch = batch;
+        self
+    }
+}
+
+/// The engine of a store (client-go `tikvrpc.EndpointType`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreType {
+    TiKV,
+    TiFlash,
+    TiFlashCompute,
+}
+
+impl StoreType {
+    /// client-go `tikvrpc.GetStoreTypeByMeta` (tikvrpc/endpoint.go:81-91): by the store's
+    /// `engine` label.
+    pub fn of_store(store: &metapb::Store) -> StoreType {
+        for label in &store.labels {
+            if label.key == "engine" && label.value == "tiflash" {
+                return StoreType::TiFlash;
+            }
+            if label.key == "engine" && label.value == "tiflash_compute" {
+                return StoreType::TiFlashCompute;
+            }
+        }
+        StoreType::TiKV
+    }
 }
 
 #[async_trait]
@@ -59,6 +103,10 @@ impl KvConnect for TikvConnect {
     type KvClient = KvRpcClient;
 
     async fn connect(&self, address: &str) -> Result<KvRpcClient> {
+        self.connect_store(address, StoreType::TiKV).await
+    }
+
+    async fn connect_store(&self, address: &str, store_type: StoreType) -> Result<KvRpcClient> {
         let mut clients = Vec::with_capacity(self.connection_count);
         for _ in 0..self.connection_count.max(1) {
             let client = self
@@ -71,7 +119,18 @@ impl KvConnect for TikvConnect {
                 .await?;
             clients.push(client);
         }
-        Ok(KvRpcClient::with_clients(clients))
+        let mut client = KvRpcClient::with_clients(clients);
+        // client-go `connArray.Init` (internal/client/client.go:309-311, :386-388): the batch
+        // client runs over the same connections when `max-batch-size > 0`, for TiKV stores
+        // only (`enableBatch := req.StoreTp == tikvrpc.TiKV`, :588).
+        if self.batch.max_batch_size > 0 && store_type == StoreType::TiKV {
+            client.batch = Some(Arc::new(BatchConn::start(
+                address,
+                &client.rpc_clients,
+                self.batch.clone(),
+            )));
+        }
+        Ok(client)
     }
 
     /// client-go `invokeKVStatusAPI` (internal/locate/store_cache.go): a new connection (not
@@ -126,13 +185,16 @@ pub trait KvClient {
 
 /// This client handles requests for a single TiKV node. It converts the data
 /// types and abstractions of the client program into the grpc data types.
-/// Requests are spread round-robin over one or more connections to the node. Each request is
-/// sent with client-go's RPC timeout for its kind ([`Request::default_timeout`]) or its own
-/// deadline.
+/// Like client-go (`RPCClient.sendRequest`, internal/client/client.go:619-627), a request that
+/// has a `BatchCommands` form ([`Request::batch_cmd`]) goes through the node's batch client
+/// when batching is on; any other is a unary RPC, spread round-robin over one or more
+/// connections to the node. Each request is sent with client-go's RPC timeout for its kind
+/// ([`Request::default_timeout`]) or its own deadline.
 #[derive(Clone)]
 pub struct KvRpcClient {
     rpc_clients: Arc<[TikvClient<Channel>]>,
     next: Arc<AtomicUsize>,
+    pub(super) batch: Option<Arc<BatchConn>>,
 }
 
 impl KvRpcClient {
@@ -146,6 +208,7 @@ impl KvRpcClient {
         KvRpcClient {
             rpc_clients: rpc_clients.into(),
             next: Arc::new(AtomicUsize::new(0)),
+            batch: None,
         }
     }
 
@@ -161,6 +224,13 @@ impl KvRpcClient {
 #[async_trait]
 impl KvClient for KvRpcClient {
     async fn dispatch(&self, request: &dyn Request) -> Result<Box<dyn Any>> {
+        if let Some(batch) = &self.batch {
+            if let Some((cmd, timeout)) = request.batch_cmd(request.default_timeout()) {
+                let start = std::time::Instant::now();
+                let result = batch.send(cmd, timeout).await;
+                return request.batch_response(result, start.elapsed());
+            }
+        }
         request
             .dispatch(self.pick(), request.default_timeout())
             .await
@@ -301,6 +371,14 @@ mod tests {
         }
     }
 
+    /// No batching: these tests check the unary RPC (the batch path is tested in `batch.rs`).
+    fn unary_only() -> BatchConfig {
+        BatchConfig {
+            max_batch_size: 0,
+            ..Default::default()
+        }
+    }
+
     /// Starts the fake TiKV and returns its address.
     async fn start_big_get_tikv(value_len: usize) -> String {
         start_tikv(value_len, Seen::default()).await
@@ -323,7 +401,8 @@ mod tests {
             Arc::new(SecurityManager::default()),
             Duration::from_secs(10),
             config.grpc_max_decoding_message_size,
-        );
+        )
+        .with_batch_config(unary_only());
         let client = connect.connect(addr).await?;
         let resp = client.dispatch(&kvrpcpb::GetRequest::default()).await?;
         Ok(*resp.downcast::<kvrpcpb::GetResponse>().unwrap())
@@ -376,7 +455,8 @@ mod tests {
             Arc::new(SecurityManager::default()),
             Duration::from_secs(2),
             usize::MAX,
-        );
+        )
+        .with_batch_config(unary_only());
         let client = connect.connect(&addr).await.unwrap();
         client
             .dispatch(&kvrpcpb::GetRequest::default())
