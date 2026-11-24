@@ -486,7 +486,7 @@ impl SendLoop {
                 break;
             }
             if precise {
-                tokio::task::yield_now().await;
+                yield_once().await;
             } else {
                 match tokio::time::timeout_at(deadline.into(), self.rx.recv()).await {
                     Ok(Some(e)) => self.builder.push(e),
@@ -502,7 +502,7 @@ impl SendLoop {
             match self.rx.try_recv() {
                 Ok(e) => self.builder.push(e),
                 Err(mpsc::error::TryRecvError::Empty) if !yielded => {
-                    tokio::task::yield_now().await;
+                    yield_once().await;
                     yielded = true;
                 }
                 Err(_) => return,
@@ -571,6 +571,22 @@ impl SendLoop {
         self.metrics.batch_size(req.request_ids.len());
         cli.send(&mut state, req);
     }
+}
+
+/// Let the other tasks that are ready run once, then continue (Go's `runtime.Gosched`): the
+/// task wakes itself and returns pending once, so it goes to the back of its worker's run
+/// queue. Unlike `tokio::task::yield_now`, the wake is not deferred until the worker has polled
+/// its I/O driver, which would add a driver poll (a system call) and its delay to every batch.
+fn yield_once() -> impl std::future::Future<Output = ()> {
+    let mut yielded = false;
+    std::future::poll_fn(move |cx| {
+        if yielded {
+            return std::task::Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
