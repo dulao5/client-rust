@@ -573,6 +573,33 @@ impl SendLoop {
     }
 }
 
+/// Fails the requests still waiting on a connection when its receive loop ends, also by a
+/// panic.
+struct PendingGuard<'a>(&'a BatchCommandsClient);
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .fail_pending_requests(&Status::unavailable("batch receive loop ended"));
+    }
+}
+
+/// The error of a request failed because its stream ended. client-go fails these requests
+/// with the stream's error and `onSendFail` treats every one of them as a send failure:
+/// switch replica after backoff (internal/locate/region_request.go:1599-1700). The stream's own
+/// status says nothing about these requests (e.g. `ResourceExhausted` for one oversized
+/// message on it), and this client's retry decides by the status
+/// (`request::plan::grpc_error_action`): so every request on a failed stream gets a
+/// connection-level `Unavailable`, with the stream's status in the message. A response's own
+/// status, and the per-request timeouts, are left as they are.
+fn stream_failed(err: &Status) -> Status {
+    Status::unavailable(format!(
+        "batch commands stream failed: {:?}: {}",
+        err.code(),
+        err.message()
+    ))
+}
+
 /// Let the other tasks that are ready run once, then continue (Go's `runtime.Gosched`): the
 /// task wakes itself and returns pending once, so it goes to the back of its worker's run
 /// queue. Unlike `tokio::task::yield_now`, the wake is not deferred until the worker has polled
@@ -751,6 +778,11 @@ impl BatchCommandsClient {
     /// client-go `batchRecvLoop` (client_batch.go:1019-1100) with `recreateStreamingClient`
     /// (:1108-1162).
     async fn recv_loop(self: Arc<Self>, rx: stream_mpsc::UnboundedReceiver<BatchCommandsRequest>) {
+        // client-go restarts a panicked receive loop (client_batch.go:1020-1031). Here the
+        // task ends; this guard fails what is still waiting on it at once (`Unavailable`, so
+        // the retry switches replica and drops the store's client, which is rebuilt on next
+        // use) instead of leaving it to its timeout.
+        let _guard = PendingGuard(&self);
         let mut rx = Some(rx);
         // client-go retries the stream with `BoTiKVRPC` (100 ms → 2 s, equal jitter,
         // config/retry/config.go:122) until it is recreated.
@@ -779,7 +811,7 @@ impl BatchCommandsClient {
                 state.recreating = true;
                 state.stream = None;
             }
-            self.fail_pending_requests(&err);
+            self.fail_pending_requests(&stream_failed(&err));
             // client-go recreates the stream at once when the connection is still up
             // (`waitConnReady` returns immediately) and otherwise retries with backoff. A
             // stream here cannot tell before it is used: the first recreation is immediate,
@@ -970,6 +1002,12 @@ mod tests {
                             b"slow" => continue,
                             b"drop" => {
                                 let _ = tx.unbounded_send(Err(Status::unavailable("dropped")));
+                                return;
+                            }
+                            b"exhaust" => {
+                                let _ = tx.unbounded_send(Err(Status::resource_exhausted(
+                                    "message too large",
+                                )));
                                 return;
                             }
                             b"big" => vec![7; BIG],
@@ -1178,7 +1216,40 @@ mod tests {
 
         let limited = connect(&addr, 4 * 1024 * 1024).await;
         let err = value_of(&limited, &get("big")).await.unwrap_err();
-        assert_eq!(grpc_code(&err), Code::OutOfRange, "{err:?}");
+        // The stream fails, and with it the request, as a connection-level failure.
+        assert_eq!(grpc_code(&err), Code::Unavailable, "{err:?}");
+        assert!(format!("{err:?}").contains("OutOfRange"), "{err:?}");
+    }
+
+    /// A stream that ends with a status about one message (`ResourceExhausted`) fails the other
+    /// requests in flight on it as a connection failure, which the retry logic retries on
+    /// another replica after invalidating the store, as client-go's `onSendFail` does.
+    #[tokio::test]
+    async fn requests_on_a_failed_stream_are_retried_as_connection_failures() {
+        let fake = FakeTikv::default();
+        let addr = start_fake(fake.clone()).await;
+        let client = connect(&addr, usize::MAX).await;
+        let waiting = {
+            let client = client.clone();
+            tokio::spawn(async move { value_of(&client, &get("slow")).await })
+        };
+        while fake.batch_sizes.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        let err = value_of(&client, &get("exhaust")).await.unwrap_err();
+        assert_eq!(grpc_code(&err), Code::Unavailable, "{err:?}");
+        let err = waiting.await.unwrap().unwrap_err();
+        assert_eq!(grpc_code(&err), Code::Unavailable, "{err:?}");
+        assert!(format!("{err:?}").contains("ResourceExhausted"), "{err:?}");
+        assert!(matches!(
+            crate::request::plan::grpc_error_action(&err),
+            crate::request::plan::GrpcErrorAction::TryNextPeerAndInvalidate
+        ));
+        // A request's own timeout is still a deadline, not a connection failure.
+        let mut slow = get("slow");
+        slow.set_max_execution_duration(Duration::from_millis(50));
+        let err = value_of(&client, &slow).await.unwrap_err();
+        assert_eq!(grpc_code(&err), Code::DeadlineExceeded);
     }
 
     /// Dropping the last handle stops the store's tasks and closes its streams.
@@ -1271,5 +1342,32 @@ mod tests {
         // The same request to a TiKV store goes through the stream.
         let client = connect(&addr, usize::MAX).await;
         assert!(client.batch.is_some());
+    }
+    /// The receive loop's guard fails the waiting requests when the loop ends, also by a
+    /// panic (simulated here by dropping the guard).
+    #[tokio::test]
+    async fn waiting_requests_fail_when_the_receive_loop_ends() {
+        let (_closed_tx, closed) = watch::channel(());
+        let client = BatchCommandsClient {
+            target: "nowhere".to_owned(),
+            grpc: TikvClient::new(Channel::from_static("http://127.0.0.1:1").connect_lazy()),
+            state: Mutex::new(StreamState::default()),
+            batched: Mutex::new(HashMap::new()),
+            sent: AtomicI64::new(1),
+            limit: i64::MAX,
+            tikv_load: Arc::new(AtomicU64::new(0)),
+            track_load: false,
+            closed,
+        };
+        let (res, rx) = oneshot::channel();
+        client.batched.lock().unwrap().insert(7, res);
+        let unwinding = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = PendingGuard(&client);
+            panic!("in the receive loop");
+        }));
+        assert!(unwinding.is_err());
+        let err = rx.await.unwrap().unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable);
+        assert_eq!(client.sent.load(Ordering::Relaxed), 0);
     }
 }
