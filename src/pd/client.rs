@@ -88,6 +88,12 @@ pub trait PdClient: Send + Sync + 'static {
 
     async fn all_stores(&self) -> Result<Vec<Store>>;
 
+    /// The network address of `store_id` (cached in `RegionCache`; reads through to PD on miss).
+    /// Returns an empty string for test doubles that do not track store addresses.
+    async fn store_address(&self, _store_id: StoreId) -> Result<String> {
+        Ok(String::new())
+    }
+
     /// The lock-resolution state of this cluster client: client-go keeps it per `KVStore` in
     /// its `LockResolver` (resolved-status cache, in-flight region resolves). It lives on the
     /// PD client only because that is what the lock-resolution paths (the `ResolveLock` plan,
@@ -262,7 +268,11 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
         let store_id = region.get_store_id()?;
         let store = self.region_cache.get_store_by_id(store_id).await?;
         let kv_client = self.kv_client_for(&store).await?;
-        Ok(RegionStore::new(region, Arc::new(kv_client)))
+        Ok(RegionStore::new(region, Arc::new(kv_client)).with_store_address(store.address))
+    }
+
+    async fn store_address(&self, store_id: StoreId) -> Result<String> {
+        Ok(self.region_cache.get_store_by_id(store_id).await?.address)
     }
 
     async fn region_for_key(&self, key: &Key) -> Result<RegionWithLeader> {

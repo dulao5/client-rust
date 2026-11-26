@@ -21,9 +21,8 @@
 //!   `NewClientHelper(store, &resolvedLocks, &committedLocks, false)` does.
 //!
 //! Differences kept (spec D07.2 part 2): no replica read (leader only, as the rest of this
-//! client, parity table §3.1), no region buckets (locations carry none), the store's
-//! estimated wait time is always zero (no load-based selection), and the store address is not
-//! known here (empty).
+//! client, parity table §3.1), no region buckets (locations carry none), and the store's
+//! estimated wait time is always zero (no load-based selection).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,7 +77,7 @@ pub struct CopRpcContext {
     pub store_id: u64,
     /// `Store.EstimatedWaitTime()`: always zero (no load-based replica selection here).
     pub store_estimated_wait_time: Duration,
-    /// `Addr`: not known by this client (empty).
+    /// `Addr`: the TiKV store's network address (`metapb::Store::address`).
     pub addr: String,
 }
 
@@ -203,12 +202,13 @@ impl<PdC: PdClient> CopSender<PdC> {
         let Some(leader) = region.leader.clone() else {
             return Ok(None);
         };
+        let addr = self.pd_client.store_address(leader.store_id).await?;
         Ok(Some(CopRpcContext {
             ver_id: ver_id.clone(),
             store_id: leader.store_id,
             peer: leader,
             store_estimated_wait_time: Duration::ZERO,
-            addr: String::new(),
+            addr,
         }))
     }
 
@@ -260,13 +260,6 @@ impl<PdC: PdClient> CopSender<PdC> {
                 .leader
                 .clone()
                 .filter(|_| target.leader != region.leader);
-            let rpc_ctx = target.leader.clone().map(|peer| CopRpcContext {
-                ver_id: ver_id.clone(),
-                store_id: peer.store_id,
-                peer,
-                store_estimated_wait_time: Duration::ZERO,
-                addr: String::new(),
-            });
             let region_store = match self.pd_client.clone().map_region_to_store(target).await {
                 Ok(rs) => rs,
                 Err(e) => {
@@ -286,6 +279,18 @@ impl<PdC: PdClient> CopSender<PdC> {
                     continue;
                 }
             };
+            let rpc_ctx =
+                region_store
+                    .region_with_leader
+                    .leader
+                    .clone()
+                    .map(|peer| CopRpcContext {
+                        ver_id: ver_id.clone(),
+                        store_id: peer.store_id,
+                        peer,
+                        store_estimated_wait_time: Duration::ZERO,
+                        addr: region_store.store_address.clone(),
+                    });
 
             let mut rpc = CoprocessorRpc {
                 inner: req.clone(),
@@ -403,6 +408,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::mock::DeadLeaderFixture;
     use crate::mock::MockKvClient;
     use crate::mock::MockPdClient;
 
@@ -462,7 +468,10 @@ mod tests {
             .unwrap();
         assert_eq!(res.resp.data, b"x");
         assert!(res.resp.region_error.is_none());
-        assert_eq!(res.rpc_ctx.unwrap().ver_id, region);
+        let ctx = res.rpc_ctx.unwrap();
+        assert_eq!(ctx.ver_id, region);
+        assert_eq!(ctx.store_id, 41);
+        assert_eq!(ctx.addr, "store-41");
         assert_eq!(seen.lock().unwrap()[0], (region.id, vec![]));
     }
 
@@ -511,6 +520,7 @@ mod tests {
             .await
             .unwrap();
         assert!(res.resp.region_error.unwrap().epoch_not_match.is_some());
+        assert_eq!(res.rpc_ctx.unwrap().addr, "store-41");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -598,6 +608,7 @@ mod tests {
         let region = MockPdClient::region1();
         let ctx = s.rpc_context(&region.ver_id()).await.unwrap().unwrap();
         assert_eq!(ctx.store_id, region.leader.unwrap().store_id);
+        assert_eq!(ctx.addr, "store-41");
         let mut stale = region.region.clone();
         stale.region_epoch.as_mut().unwrap().version += 1;
         let stale_id = RegionVerId {
@@ -606,5 +617,85 @@ mod tests {
             ver: stale.region_epoch.as_ref().unwrap().version,
         };
         assert!(s.rpc_context(&stale_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_rpc_context_uses_store_address_and_propagates_error() {
+        let s = sender(
+            pd(|_| ok("")).with_store_address_hook(|store_id| match store_id {
+                41 => Ok("10.0.0.1:20160".to_owned()),
+                42 => Err(internal_err!("store {} not found", store_id)),
+                _ => Ok(format!("10.0.0.{store_id}:20160")),
+            }),
+        );
+
+        let ctx1 = s
+            .rpc_context(&MockPdClient::region1().ver_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctx1.store_id, 41);
+        assert_eq!(ctx1.addr, "10.0.0.1:20160");
+
+        let err = s
+            .rpc_context(&MockPdClient::region2().ver_id())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("store 42 not found"));
+    }
+
+    #[tokio::test]
+    async fn test_send_populates_store_addr_for_fallback_peer() {
+        let fixture = DeadLeaderFixture::new();
+        let seen_stores = Arc::new(Mutex::new(Vec::new()));
+        let seen_stores_hook = seen_stores.clone();
+        let client = MockKvClient::with_dispatch_hook(move |req: &dyn Any| {
+            let cop = req
+                .downcast_ref::<coprocessor::Request>()
+                .expect("cop request");
+            let store_id = cop
+                .context
+                .as_ref()
+                .unwrap()
+                .peer
+                .as_ref()
+                .unwrap()
+                .store_id;
+            seen_stores_hook.lock().unwrap().push(store_id);
+            if store_id == DeadLeaderFixture::DEAD_LEADER {
+                Err(Error::GrpcAPI(tonic::Status::unavailable("leader down")))
+            } else {
+                ok("fallback")
+            }
+        });
+        let pd_client =
+            fixture
+                .pd_client(client)
+                .with_store_address_hook(|store_id| match store_id {
+                    41 => Ok("10.0.0.41:20160".to_owned()),
+                    44 => Ok("10.0.0.44:20160".to_owned()),
+                    45 => Ok("10.0.0.45:20160".to_owned()),
+                    _ => Err(internal_err!("unexpected store {}", store_id)),
+                });
+        let s = sender(pd_client);
+        let ver_id = DeadLeaderFixture::ver_id();
+
+        let res = s
+            .send(
+                &mut Backoff::time_budget(20_000).start(),
+                &ver_id,
+                coprocessor::Request::default(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.resp.data, b"fallback");
+        assert_eq!(*seen_stores.lock().unwrap(), vec![41, 44]);
+        let ctx = res.rpc_ctx.unwrap();
+        assert_eq!(ctx.ver_id, ver_id);
+        assert_eq!(ctx.store_id, 44);
+        assert_eq!(ctx.peer.store_id, 44);
+        assert_eq!(ctx.addr, "10.0.0.44:20160");
     }
 }

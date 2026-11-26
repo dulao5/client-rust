@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
+use crate::internal_err;
 use crate::metrics;
 use crate::metrics::PdCmd;
 use crate::pd::Cluster;
@@ -200,10 +201,10 @@ impl RetryClientTrait for RetryClient<Cluster> {
 
     async fn get_store(self: Arc<Self>, id: StoreId) -> Result<metapb::Store> {
         retry_mut!(self, "get_store", PdCmd::GetStore, |cluster| async {
-            cluster
-                .get_store(id, self.timeout)
-                .await
-                .map(|resp| resp.store.unwrap())
+            cluster.get_store(id, self.timeout).await.and_then(|resp| {
+                resp.store
+                    .ok_or_else(|| internal_err!("store {} not found in response", id))
+            })
         })
     }
 
@@ -302,7 +303,6 @@ mod test {
     use futures::future::ready;
 
     use super::*;
-    use crate::internal_err;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_reconnect() {
