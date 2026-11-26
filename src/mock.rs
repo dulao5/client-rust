@@ -96,6 +96,14 @@ pub struct MockPdClient {
     #[new(default)]
     region_for_key_hook:
         Option<Arc<dyn Fn(&Key) -> Result<RegionWithLeader> + Send + Sync + 'static>>,
+    /// Optional override for `region_for_id`.
+    #[new(default)]
+    region_for_id_hook:
+        Option<Arc<dyn Fn(RegionId) -> Result<RegionWithLeader> + Send + Sync + 'static>>,
+    /// Optional override for `store_address`.
+    #[new(default)]
+    store_address_hook:
+        Option<Arc<dyn Fn(crate::region::StoreId) -> Result<String> + Send + Sync + 'static>>,
     /// Optional observer/override for leader cache updates.
     #[new(default)]
     update_leader_hook:
@@ -159,6 +167,24 @@ impl MockPdClient {
         F: Fn(&Key) -> Result<RegionWithLeader> + Send + Sync + 'static,
     {
         self.region_for_key_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Override `region_for_id` with a custom hook.
+    pub fn with_region_for_id_hook<F>(mut self, hook: F) -> MockPdClient
+    where
+        F: Fn(RegionId) -> Result<RegionWithLeader> + Send + Sync + 'static,
+    {
+        self.region_for_id_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Override `store_address` with a custom hook.
+    pub fn with_store_address_hook<F>(mut self, hook: F) -> MockPdClient
+    where
+        F: Fn(crate::region::StoreId) -> Result<String> + Send + Sync + 'static,
+    {
+        self.store_address_hook = Some(Arc::new(hook));
         self
     }
 
@@ -262,7 +288,21 @@ impl PdClient for MockPdClient {
         if let Some(hook) = &self.map_region_to_store_hook {
             return hook(region);
         }
-        Ok(RegionStore::new(region, Arc::new(self.client.clone())))
+        let addr = match region.get_store_id() {
+            Ok(store_id) => self.store_address(store_id).await?,
+            Err(_) => self.client.addr.clone(),
+        };
+        Ok(RegionStore::new(region, Arc::new(self.client.clone())).with_store_address(addr))
+    }
+
+    async fn store_address(&self, store_id: crate::region::StoreId) -> Result<String> {
+        if let Some(hook) = &self.store_address_hook {
+            return hook(store_id);
+        }
+        if !self.client.addr.is_empty() {
+            return Ok(self.client.addr.clone());
+        }
+        Ok(format!("store-{store_id}"))
     }
 
     async fn region_for_key(&self, key: &Key) -> Result<RegionWithLeader> {
@@ -282,6 +322,9 @@ impl PdClient for MockPdClient {
     }
 
     async fn region_for_id(&self, id: RegionId) -> Result<RegionWithLeader> {
+        if let Some(hook) = &self.region_for_id_hook {
+            return hook(id);
+        }
         match id {
             1 => Ok(Self::region1()),
             2 => Ok(Self::region2()),
@@ -388,6 +431,10 @@ impl DeadLeaderFixture {
         *self.leader.lock().unwrap() = Self::DEAD_LEADER;
     }
 
+    pub fn ver_id() -> RegionVerId {
+        Self::region(Self::DEAD_LEADER).ver_id()
+    }
+
     pub fn pd_client(&self, client: MockKvClient) -> MockPdClient {
         use std::sync::atomic::Ordering;
 
@@ -395,13 +442,18 @@ impl DeadLeaderFixture {
 
         use crate::store::Liveness;
 
-        let leader = self.leader.clone();
+        let leader_for_key = self.leader.clone();
+        let leader_for_id = self.leader.clone();
         let update_leader = self.leader.clone();
         let leader_updates = self.leader_updates.clone();
         let probe_down = self.down.clone();
         let probes = self.probes.clone();
         MockPdClient::new(client)
-            .with_region_for_key_hook(move |_| Ok(Self::region(*leader.lock().unwrap())))
+            .with_region_for_key_hook(move |_| Ok(Self::region(*leader_for_key.lock().unwrap())))
+            .with_region_for_id_hook(move |id| match id {
+                1 => Ok(Self::region(*leader_for_id.lock().unwrap())),
+                _ => Err(Error::RegionNotFoundInResponse { region_id: id }),
+            })
             .with_update_leader_hook(move |_, peer| {
                 *update_leader.lock().unwrap() = peer.store_id;
                 leader_updates.lock().unwrap().push(peer.store_id);
