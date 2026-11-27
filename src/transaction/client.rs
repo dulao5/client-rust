@@ -349,14 +349,16 @@ impl Client {
                 return Ok(live_locks);
             }
 
-            match backoff.next_delay_duration() {
+            let t = crate::metrics::BackoffType::TikvLockFast;
+            match backoff.next_step(t, None) {
                 None => return Ok(live_locks),
-                Some(delay_duration) => {
-                    crate::metrics::backoff(
-                        crate::metrics::BackoffType::TikvLockFast,
-                        delay_duration,
-                    );
-                    tokio::time::sleep(delay_duration).await;
+                Some(step) => {
+                    let err = crate::Error::ResolveLockError(live_locks);
+                    backoff.finish_step(t, step, &err).await;
+                    let crate::Error::ResolveLockError(returned_locks) = err else {
+                        unreachable!();
+                    };
+                    live_locks = returned_locks;
                 }
             }
         }

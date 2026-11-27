@@ -6,12 +6,10 @@ use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
 
 use log::debug;
-use tokio::time::sleep;
 
 use super::Transaction;
 use super::TransactionStatus;
 use crate::backoff::Backoff;
-use crate::metrics;
 use crate::metrics::BackoffType;
 use crate::pd::PdClient;
 use crate::pd::PdRpcClient;
@@ -19,7 +17,6 @@ use crate::proto::pdpb::Timestamp;
 use crate::region::RegionWithLeader;
 use crate::request::plan::check_store_liveness;
 use crate::request::plan::grpc_error_action;
-use crate::request::plan::handle_region_error;
 use crate::request::plan::is_grpc_error;
 use crate::request::plan::liveness_target;
 use crate::request::plan::not_leader_hint_is_unreachable;
@@ -433,20 +430,17 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
             };
 
             if let Some(region_error) = response.region_error() {
-                let backoff_type = metrics::backoff_type_for_region_error(&region_error);
-                let Some(delay) = region_backoff.next_delay_for(backoff_type) else {
-                    return Err(
-                        region_backoff.exhausted(Error::RegionError(Box::new(region_error)))
-                    );
-                };
                 let hint_unreachable =
                     not_leader_hint_is_unreachable(&*self.pd_client, &region_error);
-                let retry_immediately =
-                    handle_region_error(self.pd_client.clone(), region_error, region_store).await?;
-                if !retry_immediately || hint_unreachable {
-                    metrics::backoff(backoff_type, delay);
-                    sleep(delay).await;
-                }
+                crate::request::plan::retry_on_region_error(
+                    self.pd_client.clone(),
+                    &mut region_backoff,
+                    region_error,
+                    region_store,
+                    hint_unreachable,
+                    || {},
+                )
+                .await?;
                 continue;
             }
             if let Some(peer) = fallback_peer {
@@ -517,12 +511,7 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
         } else {
             BackoffType::RegionMiss
         };
-        let Some(delay) = backoff.next_delay_for(t) else {
-            return Err(backoff.exhausted(error));
-        };
-        metrics::backoff(t, delay);
-        sleep(delay).await;
-        Ok(())
+        backoff.backoff(t, error).await
     }
 
     fn check_allow_operation(&self) -> Result<()> {

@@ -28,6 +28,16 @@ pub struct Backoff {
     base_delay_ms: u64,
     current_delay_ms: u64,
     max_delay_ms: u64,
+    txn_start_ts: Option<u64>,
+}
+
+/// Computed delay and `client-go` `"backoff"` debug log metadata for one backoff step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BackoffStep {
+    pub(crate) delay: Duration,
+    pub(crate) base: u64,
+    pub(crate) sleep: u64,
+    pub(crate) attempts: u32,
 }
 
 impl Backoff {
@@ -37,22 +47,27 @@ impl Backoff {
     // `regionMiss` one. The crate's own retry loops call `next_delay_for` with the error's
     // kind instead.
     pub fn next_delay_duration(&mut self) -> Option<Duration> {
+        self.next_delay_duration_with_meta().map(|step| step.delay)
+    }
+
+    pub(crate) fn next_delay_duration_with_meta(&mut self) -> Option<BackoffStep> {
         if let BackoffKind::TimeBudget(_) = self.kind {
-            return self.next_delay_for(BackoffType::RegionMiss);
+            return self.next_step(BackoffType::RegionMiss, None);
         }
         if self.current_attempts >= self.max_attempts {
             return None;
         }
+        let attempts = self.current_attempts;
+        let base = self.base_delay_ms;
         self.current_attempts += 1;
 
-        match self.kind {
-            BackoffKind::None => None,
+        let delay_ms = match self.kind {
+            BackoffKind::None => return None,
             BackoffKind::TimeBudget(_) => unreachable!(),
             BackoffKind::NoJitter => {
                 let delay_ms = self.max_delay_ms.min(self.current_delay_ms);
                 self.current_delay_ms <<= 1;
-
-                Some(Duration::from_millis(delay_ms))
+                delay_ms
             }
             BackoffKind::FullJitter => {
                 let delay_ms = self.max_delay_ms.min(self.current_delay_ms);
@@ -60,8 +75,7 @@ impl Backoff {
                 let mut rng = thread_rng();
                 let delay_ms: u64 = rng.gen_range(0..delay_ms);
                 self.current_delay_ms <<= 1;
-
-                Some(Duration::from_millis(delay_ms))
+                delay_ms
             }
             BackoffKind::EqualJitter => {
                 let delay_ms = self.max_delay_ms.min(self.current_delay_ms);
@@ -70,8 +84,7 @@ impl Backoff {
                 let mut rng = thread_rng();
                 let delay_ms: u64 = rng.gen_range(0..half_delay_ms) + half_delay_ms;
                 self.current_delay_ms <<= 1;
-
-                Some(Duration::from_millis(delay_ms))
+                delay_ms
             }
             BackoffKind::DecorrelatedJitter => {
                 let mut rng = thread_rng();
@@ -81,44 +94,120 @@ impl Backoff {
 
                 let delay_ms = delay_ms.min(self.max_delay_ms);
                 self.current_delay_ms = delay_ms;
-
-                Some(Duration::from_millis(delay_ms))
+                delay_ms
             }
-        }
+        };
+
+        Some(BackoffStep {
+            delay: Duration::from_millis(delay_ms),
+            base,
+            sleep: delay_ms,
+            attempts,
+        })
+    }
+
+    /// Attach the transaction's start timestamp (mirroring `client-go`'s `retry.TxnStartKey` on
+    /// `context.Context`) so `"retry later"` logs include `txnStartTS`.
+    #[must_use]
+    pub fn with_txn_start_ts(mut self, txn_start_ts: u64) -> Self {
+        self.txn_start_ts = Some(txn_start_ts);
+        self
+    }
+
+    pub(crate) fn set_txn_start_ts(&mut self, txn_start_ts: u64) {
+        self.txn_start_ts = Some(txn_start_ts);
+    }
+
+    /// The transaction start timestamp attached to this backoff, if any.
+    pub fn txn_start_ts(&self) -> Option<u64> {
+        self.txn_start_ts
     }
 
     /// The delay before retrying after an error of kind `t`. A
     /// [`time_budget`](Backoff::time_budget) backoff uses client-go's curve for `t` and charges
     /// the delay to its budget; every other backoff ignores `t`
     /// ([`next_delay_duration`](Backoff::next_delay_duration)).
+    #[cfg(test)]
     pub(crate) fn next_delay_for(&mut self, t: BackoffType) -> Option<Duration> {
         self.next_delay_capped(t, None)
     }
 
     /// [`next_delay_for`](Backoff::next_delay_for), with the sleep capped at `cap`: client-go's
     /// `BackoffWithMaxSleepTxnLockFast` (backoff.go:127), which charges the capped sleep.
+    #[cfg(test)]
     pub(crate) fn next_delay_capped(
         &mut self,
         t: BackoffType,
         cap: Option<Duration>,
     ) -> Option<Duration> {
+        self.next_step(t, cap).map(|step| step.delay)
+    }
+
+    /// Reserve the next backoff step for `t` (capped at `cap`) without sleeping or emitting
+    /// logs yet. Call [`finish_step`](Backoff::finish_step) to sleep and emit `"backoff"` /
+    /// `"retry later"`, or [`record_error`](Backoff::record_error) if the retry skips sleeping.
+    pub(crate) fn next_step(
+        &mut self,
+        t: BackoffType,
+        cap: Option<Duration>,
+    ) -> Option<BackoffStep> {
         let BackoffKind::TimeBudget(budget) = &mut self.kind else {
-            let delay = self.next_delay_duration()?;
-            return Some(cap.map_or(delay, |cap| delay.min(cap)));
+            let mut step = self.next_delay_duration_with_meta()?;
+            if let Some(cap) = cap {
+                step.delay = step.delay.min(cap);
+            }
+            return Some(step);
         };
-        let ms = budget.next(t, cap.map(|c| c.as_millis() as u64))?;
+        let step = budget.next_step(t, cap.map(|c| c.as_millis() as u64))?;
         self.current_attempts += 1;
-        Some(Duration::from_millis(ms))
+        Some(step)
+    }
+
+    /// Emit client-go `newBackoffFn`'s `"backoff"` debug log (`config/retry/config.go:190`).
+    pub(crate) fn log_backoff_step(step: &BackoffStep) {
+        log::debug!(
+            base = step.base,
+            sleep = step.sleep,
+            attempts = step.attempts;
+            "backoff"
+        );
+    }
+
+    /// Record `err` with its UTC RFC3339Nano timestamp in the time-budget history
+    /// (`config/retry/backoff.go:183`).
+    pub(crate) fn record_error(&self, err: &crate::Error) {
+        if let BackoffKind::TimeBudget(TimeBudget {
+            state: Some(state), ..
+        }) = &self.kind
+        {
+            let entry = format!(
+                "{err} at {}",
+                crate::util::log::Rfc3339NanoUtc(std::time::SystemTime::now())
+            );
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .errors
+                .push(entry);
+        }
+    }
+
+    /// Complete a reserved step: log `"backoff"`, record the error, observe metrics, sleep,
+    /// and log `"retry later"`.
+    pub(crate) async fn finish_step(&self, t: BackoffType, step: BackoffStep, err: &crate::Error) {
+        Self::log_backoff_step(&step);
+        self.record_error(err);
+        crate::metrics::backoff(t, step.delay);
+        tokio::time::sleep(step.delay).await;
+        self.log_retry_later(t, err);
     }
 
     /// client-go `Backoffer.Backoff(cfg, err)`: sleeps for the next delay of kind `t`, or
-    /// returns `err` as this budget's exhaustion ([`exhausted`](Backoff::exhausted)).
+    /// returns `err` wrapped as this budget's exhaustion (`Error::BackoffExhausted`).
     pub async fn backoff(&mut self, t: BackoffType, err: crate::Error) -> crate::Result<()> {
-        match self.next_delay_for(t) {
-            Some(delay) => {
-                crate::metrics::backoff(t, delay);
-                tokio::time::sleep(delay).await;
-                self.log_retry_later(t, &err);
+        match self.next_step(t, None) {
+            Some(step) => {
+                self.finish_step(t, step, &err).await;
                 Ok(())
             }
             None => Err(self.exhausted_for(Some(t), err)),
@@ -132,11 +221,9 @@ impl Backoff {
         err: crate::Error,
     ) -> crate::Result<()> {
         let t = BackoffType::TikvLockFast;
-        match self.next_delay_capped(t, Some(Duration::from_millis(max_sleep_ms))) {
-            Some(delay) => {
-                crate::metrics::backoff(t, delay);
-                tokio::time::sleep(delay).await;
-                self.log_retry_later(t, &err);
+        match self.next_step(t, Some(Duration::from_millis(max_sleep_ms))) {
+            Some(step) => {
+                self.finish_step(t, step, &err).await;
                 Ok(())
             }
             None => Err(self.exhausted_for(Some(t), err)),
@@ -151,7 +238,8 @@ impl Backoff {
             totalSleep = self.total_sleep_ms(),
             excludedSleep = self.excluded_sleep_ms(),
             maxSleep = self.max_sleep_ms(),
-            "type" = t.go_config();
+            "type" = t.go_config(),
+            txnStartTS = self.txn_start_ts;
             "retry later"
         );
     }
@@ -225,56 +313,44 @@ impl Backoff {
             .map(|(t, _)| t)
     }
 
-    /// The error to return when this backoff refuses another retry after `error`. A
-    /// [`time_budget`](Backoff::time_budget) reports, as client-go does, the kind of error it
-    /// slept on longest ([`Error::BackoffExhausted`]; backoff.go:175-180), with `error` as the
-    /// last one. Any other backoff, or an undetermined outcome (which commit paths must
-    /// recognise as such), returns `error` unchanged.
-    pub(crate) fn exhausted(&self, error: crate::Error) -> crate::Error {
-        self.exhausted_for(None, error)
-    }
-
-    fn exhausted_for(&self, t: Option<BackoffType>, error: crate::Error) -> crate::Error {
+    /// The error to return when this backoff refuses another retry after `error`,
+    /// associating the exhaustion with `t` when known. A [`time_budget`](Backoff::time_budget)
+    /// reports, as client-go does, the kind of error it slept on longest
+    /// ([`Error::BackoffExhausted`]; backoff.go:175-180), with `error` as the last one. Any
+    /// other backoff, or an undetermined outcome (which commit paths must recognise as such),
+    /// returns `error` unchanged.
+    pub(crate) fn exhausted_for(
+        &self,
+        t: Option<BackoffType>,
+        error: crate::Error,
+    ) -> crate::Error {
         if let BackoffKind::TimeBudget(TimeBudget {
             max_sleep_ms,
             state: Some(state),
         }) = &self.kind
         {
-            if *max_sleep_ms > 0 {
-                let (total_sleep_ms, excluded_sleep_ms, last_type, longest) = {
-                    let s = state.lock().unwrap_or_else(|e| e.into_inner());
-                    let longest = BackoffType::ALL
-                        .into_iter()
-                        .filter(|kind| *kind != BackoffType::ServerBusy)
-                        .map(|kind| (kind, s.slept_ms[kind as usize]))
-                        .filter(|(_, ms)| *ms > 0)
-                        .max_by_key(|(_, ms)| *ms);
-                    (
-                        s.total_sleep_ms,
-                        s.excluded_sleep_ms,
-                        s.last_exhausted_type,
-                        longest,
-                    )
-                };
-                let cfg = t
-                    .or(last_type)
-                    .or_else(|| longest.map(|(kind, _)| kind))
-                    .map(BackoffType::go_config)
-                    .unwrap_or("unknown");
-                let (longest_type, longest_ms) = match longest {
-                    Some((kind, ms)) => (kind.go_config(), ms),
-                    None => ("", 0),
-                };
-                log::warn!(
-                    "type" = cfg,
-                    maxSleep = *max_sleep_ms,
-                    totalSleep = total_sleep_ms,
-                    excludedSleep = excluded_sleep_ms,
-                    longestSleepType = longest_type,
-                    longestSleepMs = longest_ms,
-                    error:% = error;
-                    "{cfg} backoffer.maxSleep {max_sleep_ms}ms is exceeded, errors:"
+            if *max_sleep_ms > 0 && log::log_enabled!(log::Level::Warn) {
+                let s = state.lock().unwrap_or_else(|e| e.into_inner());
+                let longest = BackoffType::ALL
+                    .into_iter()
+                    .filter(|kind| *kind != BackoffType::ServerBusy)
+                    .map(|kind| (kind, s.slept_ms[kind as usize]))
+                    .filter(|(_, ms)| *ms > 0)
+                    .max_by_key(|(_, ms)| *ms);
+                let cfg_type = t
+                    .or(s.last_exhausted_type)
+                    .or(longest.map(|(kind, _)| kind));
+                let msg = format_max_sleep_exceeded_msg(
+                    cfg_type,
+                    *max_sleep_ms,
+                    s.total_sleep_ms,
+                    s.excluded_sleep_ms,
+                    &s.backoff_times,
+                    &s.errors,
+                    longest,
+                    log::log_enabled!(log::Level::Debug),
                 );
+                log::warn!("{msg}");
             }
         }
         if crate::request::plan::is_undetermined_region_error(&error) {
@@ -314,8 +390,11 @@ impl Backoff {
                     total_sleep_ms: state.total_sleep_ms,
                     excluded_sleep_ms: state.excluded_sleep_ms,
                     attempts: [0; BACKOFF_COUNT],
-                    // `Fork` copies `backoffSleepMS` (backoff.go:287).
+                    // `Fork` copies `backoffSleepMS`, `backoffTimes`, and `errors`
+                    // (backoff.go:285-288).
                     slept_ms: state.slept_ms,
+                    backoff_times: state.backoff_times,
+                    errors: state.errors.clone(),
                     last_exhausted_type: None,
                 }
             });
@@ -353,6 +432,7 @@ impl Backoff {
             base_delay_ms: 0,
             current_delay_ms: 0,
             max_delay_ms: 0,
+            txn_start_ts: None,
         }
     }
 
@@ -375,6 +455,7 @@ impl Backoff {
             base_delay_ms: 0,
             current_delay_ms: 0,
             max_delay_ms: 0,
+            txn_start_ts: None,
         }
     }
 
@@ -395,6 +476,7 @@ impl Backoff {
             base_delay_ms,
             current_delay_ms: base_delay_ms,
             max_delay_ms,
+            txn_start_ts: None,
         }
     }
 
@@ -420,6 +502,7 @@ impl Backoff {
             base_delay_ms,
             current_delay_ms: base_delay_ms,
             max_delay_ms,
+            txn_start_ts: None,
         }
     }
 
@@ -445,6 +528,7 @@ impl Backoff {
             base_delay_ms,
             current_delay_ms: base_delay_ms,
             max_delay_ms,
+            txn_start_ts: None,
         }
     }
 
@@ -467,8 +551,69 @@ impl Backoff {
             base_delay_ms,
             current_delay_ms: base_delay_ms,
             max_delay_ms,
+            txn_start_ts: None,
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_max_sleep_exceeded_msg(
+    cfg_type: Option<BackoffType>,
+    max_sleep_ms: u64,
+    total_sleep_ms: u64,
+    excluded_sleep_ms: u64,
+    backoff_times: &[u32; BACKOFF_COUNT],
+    errors: &[String],
+    longest: Option<(BackoffType, u64)>,
+    include_all_errors: bool,
+) -> String {
+    use std::fmt::Write as _;
+
+    let cfg = cfg_type.map(BackoffType::go_config).unwrap_or("unknown");
+    let max_backoff_time_exceeded =
+        total_sleep_ms.saturating_sub(excluded_sleep_ms) >= max_sleep_ms;
+    let max_excluded_time_exceeded = cfg_type == Some(BackoffType::ServerBusy)
+        && excluded_sleep_ms >= SERVER_BUSY_EXCLUDED_MS
+        && excluded_sleep_ms >= max_sleep_ms;
+
+    let mut msg = format!("{cfg} backoffer.maxSleep {max_sleep_ms}ms is exceeded, errors:");
+    let start_idx = if include_all_errors {
+        0
+    } else {
+        errors.len().saturating_sub(3)
+    };
+    for err in &errors[start_idx..] {
+        msg.push('\n');
+        msg.push_str(err);
+    }
+
+    let mut backoff_detail = String::new();
+    let mut total_times: u32 = 0;
+    for kind in BackoffType::ALL {
+        let times = backoff_times[kind as usize];
+        if times > 0 {
+            total_times += times;
+            if !backoff_detail.is_empty() {
+                backoff_detail.push_str(", ");
+            }
+            let _ = write!(backoff_detail, "{}:{times}", kind.go_config());
+        }
+    }
+
+    let _ = write!(
+        msg,
+        "\ntotal-backoff-times: {total_times}, backoff-detail: {backoff_detail}, \
+         maxBackoffTimeExceeded: {max_backoff_time_exceeded}, \
+         maxExcludedTimeExceeded: {max_excluded_time_exceeded}"
+    );
+    if let Some((kind, ms)) = longest {
+        let _ = write!(
+            msg,
+            "\nlongest sleep type: {}, time: {ms}ms",
+            kind.go_config()
+        );
+    }
+    msg
 }
 
 /// The pattern for computing backoff times.
@@ -508,6 +653,10 @@ struct BudgetState {
     attempts: [u32; BACKOFF_COUNT],
     /// Sleep per kind (`backoffSleepMS`), for the error reported when the budget runs out.
     slept_ms: [u64; BACKOFF_COUNT],
+    /// Number of backoffs per kind (`backoffTimes`), for the exhaustion summary.
+    backoff_times: [u32; BACKOFF_COUNT],
+    /// Recorded error lines (`"<err> at <RFC3339Nano>"`), matching client-go `b.errors`.
+    errors: Vec<String>,
     /// The backoff type that hit the budget limit, for exhaustion warning logs.
     last_exhausted_type: Option<BackoffType>,
 }
@@ -546,7 +695,7 @@ const fn go_curve(t: BackoffType) -> (u64, u64, Jitter) {
 impl TimeBudget {
     /// `Backoffer.BackoffWithCfgAndMaxSleep` (backoff.go:134-205) without the sleep itself:
     /// the sleep for `t`, at most `cap_ms`, charged to the budget.
-    fn next(&mut self, t: BackoffType, cap_ms: Option<u64>) -> Option<u64> {
+    fn next_step(&mut self, t: BackoffType, cap_ms: Option<u64>) -> Option<BackoffStep> {
         let max_sleep_ms = self.max_sleep_ms;
         let state = self
             .state
@@ -566,25 +715,31 @@ impl TimeBudget {
         // min(cap, base * 2^attempts); EqualJitter is v/2 + rand(v/2).
         let (base, cap, jitter) = go_curve(t);
         let base = base.max(2);
-        let attempts = &mut state.attempts[t as usize];
+        let attempt = state.attempts[t as usize];
         let v = base
-            .checked_shl(*attempts)
-            .filter(|v| *v >> *attempts == base)
+            .checked_shl(attempt)
+            .filter(|v| *v >> attempt == base)
             .map_or(cap, |v| v.min(cap));
         let sleep = match jitter {
             Jitter::No => v,
             Jitter::Equal => v / 2 + thread_rng().gen_range(0..(v / 2).max(1)),
         };
-        *attempts += 1;
+        state.attempts[t as usize] += 1;
+        state.backoff_times[t as usize] += 1;
         // `maxSleepMs` caps the sleep actually taken (config.go:196-199), which is what is
         // charged (backoff.go:200-203).
-        let sleep = cap_ms.map_or(sleep, |cap| sleep.min(cap));
-        state.total_sleep_ms += sleep;
-        state.slept_ms[t as usize] += sleep;
+        let real_sleep = cap_ms.map_or(sleep, |cap| sleep.min(cap));
+        state.total_sleep_ms += real_sleep;
+        state.slept_ms[t as usize] += real_sleep;
         if excluded {
-            state.excluded_sleep_ms += sleep;
+            state.excluded_sleep_ms += real_sleep;
         }
-        Some(sleep)
+        Some(BackoffStep {
+            delay: Duration::from_millis(real_sleep),
+            base,
+            sleep,
+            attempts: attempt,
+        })
     }
 }
 
@@ -865,7 +1020,7 @@ mod test {
     #[tokio::test]
     async fn test_time_budget_logs_retry_later_and_exhaustion() {
         let start = crate::util::log::test_logger::checkpoint();
-        let mut b = Backoff::time_budget(10).start();
+        let mut b = Backoff::time_budget(10).start().with_txn_start_ts(4242);
         let marker = "backoff-unit-test-err-991";
 
         let mut retries = 0;
@@ -879,12 +1034,24 @@ mod test {
         {
             retries += 1;
         }
-        assert!(retries > 0);
+        assert_eq!(retries, 3); // 2 + 4 + 8 = 14 ms >= 10 ms
         assert!(b.total_sleep_ms() >= 10);
         assert_eq!(b.excluded_sleep_ms(), 0);
         assert_eq!(b.max_sleep_ms(), 10);
 
         let records = crate::util::log::test_logger::since(start);
+
+        assert!(
+            records.iter().any(|r| {
+                r.level == log::Level::Debug
+                    && r.message == "backoff"
+                    && r.kv("base") == Some("2")
+                    && r.kv("sleep") == Some("2")
+                    && r.kv("attempts") == Some("0")
+            }),
+            "expected 'backoff' debug log"
+        );
+
         let retry_record = records
             .iter()
             .find(|r| {
@@ -896,27 +1063,37 @@ mod test {
         assert_eq!(retry_record.kv("type"), Some("regionMiss"));
         assert_eq!(retry_record.kv("maxSleep"), Some("10"));
         assert_eq!(retry_record.kv("excludedSleep"), Some("0"));
+        assert_eq!(retry_record.kv("txnStartTS"), Some("4242"));
         assert!(retry_record.kv("totalSleep").is_some());
 
         let warn_record = records
             .iter()
             .find(|r| {
                 r.level == log::Level::Warn
-                    && r.message == "regionMiss backoffer.maxSleep 10ms is exceeded, errors:"
-                    && r.kv("error").is_some_and(|e| e.contains(marker))
+                    && r.message
+                        .starts_with("regionMiss backoffer.maxSleep 10ms is exceeded, errors:")
+                    && r.message.contains(marker)
             })
             .expect("expected backoffer.maxSleep warn log");
-        assert_eq!(warn_record.kv("type"), Some("regionMiss"));
-        assert_eq!(warn_record.kv("maxSleep"), Some("10"));
-        assert_eq!(warn_record.kv("excludedSleep"), Some("0"));
-        assert_eq!(warn_record.kv("longestSleepType"), Some("regionMiss"));
-        assert_eq!(
-            warn_record.kv("totalSleep"),
-            Some(b.total_sleep_ms().to_string().as_str())
+        assert!(
+            warn_record.kvs.is_empty(),
+            "backoffer.maxSleep WARN must have no KV fields, got {:?}",
+            warn_record.kvs
         );
-        assert_eq!(
-            warn_record.kv("longestSleepMs"),
-            Some(b.total_sleep_ms().to_string().as_str())
+        let expected_err_prefix = format!("{marker} at ");
+        assert!(
+            warn_record.message.contains(&expected_err_prefix),
+            "expected recorded error with timestamp in {:?}",
+            warn_record.message
+        );
+        let total_ms = b.total_sleep_ms();
+        let expected_summary = format!(
+            "\ntotal-backoff-times: 3, backoff-detail: regionMiss:3, maxBackoffTimeExceeded: true, maxExcludedTimeExceeded: false\nlongest sleep type: regionMiss, time: {total_ms}ms"
+        );
+        assert!(
+            warn_record.message.ends_with(&expected_summary),
+            "unexpected maxSleep WARN message: {:?}",
+            warn_record.message
         );
     }
 
@@ -930,6 +1107,22 @@ mod test {
             .unwrap();
 
         let records = crate::util::log::test_logger::since(start);
+        let backoff_record = records
+            .iter()
+            .find(|r| {
+                r.level == log::Level::Debug
+                    && r.message == "backoff"
+                    && r.kv("base") == Some("10")
+                    && r.kv("attempts") == Some("0")
+            })
+            .expect("expected 'backoff' debug log for txnLockFast");
+        let sleep_ms: u64 = backoff_record
+            .kv("sleep")
+            .expect("sleep kv")
+            .parse()
+            .unwrap();
+        assert!((5..10).contains(&sleep_ms), "unexpected sleep {sleep_ms}");
+
         let retry_record = records
             .iter()
             .find(|r| {
@@ -942,5 +1135,74 @@ mod test {
         assert_eq!(retry_record.kv("maxSleep"), Some("100"));
         assert_eq!(retry_record.kv("totalSleep"), Some("1"));
         assert_eq!(retry_record.kv("excludedSleep"), Some("0"));
+        assert_eq!(retry_record.kv("txnStartTS"), Some("None"));
+    }
+
+    #[test]
+    fn test_format_max_sleep_exceeded_msg_truncation_and_fields() {
+        let mut backoff_times = [0u32; BACKOFF_COUNT];
+        backoff_times[BackoffType::RegionMiss as usize] = 3;
+        backoff_times[BackoffType::TikvRpc as usize] = 2;
+        let errors = vec![
+            "err-1 at 2026-01-01T00:00:01Z".to_owned(),
+            "err-2 at 2026-01-01T00:00:02Z".to_owned(),
+            "err-3 at 2026-01-01T00:00:03Z".to_owned(),
+            "err-4 at 2026-01-01T00:00:04Z".to_owned(),
+            "err-5 at 2026-01-01T00:00:05Z".to_owned(),
+        ];
+
+        let non_debug = format_max_sleep_exceeded_msg(
+            Some(BackoffType::TikvRpc),
+            200,
+            250,
+            0,
+            &backoff_times,
+            &errors,
+            Some((BackoffType::TikvRpc, 210)),
+            false,
+        );
+        assert_eq!(
+            non_debug,
+            "tikvRPC backoffer.maxSleep 200ms is exceeded, errors:\n\
+             err-3 at 2026-01-01T00:00:03Z\n\
+             err-4 at 2026-01-01T00:00:04Z\n\
+             err-5 at 2026-01-01T00:00:05Z\n\
+             total-backoff-times: 5, backoff-detail: tikvRPC:2, regionMiss:3, maxBackoffTimeExceeded: true, maxExcludedTimeExceeded: false\n\
+             longest sleep type: tikvRPC, time: 210ms"
+        );
+
+        let with_debug = format_max_sleep_exceeded_msg(
+            Some(BackoffType::TikvRpc),
+            200,
+            250,
+            0,
+            &backoff_times,
+            &errors,
+            Some((BackoffType::TikvRpc, 210)),
+            true,
+        );
+        assert!(with_debug.contains("err-1 at 2026-01-01T00:00:01Z\n"));
+        assert!(with_debug.contains("err-2 at 2026-01-01T00:00:02Z\n"));
+        assert!(with_debug.contains("err-5 at 2026-01-01T00:00:05Z\n"));
+
+        // Excluded limit exceeded with no non-excluded longest sleep omits longest line.
+        let mut busy_times = [0u32; BACKOFF_COUNT];
+        busy_times[BackoffType::ServerBusy as usize] = 1;
+        let excluded = format_max_sleep_exceeded_msg(
+            Some(BackoffType::ServerBusy),
+            100,
+            SERVER_BUSY_EXCLUDED_MS,
+            SERVER_BUSY_EXCLUDED_MS,
+            &busy_times,
+            &errors[..1],
+            None,
+            false,
+        );
+        assert_eq!(
+            excluded,
+            "tikvServerBusy backoffer.maxSleep 100ms is exceeded, errors:\n\
+             err-1 at 2026-01-01T00:00:01Z\n\
+             total-backoff-times: 1, backoff-detail: tikvServerBusy:1, maxBackoffTimeExceeded: false, maxExcludedTimeExceeded: true"
+        );
     }
 }

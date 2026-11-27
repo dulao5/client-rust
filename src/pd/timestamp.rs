@@ -33,7 +33,7 @@ use tonic::transport::Channel;
 use crate::internal_err;
 use crate::proto::pdpb::pd_client::PdClient;
 use crate::proto::pdpb::*;
-use crate::util::log::format_go_duration;
+use crate::util::log::GoDuration;
 use crate::Result;
 
 /// It is an empirical value.
@@ -87,6 +87,14 @@ impl TimestampOracle {
         Ok(TimestampOracle { request_tx })
     }
 
+    /// Fetch a timestamp from PD.
+    ///
+    /// Unlike `client-go`'s `pdOracle` (which exposes both synchronous `GetTimestamp`, logging
+    /// `"get timestamp too slow"` above `30ms`, and pipelined `GetTimestampAsync` / `tsFuture`,
+    /// plus `GetMinTS` for `"get minimum timestamp too slow"`), `client-rust` routes every
+    /// timestamp fetch (`current_timestamp`, transaction begin, commit, lock wait, and
+    /// low-resolution refresh) through this single synchronous path and does not implement
+    /// `GetTimestampAsync` or `GetMinTS`.
     pub(crate) async fn get_timestamp(self) -> Result<Timestamp> {
         debug!("getting current timestamp");
         let start = std::time::Instant::now();
@@ -111,8 +119,7 @@ impl TimestampOracle {
 
 fn log_slow_tso(elapsed: Duration) {
     if elapsed > SLOW_TSO_THRESHOLD {
-        let cost = format_go_duration(elapsed);
-        warn!("cost time" = cost.as_str(); "get timestamp too slow");
+        warn!("cost time":% = GoDuration(elapsed); "get timestamp too slow");
     }
 }
 
@@ -200,9 +207,8 @@ async fn run_tso(
                     let next = match tokio::time::timeout(wait, responses.next()).await {
                         Ok(next) => next,
                         Err(_) if oldest.is_some() => {
-                            let timeout = format_go_duration(TSO_BATCH_DEADLINE);
                             warn!(
-                                timeout = timeout.as_str();
+                                timeout:% = GoDuration(TSO_BATCH_DEADLINE);
                                 "TSO stream: no answer within deadline; reopening it"
                             );
                             break;
@@ -268,8 +274,7 @@ async fn run_tso(
         let backoff = STREAM_RETRY_BASE
             .saturating_mul(1 << failures.min(10))
             .min(STREAM_RETRY_CAP);
-        let backoff_str = format_go_duration(backoff);
-        info!(backoff = backoff_str.as_str(); "reopening the TSO stream");
+        info!(backoff:% = GoDuration(backoff); "reopening the TSO stream");
         tokio::time::sleep(backoff).await;
     }
 }

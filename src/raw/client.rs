@@ -5,7 +5,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use log::debug;
-use tokio::time::sleep;
 
 use crate::backoff::{DEFAULT_REGION_BACKOFF, DEFAULT_STORE_BACKOFF};
 use crate::common::Error;
@@ -833,14 +832,16 @@ impl<PdC: PdClient> Client<PdC> {
                         let status =
                             plan::handle_region_error(self.rpc.clone(), err.clone(), store.clone())
                                 .await?;
-                        if status {
-                            continue;
-                        } else if let Some(duration) = scan_args.backoff.next_delay_duration() {
-                            sleep(duration).await;
-                            continue;
-                        } else {
-                            return Err(RegionError(Box::new(err)));
+                        if !status {
+                            scan_args
+                                .backoff
+                                .backoff(
+                                    crate::metrics::BackoffType::RegionMiss,
+                                    RegionError(Box::new(err)),
+                                )
+                                .await?;
                         }
+                        continue;
                     }
                     Ok((Some(r), region.end_key()))
                 }

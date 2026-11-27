@@ -228,6 +228,9 @@ impl<PdC: PdClient> CopSender<PdC> {
         mut req: coprocessor::Request,
         timeout: Duration,
     ) -> Result<CopSendResult> {
+        if bo.txn_start_ts().is_none() {
+            bo.set_txn_start_ts(self.timestamp.version());
+        }
         req.context.get_or_insert_with(Default::default).api_version =
             self.keyspace.api_version().into();
         loop {
@@ -369,6 +372,9 @@ impl<PdC: PdClient> CopSender<PdC> {
     /// waits for a live lock (`BackoffWithMaxSleepTxnLockFast(msBeforeExpired)`), all charged
     /// to `bo`.
     pub async fn resolve_lock(&self, bo: &mut Backoff, lock: kvrpcpb::LockInfo) -> Result<()> {
+        if bo.txn_start_ts().is_none() {
+            bo.set_txn_start_ts(self.timestamp.version());
+        }
         let read = resolve_locks_for_read(
             expand_shared_lock(lock),
             self.timestamp.clone(),
@@ -381,10 +387,9 @@ impl<PdC: PdClient> CopSender<PdC> {
         self.lock_hints.record(self.timestamp.version(), &read);
         if !read.live.is_empty() {
             let mut lock_backoff = LockBackoff::new(bo.clone());
-            match lock_backoff.next_wait(read.ms_before_expired) {
-                Some(wait) => wait.wait(self.pd_client.clone()).await?,
-                None => return Err(lock_backoff.exhausted(Error::ResolveLockError(read.live))),
-            }
+            lock_backoff
+                .wait_or_exhausted(read.ms_before_expired, self.pd_client.clone(), read.live)
+                .await?;
         }
         Ok(())
     }

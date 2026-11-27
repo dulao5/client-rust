@@ -137,7 +137,7 @@ impl StoreLiveness {
                 if let Some(liveness) = result.filter(|l| *l != Liveness::Reachable) {
                     if entry.state == Liveness::Reachable {
                         info!(
-                            store_id = store_id,
+                            storeID = store_id,
                             liveness:? = liveness;
                             "[health check] store is not reachable, start its health check loop"
                         );
@@ -190,16 +190,15 @@ impl Inner {
                 };
                 match result {
                     Some(Liveness::Reachable) | None => {
-                        let status = if result.is_some() {
-                            "reachable"
+                        if result.is_some() {
+                            info!(storeID = store_id; "[health check] store became reachable");
                         } else {
-                            "invalid (tombstone)"
-                        };
-                        info!(
-                            store_id = store_id,
-                            status = status;
-                            "[health check] stop store health check loop"
-                        );
+                            info!(
+                                storeID = store_id,
+                                state = "tombstone";
+                                "[health check] store is invalid(tombstone or removed), stop checking"
+                            );
+                        }
                         entry.state = Liveness::Reachable;
                         if entry.probe.is_none() {
                             stores.remove(&store_id);
@@ -231,6 +230,22 @@ pub(crate) const HEALTH_CHECK_PATH: &str = "/grpc.health.v1.Health/Check";
 pub(crate) const SERVING_STATUS_UNKNOWN: i32 = 0;
 pub(crate) const SERVING_STATUS_SERVING: i32 = 1;
 pub(crate) const SERVING_STATUS_SERVICE_UNKNOWN: i32 = 3;
+
+/// Zero-allocation formatter for `grpc.health.v1.HealthCheckResponse.ServingStatus` matching
+/// Go's `zap.Stringer("status", status)` (`internal/locate/store_cache.go:785`).
+pub(crate) struct ServingStatusDisplay(pub(crate) i32);
+
+impl std::fmt::Display for ServingStatusDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            SERVING_STATUS_UNKNOWN => f.write_str("UNKNOWN"),
+            SERVING_STATUS_SERVING => f.write_str("SERVING"),
+            2 => f.write_str("NOT_SERVING"),
+            SERVING_STATUS_SERVICE_UNKNOWN => f.write_str("SERVICE_UNKNOWN"),
+            other => write!(f, "{other}"),
+        }
+    }
+}
 
 /// client-go `invokeKVStatusAPI`'s reading of a health response.
 pub(crate) fn liveness_of_status(status: i32) -> Liveness {

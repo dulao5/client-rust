@@ -97,19 +97,26 @@ impl<PdC: PdClient, P: Plan, Ph: PlanBuilderPhase> PlanBuilder<PdC, P, Ph> {
     pub fn resolve_lock(
         self,
         timestamp: Timestamp,
-        backoff: Backoff,
+        mut backoff: Backoff,
         keyspace: Keyspace,
     ) -> PlanBuilder<PdC, ResolveLock<P, PdC>, Ph>
     where
         P::Result: HasLocks,
     {
+        use crate::timestamp::TimestampExt;
+        let txn_start_ts = timestamp.version();
+        if backoff.txn_start_ts().is_none() {
+            backoff.set_txn_start_ts(txn_start_ts);
+        }
+        let mut region_backoff = DEFAULT_REGION_BACKOFF;
+        region_backoff.set_txn_start_ts(txn_start_ts);
         PlanBuilder {
             pd_client: self.pd_client.clone(),
             plan: ResolveLock {
                 inner: self.plan,
                 timestamp,
                 backoff,
-                region_backoff: DEFAULT_REGION_BACKOFF,
+                region_backoff,
                 pd_client: self.pd_client,
                 keyspace,
                 read_hints: None,
@@ -306,7 +313,11 @@ where
     /// a TiKV is down does not fail the read after a fixed ~1.5 s (tidb-rs
     /// `client-go-parity.md` P0-1).
     #[must_use]
-    pub fn lock_region_backoff(mut self, backoff: Backoff) -> Self {
+    pub fn lock_region_backoff(mut self, mut backoff: Backoff) -> Self {
+        use crate::timestamp::TimestampExt;
+        if backoff.txn_start_ts().is_none() {
+            backoff.set_txn_start_ts(self.plan.timestamp.version());
+        }
         self.plan.region_backoff = backoff;
         self
     }

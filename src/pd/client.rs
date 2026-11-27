@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use async_trait::async_trait;
 use futures::prelude::*;
 use futures::stream::BoxStream;
-use log::info;
+use log::{info, warn};
 use tokio::sync::RwLock;
 
 use crate::compat::stream_fn;
@@ -314,7 +314,7 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
                     let store = match region_cache.get_store_by_id(store_id).await {
                         Ok(store) => store,
                         Err(e) => {
-                            info!(store_id = store_id, error:? = e; "[health check] failed to resolve store");
+                            warn!(error:% = e; "[health check] failed to re-resolve unhealthy store");
                             return Some(Liveness::Unknown);
                         }
                     };

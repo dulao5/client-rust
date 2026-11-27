@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 
 use crate::backoff::Backoff;
+use crate::backoff::BackoffStep;
 use crate::backoff::DEFAULT_REGION_BACKOFF;
 use crate::kv::HexRepr;
 use crate::pd::LowResolutionTs;
@@ -30,7 +31,6 @@ use crate::proto::kvrpcpb;
 use crate::proto::kvrpcpb::TxnInfo;
 use crate::proto::pdpb::Timestamp;
 use crate::region::RegionVerId;
-use crate::request::plan::handle_region_error;
 use crate::request::plan::is_grpc_error;
 use crate::request::CollectSingle;
 use crate::request::Keyspace;
@@ -47,9 +47,67 @@ use crate::transaction::requests::TransactionStatusKind;
 use crate::Error;
 use crate::Result;
 
-pub(crate) fn format_key_for_log(key: &[u8]) -> String {
-    let prefix_len = key.len().min(16);
-    format!("len={}, prefix={}", key.len(), HexRepr(&key[..prefix_len]))
+struct GoLockDisplay<'a>(&'a kvrpcpb::LockInfo);
+
+impl std::fmt::Display for GoLockDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let l = self.0;
+        let lock_type = kvrpcpb::Op::try_from(l.lock_type)
+            .map(|op| op.as_str_name())
+            .unwrap_or("Unknown");
+        write!(
+            f,
+            "key: {}, primary: {}, txnStartTS: {}, lockForUpdateTS:{}, minCommitTs:{}, ttl: {}, type: {}, UseAsyncCommit: {}, txnSize: {}",
+            HexRepr(&l.key),
+            HexRepr(&l.primary_lock),
+            l.lock_version,
+            l.lock_for_update_ts,
+            l.min_commit_ts,
+            l.lock_ttl,
+            lock_type,
+            l.use_async_commit,
+            l.txn_size,
+        )
+    }
+}
+
+struct GoTxnStatusDisplay<'a>(&'a TransactionStatus);
+
+impl std::fmt::Display for GoTxnStatusDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (ttl, commit_ts) = match &self.0.kind {
+            TransactionStatusKind::Committed(ts) => (0, ts.version()),
+            TransactionStatusKind::RolledBack => (0, 0),
+            TransactionStatusKind::Locked(ttl, _) => (*ttl, 0),
+        };
+        write!(
+            f,
+            "ttl:{ttl} commit_ts:{commit_ts} action: {}",
+            self.0.action.as_str_name()
+        )
+    }
+}
+
+struct ResolveLockErrorDisplay<'a> {
+    key_err: &'a kvrpcpb::KeyError,
+    key: &'a [u8],
+    start_version: u64,
+    commit_version: u64,
+    is_txn_file: bool,
+}
+
+impl std::fmt::Display for ResolveLockErrorDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unexpected resolve err: {:?}, lock: {{key: {}, start_version: {}, commit_version: {}, is_txn_file: {}}}",
+            self.key_err,
+            HexRepr(self.key),
+            self.start_version,
+            self.commit_version,
+            self.is_txn_file,
+        )
+    }
 }
 
 /// Refuse to resolve a SHARED lock wrapper, as client-go does (`resolveLocks` /
@@ -214,15 +272,10 @@ pub(crate) struct LockBackoff {
     /// What is left of the current step, if one is open.
     step_left: Option<Duration>,
     zero_streak: u32,
+    pending_step: Option<BackoffStep>,
 }
 
 impl LockBackoff {
-    /// The error to return when the lock backoff gives up after `error`
-    /// ([`Backoff::exhausted`]).
-    pub(crate) fn exhausted(&self, error: Error) -> Error {
-        self.backoff.exhausted(error)
-    }
-
     /// The sleep of a round that refreshes the low-resolution timestamp.
     pub(crate) const REFRESH_SLEEP: Duration = Duration::from_millis(1);
 
@@ -232,7 +285,39 @@ impl LockBackoff {
             backoff,
             step_left: None,
             zero_streak: 0,
+            pending_step: None,
         }
+    }
+
+    /// Wait according to `ms_before_expired`, emitting `"backoff"` / `"retry later"` logs and
+    /// updating the budget, or return the exhausted error when no wait remains.
+    pub(crate) async fn wait_or_exhausted(
+        &mut self,
+        ms_before_expired: i64,
+        pd_client: Arc<impl PdClient>,
+        live_locks: Vec<kvrpcpb::LockInfo>,
+    ) -> Result<()> {
+        let Some(wait) = self.next_wait(ms_before_expired) else {
+            return Err(self.backoff.exhausted_for(
+                Some(BackoffType::TikvLockFast),
+                Error::ResolveLockError(live_locks),
+            ));
+        };
+        if !wait.sleep.is_zero() {
+            let err = Error::ResolveLockError(live_locks);
+            if let Some(step) = self.pending_step.take() {
+                Backoff::log_backoff_step(&step);
+            }
+            self.backoff.record_error(&err);
+            metrics::backoff(BackoffType::TikvLockFast, wait.sleep);
+            sleep(wait.sleep).await;
+            self.backoff
+                .log_retry_later(BackoffType::TikvLockFast, &err);
+        }
+        if wait.refresh_ts {
+            pd_client.get_timestamp().await?;
+        }
+        Ok(())
     }
 
     /// What to do before the next retry, or `None` when the budget is spent.
@@ -266,13 +351,19 @@ impl LockBackoff {
             // client-go `BackoffWithMaxSleepTxnLockFast(msBeforeExpired)`: the `txnLockFast`
             // curve, capped, and the capped sleep charged to the read's shared budget
             // (backoff.go:127). No steps to keep: the budget is time.
-            return self
+            let step = self
                 .backoff
-                .next_delay_capped(BackoffType::TikvLockFast, Some(cap));
+                .next_step(BackoffType::TikvLockFast, Some(cap))?;
+            self.pending_step = Some(step);
+            return Some(step.delay);
         }
         let left = match self.step_left {
             Some(left) => left,
-            None => self.backoff.next_delay_duration()?,
+            None => {
+                let step = self.backoff.next_delay_duration_with_meta()?;
+                self.pending_step = Some(step);
+                step.delay
+            }
         };
         let sleep = left.min(cap);
         let rest = left - sleep;
@@ -288,21 +379,6 @@ pub(crate) struct LockWait {
     pub sleep: Duration,
     /// Fetch a TSO before retrying, which refreshes the low-resolution timestamp.
     pub refresh_ts: bool,
-}
-
-impl LockWait {
-    /// Sleep, refresh the low-resolution timestamp if asked, and record the backoff metric.
-    // glue: the retry wait of a read that met live locks
-    pub(crate) async fn wait(self, pd_client: Arc<impl PdClient>) -> Result<()> {
-        if !self.sleep.is_zero() {
-            metrics::backoff(BackoffType::TikvLockFast, self.sleep);
-            sleep(self.sleep).await;
-        }
-        if self.refresh_ts {
-            pd_client.get_timestamp().await?;
-        }
-        Ok(())
-    }
 }
 
 /// The lock hints of a snapshot or of one coprocessor request: client-go's pair of
@@ -705,6 +781,7 @@ fn resolve_in_background(
 ) {
     let start_version = lock.lock_version;
     let is_txn_file = lock.is_txn_file;
+    let lock_for_log = lock.clone();
     let plan = ResolvePlan::new(lock, keys, lite);
     tokio::spawn(async move {
         let mut regions = HashSet::new();
@@ -723,9 +800,9 @@ fn resolve_in_background(
             .await
             {
                 info!(
-                    start_ts = start_version,
-                    commit_ts = commit_version,
-                    error:? = e;
+                    lock:% = GoLockDisplay(&lock_for_log),
+                    commitTS = commit_version,
+                    error:% = e;
                     "failed to resolve lock asynchronously"
                 );
                 return;
@@ -810,14 +887,13 @@ async fn resolve_lock_with_retry(
                 Ok(plan_builder) => plan_builder,
                 Err(Error::LeaderNotFound { region }) => {
                     pd_client.invalidate_region_cache(region.clone()).await;
-                    match backoff.next_delay_for(BackoffType::RegionScheduling) {
-                        Some(duration) => {
-                            metrics::backoff(BackoffType::RegionScheduling, duration);
-                            sleep(duration).await;
-                            continue;
-                        }
-                        None => return Err(backoff.exhausted(Error::LeaderNotFound { region })),
-                    }
+                    backoff
+                        .backoff(
+                            BackoffType::RegionScheduling,
+                            Error::LeaderNotFound { region },
+                        )
+                        .await?;
+                    continue;
                 }
                 Err(err) => return Err(err),
             };
@@ -841,51 +917,47 @@ async fn resolve_lock_with_retry(
             // a popped element.
             Err(Error::MultipleRegionErrors(mut errors)) => match errors.pop() {
                 Some(Error::RegionError(e)) => {
-                    match backoff.next_delay_for(metrics::backoff_type_for_region_error(&e)) {
-                        Some(duration) => {
-                            let backoff_type = metrics::backoff_type_for_region_error(&e);
-                            let region_error_resolved =
-                                handle_region_error(pd_client.clone(), *e, store.clone()).await?;
-                            if !region_error_resolved {
-                                metrics::backoff(backoff_type, duration);
-                                sleep(duration).await;
-                            }
-                            continue;
-                        }
-                        None => return Err(backoff.exhausted(Error::RegionError(e))),
-                    }
+                    crate::request::plan::retry_on_region_error(
+                        pd_client.clone(),
+                        &mut backoff,
+                        *e,
+                        store.clone(),
+                        false,
+                        || {},
+                    )
+                    .await?;
+                    continue;
                 }
                 Some(e) => return Err(e),
                 None => unreachable!(),
             },
             Err(Error::MultipleKeyErrors(mut errors)) => match errors.pop() {
                 Some(Error::KeyError(key_err)) => {
-                    // Keyspace is not truncated here because we need full key info for logging.
-                    let formatted_key = format_key_for_log(key);
                     error!(
-                        error:? = key_err,
-                        key = formatted_key.as_str(),
-                        start_version = start_version,
-                        commit_version = commit_version,
-                        is_txn_file = is_txn_file;
-                        "resolve_lock error: unexpected resolve error"
+                        error:% = ResolveLockErrorDisplay {
+                            key_err: &key_err,
+                            key: key.as_ref(),
+                            start_version,
+                            commit_version,
+                            is_txn_file,
+                        };
+                        "resolveLock error"
                     );
                     return Err(Error::KeyError(key_err));
                 }
                 Some(e) => return Err(e),
                 None => unreachable!(),
             },
-            Err(e) if is_grpc_error(&e) => match backoff.next_delay_for(BackoffType::TikvRpc) {
-                Some(duration) => {
+            Err(e) if is_grpc_error(&e) => match backoff.next_step(BackoffType::TikvRpc, None) {
+                Some(step) => {
                     pd_client.invalidate_region_cache(ver_id.clone()).await;
                     if let Ok(store_id) = store.region_with_leader.get_store_id() {
                         pd_client.invalidate_store_cache(store_id).await;
                     }
-                    metrics::backoff(BackoffType::TikvRpc, duration);
-                    sleep(duration).await;
+                    backoff.finish_step(BackoffType::TikvRpc, step, &e).await;
                     continue;
                 }
-                None => return Err(backoff.exhausted(e)),
+                None => return Err(backoff.exhausted_for(Some(BackoffType::TikvRpc), e)),
             },
             Err(e) => return Err(e),
         }
@@ -961,8 +1033,8 @@ impl LockResolverState {
     pub fn save_resolved(&self, txn_id: u64, status: Arc<TransactionStatus>) {
         if !status.is_determined() {
             error!(
-                txn_id = txn_id,
-                status:? = status;
+                txnID = txn_id,
+                status:% = GoTxnStatusDisplay(&status);
                 "unexpected undetermined status saved to cache"
             );
             panic!("unexpected undetermined status saved to cache");
@@ -971,9 +1043,9 @@ impl LockResolverState {
         if let Some(saved) = cache.map.get(&txn_id) {
             if !saved.has_same_determined_status(&status) {
                 error!(
-                    txn_id = txn_id,
-                    existing:? = saved,
-                    new:? = status;
+                    txnID = txn_id,
+                    "existing status":% = GoTxnStatusDisplay(saved),
+                    "new status":% = GoTxnStatusDisplay(&status);
                     "unexpected txn status saving to the cache, the existing status is not equal to the new one"
                 );
                 panic!("unexpected txn status saved to cache with existing different entry");
@@ -1567,9 +1639,9 @@ impl LockResolver {
                     let current = low_resolution_timestamp(pd_client.clone()).await?;
                     if lock_until_expired_ms(lock.lock_version, lock.lock_ttl, current) <= 0 {
                         warn!(
-                            lock:? = lock,
-                            caller_start_ts = caller_start_ts,
-                            current_ts = current_ts;
+                            CallerStartTs = caller_start_ts,
+                            "lock str":% = GoLockDisplay(lock),
+                            status = "ttl:0 commit_ts:0 action: NoAction";
                             "lock txn not found, lock has expired"
                         );
                         rollback_if_not_exist = true;
@@ -1583,12 +1655,10 @@ impl LockResolver {
                         return Ok(Arc::new(status));
                     }
 
-                    if let Some(duration) = backoff.next_delay_for(BackoffType::TxnNotFound) {
-                        metrics::backoff(BackoffType::TxnNotFound, duration);
-                        sleep(duration).await;
-                        continue;
-                    }
-                    return Err(backoff.exhausted(Error::TxnNotFound(txn_not_found)));
+                    backoff
+                        .backoff(BackoffType::TxnNotFound, Error::TxnNotFound(txn_not_found))
+                        .await?;
+                    continue;
                 }
                 Err(err) => return Err(err),
             }
@@ -3284,16 +3354,193 @@ mod tests {
     }
 
     #[test]
-    fn format_key_for_log_hex_encodes_the_prefix() {
-        assert_eq!(format_key_for_log(b"hello"), "len=5, prefix=68656C6C6F");
+    fn go_lock_and_status_display_match_client_go() {
+        let lock = kvrpcpb::LockInfo {
+            key: b"k1".to_vec(),
+            primary_lock: b"pk".to_vec(),
+            lock_version: 100,
+            lock_ttl: 3000,
+            txn_size: 4,
+            lock_type: kvrpcpb::Op::Put as i32,
+            use_async_commit: true,
+            lock_for_update_ts: 200,
+            min_commit_ts: 300,
+            ..Default::default()
+        };
+        assert_eq!(
+            GoLockDisplay(&lock).to_string(),
+            "key: 6B31, primary: 706B, txnStartTS: 100, lockForUpdateTS:200, minCommitTs:300, ttl: 3000, type: Put, UseAsyncCommit: true, txnSize: 4"
+        );
+        let status = TransactionStatus {
+            kind: TransactionStatusKind::Committed(Timestamp::from_version(55)),
+            action: kvrpcpb::Action::MinCommitTsPushed,
+            is_expired: false,
+        };
+        assert_eq!(
+            GoTxnStatusDisplay(&status).to_string(),
+            "ttl:0 commit_ts:55 action: MinCommitTSPushed"
+        );
     }
 
-    #[test]
-    fn format_key_for_log_truncates_the_prefix_to_16_bytes() {
-        let key: Vec<u8> = (0u8..20).collect();
-        assert_eq!(
-            format_key_for_log(&key),
-            "len=20, prefix=000102030405060708090A0B0C0D0E0F"
-        );
+    #[tokio::test]
+    async fn test_lock_resolver_emits_aligned_go_logs() {
+        // 1. ResolveLock key error -> "resolveLock error"
+        let start = crate::util::log::test_logger::checkpoint();
+        let err_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.is::<kvrpcpb::ResolveLockRequest>() {
+                    return Ok(Box::new(kvrpcpb::ResolveLockResponse {
+                        error: Some(kvrpcpb::KeyError {
+                            abort: "resolve-key-err-99".to_owned(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                panic!("unexpected request");
+            },
+        )));
+        let mut clean_regions = HashSet::new();
+        let res = resolve_lock_with_retry(
+            &Key::from(b"k1".to_vec()),
+            10,
+            20,
+            false,
+            true,
+            err_client,
+            Keyspace::Disable,
+            Backoff::no_backoff(),
+            &mut clean_regions,
+        )
+        .await;
+        assert!(matches!(res, Err(Error::KeyError(_))));
+        let records = crate::util::log::test_logger::since(start);
+        assert!(records.iter().any(|r| {
+            r.level == log::Level::Error
+                && r.message == "resolveLock error"
+                && r.kv("error").is_some_and(|e| {
+                    e.contains("unexpected resolve err:") && e.contains("key: 6B31")
+                })
+        }));
+
+        // 2. Expired TxnNotFound -> "lock txn not found, lock has expired" with Go keys
+        let start = crate::util::log::test_logger::checkpoint();
+        let expired_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                let req = req
+                    .downcast_ref::<kvrpcpb::CheckTxnStatusRequest>()
+                    .unwrap();
+                if !req.rollback_if_not_exist {
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        error: Some(kvrpcpb::KeyError {
+                            txn_not_found: Some(kvrpcpb::TxnNotFound::default()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                Ok(Box::<kvrpcpb::CheckTxnStatusResponse>::default() as Box<dyn Any>)
+            },
+        )));
+        let expired_lock = kvrpcpb::LockInfo {
+            key: b"k2".to_vec(),
+            primary_lock: b"pk2".to_vec(),
+            lock_version: EXPIRED_TXN_VERSION,
+            lock_ttl: 1,
+            lock_type: kvrpcpb::Op::Put as i32,
+            ..Default::default()
+        };
+        let mut resolver = LockResolver::new(ResolveLocksContext::default());
+        resolver
+            .get_txn_status_from_lock(
+                Backoff::no_backoff(),
+                &expired_lock,
+                777,
+                1000,
+                false,
+                expired_client,
+                Keyspace::Disable,
+            )
+            .await
+            .unwrap();
+        let records = crate::util::log::test_logger::since(start);
+        assert!(records.iter().any(|r| {
+            r.level == log::Level::Warn
+                && r.message == "lock txn not found, lock has expired"
+                && r.kv("CallerStartTs") == Some("777")
+                && r.kv("lock str").is_some_and(|s| s.contains("key: 6B32"))
+                && r.kv("status") == Some("ttl:0 commit_ts:0 action: NoAction")
+        }));
+
+        // 3. Unexpired TxnNotFound backoff -> "retry later" with txnStartTS + maxSleep WARN
+        let start = crate::util::log::test_logger::checkpoint();
+        let live_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.is::<kvrpcpb::CheckTxnStatusRequest>() {
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        error: Some(kvrpcpb::KeyError {
+                            txn_not_found: Some(kvrpcpb::TxnNotFound {
+                                start_ts: 42,
+                                primary_key: b"pk3".to_vec(),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                panic!("unexpected request");
+            },
+        )));
+        let unexpired_lock = kvrpcpb::LockInfo {
+            key: b"k3".to_vec(),
+            primary_lock: b"pk3".to_vec(),
+            lock_version: u64::MAX - (1 << 18),
+            lock_ttl: 60_000,
+            lock_type: kvrpcpb::Op::Put as i32,
+            ..Default::default()
+        };
+        let mut resolver = LockResolver::new(ResolveLocksContext::default());
+        let err = resolver
+            .get_txn_status_from_lock(
+                Backoff::time_budget(6).start().with_txn_start_ts(5555),
+                &unexpired_lock,
+                5555,
+                6000,
+                false,
+                live_client.clone(),
+                Keyspace::Disable,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::BackoffExhausted { .. }));
+        let records = crate::util::log::test_logger::since(start);
+        assert!(records.iter().any(|r| {
+            r.level == log::Level::Debug
+                && r.message == "retry later"
+                && r.kv("type") == Some("txnNotFound")
+                && r.kv("txnStartTS") == Some("5555")
+        }));
+        assert!(records.iter().any(|r| {
+            r.level == log::Level::Warn
+                && r.message
+                    .starts_with("txnNotFound backoffer.maxSleep 6ms is exceeded, errors:")
+                && r.kvs.is_empty()
+        }));
+
+        // 4. LockBackoff::wait_or_exhausted -> "retry later" for txnLockFast with txnStartTS
+        let start = crate::util::log::test_logger::checkpoint();
+        let mut lock_bo =
+            LockBackoff::new(Backoff::time_budget(50).start().with_txn_start_ts(6666));
+        lock_bo
+            .wait_or_exhausted(5, live_client, vec![unexpired_lock])
+            .await
+            .unwrap();
+        let records = crate::util::log::test_logger::since(start);
+        assert!(records.iter().any(|r| {
+            r.level == log::Level::Debug
+                && r.message == "retry later"
+                && r.kv("type") == Some("txnLockFast")
+                && r.kv("txnStartTS") == Some("6666")
+        }));
     }
 }

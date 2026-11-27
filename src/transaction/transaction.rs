@@ -13,6 +13,7 @@ use log::{debug, error, info, trace, warn};
 use tokio::time::Duration;
 
 use crate::backoff::Backoff;
+use crate::kv::HexRepr;
 use crate::pd::PdClient;
 use crate::pd::PdRpcClient;
 use crate::proto::kvrpcpb;
@@ -30,9 +31,9 @@ use crate::request::RetryOptions;
 use crate::request::TruncateKeyspace;
 use crate::timestamp::TimestampExt;
 use crate::transaction::buffer::Buffer;
-use crate::transaction::lock::format_key_for_log;
 use crate::transaction::lowering::*;
 use crate::transaction::ReadLockHints;
+use crate::util::log::GoDuration;
 use crate::BoundRange;
 use crate::Error;
 use crate::Key;
@@ -104,10 +105,29 @@ impl<PdC: PdClient> Transaction<PdC> {
     pub(crate) fn new(
         timestamp: Timestamp,
         rpc: Arc<PdC>,
-        options: TransactionOptions,
+        mut options: TransactionOptions,
         keyspace: Keyspace,
     ) -> Transaction<PdC> {
         let timestamp_version = timestamp.version();
+        if timestamp_version != u64::MAX {
+            if options
+                .retry_options
+                .region_backoff
+                .txn_start_ts()
+                .is_none()
+            {
+                options
+                    .retry_options
+                    .region_backoff
+                    .set_txn_start_ts(timestamp_version);
+            }
+            if options.retry_options.lock_backoff.txn_start_ts().is_none() {
+                options
+                    .retry_options
+                    .lock_backoff
+                    .set_txn_start_ts(timestamp_version);
+            }
+        }
         let status = if options.read_only {
             TransactionStatus::ReadOnly
         } else {
@@ -747,11 +767,10 @@ impl<PdC: PdClient> Transaction<PdC> {
 
         if let Ok(commit_ts) = &res {
             self.set_status(TransactionStatus::Committed);
-            let elapsed = crate::util::log::format_go_duration(self.start_instant.elapsed());
             debug!(
                 start_ts = self.timestamp.version(),
                 commit_ts:? = commit_ts.as_ref().map(|ts| ts.version()),
-                elapsed = elapsed.as_str();
+                elapsed:% = GoDuration(self.start_instant.elapsed());
                 "transaction committed"
             );
         }
@@ -1063,10 +1082,9 @@ impl<PdC: PdClient> Transaction<PdC> {
         };
         let start_instant = self.start_instant;
         let keyspace = self.keyspace;
-        let interval = crate::util::log::format_go_duration(heartbeat_interval);
         debug!(
             start_ts = self.timestamp.version(),
-            interval = interval.as_str();
+            interval:% = GoDuration(heartbeat_interval);
             "starting auto-heartbeat"
         );
 
@@ -1214,10 +1232,9 @@ async fn get_at_max_ts<PdC: PdClient>(
         hints.record(u64::MAX, &outcome);
         if !outcome.live.is_empty() {
             // `bo.BackoffWithMaxSleepTxnLockFast(msBeforeExpired)` (snapshot.go:927).
-            match lock_backoff.next_wait(outcome.ms_before_expired) {
-                None => return Err(lock_backoff.exhausted(Error::ResolveLockError(outcome.live))),
-                Some(wait) => wait.wait(rpc.clone()).await?,
-            }
+            lock_backoff
+                .wait_or_exhausted(outcome.ms_before_expired, rpc.clone(), outcome.live)
+                .await?;
         }
     }
 }
@@ -1466,6 +1483,21 @@ impl Mutation {
     }
 }
 
+struct CommitTsExpiredHex<'a>(&'a kvrpcpb::CommitTsExpired);
+
+impl std::fmt::Display for CommitTsExpiredHex<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{StartTs:{} AttemptedCommitTs:{} Key:{} MinCommitTs:{}}}",
+            self.0.start_ts,
+            self.0.attempted_commit_ts,
+            HexRepr(&self.0.key),
+            self.0.min_commit_ts,
+        )
+    }
+}
+
 /// A struct wrapping the details of two-phase commit protocol (2PC).
 ///
 /// The two phases are `prewrite` and `commit`.
@@ -1549,7 +1581,11 @@ impl<PdC: PdClient> Committer<PdC> {
         };
         tokio::spawn(self.commit_secondary(commit_ts.clone()).map(|res| {
             if let Err(e) = res {
-                warn!(error:% = e; "failed to commit secondary keys");
+                debug!(
+                    "action type" = "commit",
+                    error:% = e;
+                    "2PC async doActionOnBatches"
+                );
             }
         }));
         Ok(Some(commit_ts))
@@ -1696,19 +1732,19 @@ impl<PdC: PdClient> Committer<PdC> {
                         if let Some(expired) = key_err.commit_ts_expired {
                             // Ref: https://github.com/tikv/client-go/blob/tidb-8.5/txnkv/transaction/commit.go
                             info!(
-                                start_ts = self.start_version.version();
-                                "2PC commit_ts rejected by TiKV, retry with a newer commit_ts"
+                                txnStartTS = self.start_version.version(),
+                                info:% = CommitTsExpiredHex(&expired);
+                                "2PC commitTS rejected by TiKV, retry with a newer commitTS"
                             );
 
                             let primary_key = self.primary_key.as_ref().unwrap();
                             if primary_key != expired.key.as_ref() {
-                                let key_str = format_key_for_log(&expired.key);
-                                let primary_str = format_key_for_log(primary_key);
                                 error!(
-                                    start_ts = self.start_version.version(),
-                                    key = key_str.as_str(),
-                                    primary = primary_str.as_str();
-                                    "2PC commit_ts rejected by TiKV, but the key is not the primary key"
+                                    txnStartTS = self.start_version.version(),
+                                    key:% = HexRepr(&expired.key),
+                                    primary:% = HexRepr(primary_key.as_ref()),
+                                    batchIsPrimary = true;
+                                    "2PC commitTS rejected by TiKV, but the key is not the primary key"
                                 );
                                 return Err(Error::StringError("2PC commitTS rejected by TiKV, but the key is not the primary key".to_string()));
                             }
@@ -3056,5 +3092,147 @@ mod tests {
             start.elapsed()
         );
         txn.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_transaction_wires_txn_start_ts_and_aligned_commit_logs() {
+        // 1. Transaction::new propagates txn_start_ts so read retries log txnStartTS.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_cloned = calls.clone();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                let _ = req.downcast_ref::<kvrpcpb::GetRequest>().unwrap();
+                let resp = if calls_cloned.fetch_add(1, Ordering::SeqCst) == 0 {
+                    kvrpcpb::GetResponse {
+                        region_error: Some(stale_command()),
+                        ..Default::default()
+                    }
+                } else {
+                    kvrpcpb::GetResponse {
+                        value: b"v".to_vec(),
+                        ..Default::default()
+                    }
+                };
+                Ok(Box::new(resp) as Box<dyn Any>)
+            },
+        )));
+        let start = crate::util::log::test_logger::checkpoint();
+        let mut txn = Transaction::new(
+            Timestamp::from_version(9001),
+            pd_client,
+            go_budget(),
+            Keyspace::Disable,
+        );
+        assert_eq!(txn.get(b"k".to_vec()).await.unwrap(), Some(b"v".to_vec()));
+        txn.rollback().await.unwrap();
+        let records = crate::util::log::test_logger::since(start);
+        assert!(records.iter().any(|r| {
+            r.level == log::Level::Debug
+                && r.message == "retry later"
+                && r.kv("type") == Some("staleCommand")
+                && r.kv("txnStartTS") == Some("9001")
+        }));
+
+        // 2. CommitTsExpired on non-primary logs Go-aligned INFO + ERROR.
+        let start = crate::util::log::test_logger::checkpoint();
+        let reject_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.is::<kvrpcpb::PrewriteRequest>() {
+                    return Ok(Box::<kvrpcpb::PrewriteResponse>::default() as Box<dyn Any>);
+                }
+                if req.is::<kvrpcpb::CommitRequest>() {
+                    return Ok(Box::new(kvrpcpb::CommitResponse {
+                        error: Some(kvrpcpb::KeyError {
+                            commit_ts_expired: Some(kvrpcpb::CommitTsExpired {
+                                start_ts: 9002,
+                                attempted_commit_ts: 9005,
+                                key: b"sec".to_vec(),
+                                min_commit_ts: 9010,
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                Ok(Box::<kvrpcpb::BatchRollbackResponse>::default() as Box<dyn Any>)
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(9002),
+            reject_client,
+            TransactionOptions::new_optimistic().drop_check(super::CheckLevel::None),
+            Keyspace::Disable,
+        );
+        txn.put(b"pk".to_vec(), b"v".to_vec()).await.unwrap();
+        assert!(txn.commit().await.is_err());
+        let records = crate::util::log::test_logger::since(start);
+        assert!(records.iter().any(|r| {
+            r.level == log::Level::Info
+                && r.message == "2PC commitTS rejected by TiKV, retry with a newer commitTS"
+                && r.kv("txnStartTS") == Some("9002")
+                && r.kv("info")
+                    == Some("{StartTs:9002 AttemptedCommitTs:9005 Key:736563 MinCommitTs:9010}")
+        }));
+        assert!(records.iter().any(|r| {
+            r.level == log::Level::Error
+                && r.message == "2PC commitTS rejected by TiKV, but the key is not the primary key"
+                && r.kv("txnStartTS") == Some("9002")
+                && r.kv("key") == Some("736563")
+                && r.kv("primary") == Some("706B")
+                && r.kv("batchIsPrimary") == Some("true")
+        }));
+
+        // 3. Secondary commit failure -> DEBUG "2PC async doActionOnBatches"
+        let start = crate::util::log::test_logger::checkpoint();
+        let sec_err_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.is::<kvrpcpb::PrewriteRequest>() {
+                    return Ok(Box::<kvrpcpb::PrewriteResponse>::default() as Box<dyn Any>);
+                }
+                if let Some(commit_req) = req.downcast_ref::<kvrpcpb::CommitRequest>() {
+                    if commit_req.keys.iter().any(|k| k == b"sec") {
+                        return Ok(Box::new(kvrpcpb::CommitResponse {
+                            error: Some(kvrpcpb::KeyError {
+                                abort: "secondary-commit-fail".to_owned(),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }) as Box<dyn Any>);
+                    }
+                    return Ok(Box::<kvrpcpb::CommitResponse>::default() as Box<dyn Any>);
+                }
+                Ok(Box::<kvrpcpb::BatchRollbackResponse>::default() as Box<dyn Any>)
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(9003),
+            sec_err_client,
+            TransactionOptions::new_optimistic().no_resolve_locks(),
+            Keyspace::Disable,
+        );
+        txn.put(b"pk".to_vec(), b"v1".to_vec()).await.unwrap();
+        txn.put(b"sec".to_vec(), b"v2".to_vec()).await.unwrap();
+        txn.commit().await.unwrap();
+        for _ in 0..50 {
+            if crate::util::log::test_logger::since(start).iter().any(|r| {
+                r.level == log::Level::Debug
+                    && r.message == "2PC async doActionOnBatches"
+                    && r.kv("action type") == Some("commit")
+                    && r.kv("error").is_some()
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let records = crate::util::log::test_logger::since(start);
+        assert!(
+            records.iter().any(|r| {
+                r.level == log::Level::Debug
+                    && r.message == "2PC async doActionOnBatches"
+                    && r.kv("action type") == Some("commit")
+                    && r.kv("error").is_some()
+            }),
+            "expected '2PC async doActionOnBatches' debug log on secondary failure"
+        );
     }
 }

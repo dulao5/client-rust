@@ -28,6 +28,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use futures::channel::mpsc as stream_mpsc;
+use log::debug;
 use log::info;
 use log::warn;
 use serde_derive::Deserialize;
@@ -39,6 +40,7 @@ use tonic::transport::Channel;
 use tonic::Status;
 
 use crate::backoff::Backoff;
+use crate::metrics::BackoffType;
 use crate::proto::tikvpb::batch_commands_request;
 use crate::proto::tikvpb::batch_commands_response;
 use crate::proto::tikvpb::tikv_client::TikvClient;
@@ -395,7 +397,7 @@ impl SendLoop {
         let (mut trigger, ok) = TurboBatchTrigger::from_policy(&self.cfg.batch_policy);
         if !ok {
             warn!(
-                batch_policy = self.cfg.batch_policy.as_str();
+                value = self.cfg.batch_policy.as_str();
                 "fallback to default batch policy due to invalid value"
             );
         }
@@ -676,15 +678,15 @@ impl BatchCommandsClient {
         let stream = state.stream.as_ref().expect("stream");
         if let Err(e) = stream.unbounded_send(req) {
             let req = e.into_inner();
+            let err_status = Status::unavailable("batch commands stream closed");
             info!(
                 "target" = self.target.as_str(),
-                request_ids:? = req.request_ids;
+                forwardedHost = "",
+                requestIDs:? = req.request_ids,
+                error:% = err_status;
                 "sending batch commands meets error"
             );
-            self.fail_requests_by_ids(
-                &Status::unavailable("batch commands stream closed"),
-                &req.request_ids,
-            );
+            self.fail_requests_by_ids(&err_status, &req.request_ids);
         }
     }
 
@@ -727,7 +729,11 @@ impl BatchCommandsClient {
             for (id, resp) in request_ids.into_iter().zip(responses) {
                 match batched.remove(&id) {
                     Some(res) => done.push((res, resp)),
-                    None => warn!(request_id = id; "batchRecvLoop receives outdated response"),
+                    None => warn!(
+                        requestID = id,
+                        forwardedHost = "";
+                        "batchRecvLoop receives outdated response"
+                    ),
                 }
             }
         }
@@ -811,9 +817,10 @@ impl BatchCommandsClient {
                 self.fail_pending_requests(&Status::unavailable("batch client closed"));
                 return;
             }
-            info!(
+            debug!(
                 "target" = self.target.as_str(),
-                error:? = err;
+                forwardedHost = "",
+                error:% = err;
                 "batchRecvLoop fails when receiving, needs to reconnect"
             );
             let unavailable_since = Instant::now();
@@ -833,10 +840,14 @@ impl BatchCommandsClient {
                 failed_unused = false;
             } else if !failed_unused {
                 failed_unused = true;
-            } else if let Some(delay) = backoff.next_delay_duration() {
+            } else if let Some(step) = backoff.next_step(BackoffType::TikvRpc, None) {
+                Backoff::log_backoff_step(&step);
                 let mut closed = self.closed.clone();
                 tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
+                    _ = tokio::time::sleep(step.delay) => {
+                        crate::metrics::backoff(BackoffType::TikvRpc, step.delay);
+                        backoff.log_retry_later(BackoffType::TikvRpc, &crate::Error::GrpcAPI(err));
+                    }
                     _ = closed.changed() => return,
                 }
             }

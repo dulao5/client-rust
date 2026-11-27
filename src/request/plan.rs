@@ -15,7 +15,6 @@ use log::info;
 use log::warn;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tokio::time::sleep;
 use tonic::Code;
 
 use crate::backoff::Backoff;
@@ -942,17 +941,13 @@ where
         error: Error,
         backoff_type: BackoffType,
     ) -> ShardStep<P, <Self as Plan>::Result> {
-        match backoff.next_delay_for(backoff_type) {
-            Some(duration) => {
-                metrics::backoff(backoff_type, duration);
-                sleep(duration).await;
-                ShardStep::Again {
-                    plan,
-                    backoff,
-                    candidate_state,
-                }
-            }
-            None => ShardStep::Done(Err(backoff.exhausted(error))),
+        match backoff.backoff(backoff_type, error).await {
+            Ok(()) => ShardStep::Again {
+                plan,
+                backoff,
+                candidate_state,
+            },
+            Err(err) => ShardStep::Done(Err(err)),
         }
     }
 
@@ -1211,26 +1206,22 @@ where
         // but its step is still charged: client-go does not back off there and relies on the
         // replica selector's per-replica limits, which this crate does not port; charging
         // keeps such retries bounded.
-        let backoff_type = metrics::backoff_type_for_region_error(&error);
-        match backoff.next_delay_for(backoff_type) {
-            Some(duration) => {
-                let region_error_resolved =
-                    handle_region_error(context.pd_client.clone(), error, region_store).await?;
-                if !region_error_resolved {
-                    metrics::backoff(backoff_type, duration);
-                    sleep(duration).await;
-                }
-                Self::single_plan_handler(context, plan, backoff, false).await
-            }
-            None => {
+        retry_on_region_error(
+            context.pd_client.clone(),
+            &mut backoff,
+            error,
+            region_store,
+            false,
+            || {
                 warn!(
                     plan = plan.label(),
                     region:? = region_ver_id;
                     "giving up after exhausting retries on region error"
                 );
-                Err(backoff.exhausted(Error::RegionError(Box::new(error))))
-            }
-        }
+            },
+        )
+        .await?;
+        Self::single_plan_handler(context, plan, backoff, false).await
     }
 
     async fn retry_after_routing_error(
@@ -1256,15 +1247,36 @@ where
         } else {
             BackoffType::RegionMiss
         };
-        match backoff.next_delay_for(t) {
-            Some(duration) => {
-                metrics::backoff(t, duration);
-                sleep(duration).await;
-                Self::single_plan_handler(context, plan, backoff, false).await
-            }
-            None => Err(backoff.exhausted(error)),
-        }
+        backoff.backoff(t, error).await?;
+        Self::single_plan_handler(context, plan, backoff, false).await
     }
+}
+
+/// Handle a region error and sleep using `backoff` unless the error was resolved immediately
+/// (e.g. a `NotLeader` carrying a valid leader hint) and `force_sleep` is `false`.
+pub(crate) async fn retry_on_region_error<PdC: PdClient>(
+    pd_client: Arc<PdC>,
+    backoff: &mut Backoff,
+    error: errorpb::Error,
+    region_store: RegionStore,
+    force_sleep: bool,
+    on_exhausted: impl FnOnce(),
+) -> Result<()> {
+    let backoff_type = metrics::backoff_type_for_region_error(&error);
+    let err_for_backoff = Error::RegionError(Box::new(error.clone()));
+    let Some(step) = backoff.next_step(backoff_type, None) else {
+        on_exhausted();
+        return Err(backoff.exhausted_for(Some(backoff_type), err_for_backoff));
+    };
+    let region_error_resolved = handle_region_error(pd_client, error, region_store).await?;
+    if !region_error_resolved || force_sleep {
+        backoff
+            .finish_step(backoff_type, step, &err_for_backoff)
+            .await;
+    } else {
+        backoff.record_error(&err_for_backoff);
+    }
+    Ok(())
 }
 
 // Returns
@@ -1503,14 +1515,10 @@ where
                         return Ok(resp);
                     }
                 }
-                Err(e) if is_grpc_error(&e) => match backoff.next_delay_for(BackoffType::TikvRpc) {
-                    Some(duration) => {
-                        metrics::backoff(BackoffType::TikvRpc, duration);
-                        sleep(duration).await;
-                        continue;
-                    }
-                    None => return Err(backoff.exhausted(e)),
-                },
+                Err(e) if is_grpc_error(&e) => {
+                    backoff.backoff(BackoffType::TikvRpc, e).await?;
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1738,13 +1746,10 @@ where
                 result = self.inner.execute().await?;
             } else {
                 // client-go `BackoffWithMaxSleepTxnLockFast(msBeforeExpired)`.
-                match lock_backoff.next_wait(found.ms_before_expired) {
-                    None => return Err(lock_backoff.exhausted(Error::ResolveLockError(found.live))),
-                    Some(wait) => {
-                        wait.wait(pd_client.clone()).await?;
-                        result = clone.inner.execute().await?;
-                    }
-                }
+                lock_backoff
+                    .wait_or_exhausted(found.ms_before_expired, pd_client, found.live)
+                    .await?;
+                result = clone.inner.execute().await?;
             }
         }
     }
@@ -2078,6 +2083,7 @@ mod test {
 
     use futures::stream::BoxStream;
     use futures::stream::{self};
+    use tokio::time::sleep;
 
     use super::*;
     use crate::mock::MockPdClient;
@@ -2801,5 +2807,69 @@ mod test {
             liveness_target(&untracked, &region).and_then(|t| t.leader),
             region.leader
         );
+    }
+
+    #[tokio::test]
+    async fn test_retry_multi_region_logs_backoff_retry_later_and_max_sleep() {
+        use std::any::Any;
+
+        use crate::mock::MockKvClient;
+        use crate::request::PlanBuilder;
+        use crate::transaction::lowering::new_get_request;
+
+        let start = crate::util::log::test_logger::checkpoint();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |_: &dyn Any| {
+                Ok(Box::new(kvrpcpb::GetResponse {
+                    region_error: Some(errorpb::Error {
+                        message: "not leader test-812".to_owned(),
+                        not_leader: Some(errorpb::NotLeader::default()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }) as Box<dyn Any>)
+            },
+        )));
+        let req = new_get_request(b"k".to_vec().into(), Timestamp::from_version(7777));
+        let bo = Backoff::time_budget(10).start().with_txn_start_ts(7777);
+        let plan = PlanBuilder::new(pd_client, Keyspace::Disable, req)
+            .retry_multi_region(bo)
+            .merge(CollectSingle)
+            .plan();
+        assert!(plan.execute().await.is_err());
+
+        let records = crate::util::log::test_logger::since(start);
+        assert!(
+            records.iter().any(|r| {
+                r.level == log::Level::Debug
+                    && r.message == "backoff"
+                    && r.kv("base") == Some("2")
+                    && r.kv("sleep") == Some("2")
+                    && r.kv("attempts") == Some("0")
+            }),
+            "expected 'backoff' log in plan retry path"
+        );
+        assert!(
+            records.iter().any(|r| {
+                r.level == log::Level::Debug
+                    && r.message == "retry later"
+                    && r.kv("type") == Some("regionScheduling")
+                    && r.kv("txnStartTS") == Some("7777")
+                    && r.kv("error")
+                        .is_some_and(|e| e.contains("not leader test-812"))
+            }),
+            "expected 'retry later' log with txnStartTS in plan retry path"
+        );
+        let warn_rec = records
+            .iter()
+            .find(|r| {
+                r.level == log::Level::Warn
+                    && r.message.starts_with(
+                        "regionScheduling backoffer.maxSleep 10ms is exceeded, errors:",
+                    )
+                    && r.message.contains("not leader test-812")
+            })
+            .expect("expected backoffer.maxSleep WARN from plan retry path");
+        assert!(warn_rec.kvs.is_empty(), "got kvs: {:?}", warn_rec.kvs);
     }
 }

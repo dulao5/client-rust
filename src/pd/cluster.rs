@@ -17,7 +17,7 @@ use super::timestamp::TimestampOracle;
 use crate::internal_err;
 use crate::proto::keyspacepb;
 use crate::proto::pdpb;
-use crate::util::log::format_go_duration;
+use crate::util::log::GoDuration;
 use crate::Error;
 use crate::Result;
 use crate::SecurityManager;
@@ -155,8 +155,7 @@ impl Connection {
             tso,
         };
 
-        let spent = format_go_duration(start.elapsed());
-        info!(spent = spent.as_str(); "updating PD client done");
+        info!(spent:% = GoDuration(start.elapsed()); "updating PD client done");
         Ok(())
     }
 
