@@ -137,8 +137,9 @@ impl StoreLiveness {
                 if let Some(liveness) = result.filter(|l| *l != Liveness::Reachable) {
                     if entry.state == Liveness::Reachable {
                         info!(
-                            "[health check] store {} is {:?}, start its health check loop",
-                            store_id, liveness
+                            store_id = store_id,
+                            liveness:? = liveness;
+                            "[health check] store is not reachable, start its health check loop"
                         );
                         entry.state = liveness;
                         self.inner.spawn_health_check_loop(store_id);
@@ -189,14 +190,15 @@ impl Inner {
                 };
                 match result {
                     Some(Liveness::Reachable) | None => {
+                        let status = if result.is_some() {
+                            "reachable"
+                        } else {
+                            "invalid (tombstone)"
+                        };
                         info!(
-                            "[health check] store {} became {}",
-                            store_id,
-                            if result.is_some() {
-                                "reachable"
-                            } else {
-                                "invalid (tombstone), stop checking"
-                            }
+                            store_id = store_id,
+                            status = status;
+                            "[health check] stop store health check loop"
                         );
                         entry.state = Liveness::Reachable;
                         if entry.probe.is_none() {

@@ -28,7 +28,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::debug;
-use tokio::time::sleep;
 
 use super::coprocessor::CoprocessorRpc;
 use crate::backoff::Backoff;
@@ -214,14 +213,7 @@ impl<PdC: PdClient> CopSender<PdC> {
 
     /// Backs off `t` on `bo`, or returns `error` wrapped as the budget's exhaustion.
     async fn backoff(bo: &mut Backoff, t: BackoffType, error: Error) -> Result<()> {
-        match bo.next_delay_for(t) {
-            Some(delay) => {
-                metrics::backoff(t, delay);
-                sleep(delay).await;
-                Ok(())
-            }
-            None => Err(bo.exhausted(error)),
-        }
+        bo.backoff(t, error).await
     }
 
     /// One coprocessor request to region `ver_id` with `SendReqCtx` semantics (module docs).
@@ -311,7 +303,7 @@ impl<PdC: PdClient> CopSender<PdC> {
             let mut resp = match result {
                 Ok(resp) => resp,
                 Err(e) if is_grpc_error(&e) => {
-                    debug!("cop send: grpc error, region {:?}: {:?}", ver_id, e);
+                    debug!(region:? = ver_id, error:? = e; "cop send: grpc error");
                     match grpc_error_action(&e) {
                         GrpcErrorAction::TryNextPeerAndInvalidate => {
                             if let Some(store_id) = target_store_id {
@@ -330,10 +322,7 @@ impl<PdC: PdClient> CopSender<PdC> {
             };
 
             if let Some(region_error) = resp.region_error.take() {
-                debug!(
-                    "cop send: region error, region {:?}: {:?}",
-                    ver_id, region_error
-                );
+                debug!(region:? = ver_id, error:? = region_error; "cop send: region error");
                 // TiKV gave up at the `tikv_client_read_timeout` deadline: retry at once with
                 // the default timeout (`onReadReqConfigurableTimeout`).
                 let ctx = req.context.get_or_insert_with(Default::default);

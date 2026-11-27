@@ -233,8 +233,10 @@ where
             Ok((idx, val)) => results[idx] = Some(val),
             Err(e) => {
                 error!(
-                    "{}: failed to join task ({} tasks): {}",
-                    handler_name, task_count, e
+                    handler = handler_name,
+                    task_count = task_count,
+                    error:% = e;
+                    "failed to join task"
                 );
                 join_set.shutdown().await;
                 return Err(Error::JoinError(e));
@@ -518,8 +520,9 @@ pub(crate) async fn check_store_liveness<PdC: PdClient>(pd_client: &Arc<PdC>, st
     if let Some(store_liveness) = pd_client.store_liveness() {
         let liveness = store_liveness.check(store_id).await;
         debug!(
-            "store {} liveness after a send failure: {:?}",
-            store_id, liveness
+            store_id = store_id,
+            liveness:? = liveness;
+            "store liveness after a send failure"
         );
     }
 }
@@ -549,10 +552,10 @@ pub(crate) fn liveness_target<PdC: PdClient>(
         .first()
         .map(|peer| (*peer).clone())?;
     debug!(
-        "region {:?}: leader store {} is not reachable, sending to store {}",
-        region.ver_id(),
-        leader.store_id,
-        peer.store_id
+        region:? = region.ver_id(),
+        leader_store_id = leader.store_id,
+        target_store_id = peer.store_id;
+        "leader store is not reachable, sending to fallback store"
     );
     let mut target = region.clone();
     target.leader = Some(peer);
@@ -599,7 +602,7 @@ where
             .collect::<Vec<_>>()
             .await;
         let shards_len = shards.len();
-        debug!("single_plan_handler, shards: {}", shards_len);
+        debug!(shards = shards_len; "single_plan_handler");
         // The first attempt of a plan with one shard (a point get, a batch within one region):
         // run it on this task. Spawning it costs a task, a join set and two cross-thread
         // wake-ups per request, which is a visible share of a point get's latency; with one
@@ -731,8 +734,9 @@ where
             Ok(region_store) => region_store,
             Err(err) => {
                 debug!(
-                    "single_shard_handler::map_store, fallback: {}, error: {:?}",
-                    is_fallback, err
+                    fallback = is_fallback,
+                    error:? = err;
+                    "single_shard_handler::map_store failed"
                 );
                 if is_grpc_error(&err) {
                     check_store_liveness(pd_client, peer.store_id).await;
@@ -765,8 +769,9 @@ where
             ))),
             Err(error) if is_grpc_error(&error) => {
                 debug!(
-                    "single_shard_handler:execute: grpc error, fallback: {}, error: {:?}",
-                    is_fallback, error
+                    fallback = is_fallback,
+                    error:? = error;
+                    "single_shard_handler:execute: grpc error"
                 );
                 let action = grpc_error_action(&error);
                 if matches!(action, GrpcErrorAction::TryNextPeerAndInvalidate) {
@@ -796,7 +801,7 @@ where
                 }
             }
             Err(error) => {
-                debug!("single_shard_handler:execute: error: {:?}", error);
+                debug!(error:? = error; "single_shard_handler:execute: error");
                 CandidateRoundResult::OtherError(error)
             }
         }
@@ -922,10 +927,7 @@ where
         // returning key-level errors, which are interpreted by higher layers.
         if let Some(peer) = leader {
             if let Err(error) = pd_client.update_leader(region_ver_id.clone(), peer).await {
-                debug!(
-                    "failed to update leader after follower fallback: {:?}",
-                    error
-                );
+                debug!(error:? = error; "failed to update leader after follower fallback");
             }
         }
     }
@@ -1006,10 +1008,10 @@ where
         let region_ver_id = region.ver_id();
         let store_id = region.get_store_id().ok();
         debug!(
-            "single_shard_handler {}, region: {:?}, store: {:?}",
-            plan.label(),
-            region_ver_id,
-            store_id
+            plan = plan.label(),
+            region:? = region_ver_id,
+            store_id:? = store_id;
+            "single_shard_handler"
         );
 
         let followers_only = candidate_state.take_follower_probe();
@@ -1121,7 +1123,7 @@ where
         } = response;
 
         if let Some(error) = key_errors {
-            debug!("single_shard_handler:execute: key errors: {:?}", error);
+            debug!(error:? = error; "single_shard_handler:execute: key errors");
             return ShardStep::Done(Ok(vec![Err(Error::MultipleKeyErrors(error))]));
         }
         let Some(error) = region_error else {
@@ -1193,10 +1195,10 @@ where
         error: errorpb::Error,
     ) -> Result<<Self as Plan>::Result> {
         debug!(
-            "single_shard_handler:execute {}: region error: {:?}, region: {:?}",
-            plan.label(),
-            error,
-            region_ver_id
+            plan = plan.label(),
+            error:? = error,
+            region:? = region_ver_id;
+            "single_shard_handler:execute: region error"
         );
         // For CAS and commit points, an unknown apply outcome must surface on
         // first sight: replaying could contradict its own effect, and a later
@@ -1222,9 +1224,9 @@ where
             }
             None => {
                 warn!(
-                    "{}: giving up after exhausting retries on region error, region: {:?}",
-                    plan.label(),
-                    region_ver_id
+                    plan = plan.label(),
+                    region:? = region_ver_id;
+                    "giving up after exhausting retries on region error"
                 );
                 Err(backoff.exhausted(Error::RegionError(Box::new(error))))
             }
@@ -1238,7 +1240,7 @@ where
         backoff: Backoff,
         error: Error,
     ) -> Result<<Self as Plan>::Result> {
-        debug!("retry_after_routing_error {}: {:?}", plan.label(), error);
+        debug!(plan = plan.label(), error:? = error; "retry_after_routing_error");
         context.pd_client.invalidate_region_cache(region).await;
         Self::retry_after_error(context, plan, backoff, error).await
     }
@@ -1276,7 +1278,7 @@ pub(crate) async fn handle_region_error<PdC: PdClient>(
 ) -> Result<bool> {
     let ver_id = region_store.region_with_leader.ver_id();
     let store_id = region_store.region_with_leader.get_store_id();
-    debug!("handling region error: {:?}, region: {:?}", e, ver_id);
+    debug!(error:? = e, region:? = ver_id; "handling region error");
     metrics::region_error(&e, store_id.as_ref().copied().unwrap_or(0));
     if let Some(not_leader) = e.not_leader {
         if let Some(leader) = not_leader.leader {
@@ -1327,8 +1329,9 @@ pub(crate) async fn handle_region_error<PdC: PdClient>(
         Err(Error::RegionError(Box::new(e)))
     } else {
         debug!(
-            "unknown region error, invalidating region and store caches, region: {:?}: {:?}",
-            ver_id, e
+            region:? = ver_id,
+            error:? = e;
+            "unknown region error, invalidating region and store caches"
         );
         pd_client.invalidate_region_cache(ver_id).await;
         if let Ok(store_id) = store_id {
@@ -1833,11 +1836,11 @@ where
 
             // Propagate errors to `retry_multi_region` for retry.
             if let Some(e) = scan_lock_resp.key_errors() {
-                info!("CleanupLocks::execute, inner key errors:{:?}", e);
+                info!(error:? = e; "CleanupLocks::execute inner key errors");
                 result.key_error = Some(e);
                 return Ok(result);
             } else if let Some(e) = scan_lock_resp.region_error() {
-                info!("CleanupLocks::execute, inner region error:{}", e.message);
+                info!(error = e.message.as_str(); "CleanupLocks::execute inner region error");
                 result.region_error = Some(e);
                 return Ok(result);
             }
@@ -1845,7 +1848,7 @@ where
             // Iterate to next batch of inner.
             match scan_lock_resp.has_next_batch() {
                 Some(range) if region.contains(range.0.as_ref()) => {
-                    debug!("CleanupLocks::execute, next range:{:?}", range);
+                    debug!(next_range:? = range; "CleanupLocks::execute next range");
                     inner.next_batch(range);
                 }
                 _ => has_more_batch = false,
@@ -1869,7 +1872,7 @@ where
                     .filter(|l| l.use_async_commit)
                     .collect::<Vec<_>>();
             }
-            debug!("CleanupLocks::execute, meet locks:{}", locks.len());
+            debug!(locks = locks.len(); "CleanupLocks::execute meet locks");
 
             let lock_size = locks.len();
             match lock_resolver

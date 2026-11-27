@@ -17,6 +17,7 @@ use super::timestamp::TimestampOracle;
 use crate::internal_err;
 use crate::proto::keyspacepb;
 use crate::proto::pdpb;
+use crate::util::log::format_go_duration;
 use crate::Error;
 use crate::Result;
 use crate::SecurityManager;
@@ -154,7 +155,8 @@ impl Connection {
             tso,
         };
 
-        info!("updating PD client done, spent {:?}", start.elapsed());
+        let spent = format_go_duration(start.elapsed());
+        info!(spent = spent.as_str(); "updating PD client done");
         Ok(())
     }
 
@@ -176,7 +178,7 @@ impl Connection {
                 Ok(resp) => resp,
                 // Ignore failed PD node.
                 Err(e) => {
-                    warn!("PD endpoint {} failed to respond: {:?}", ep, e);
+                    warn!(endpoint = ep.as_str(), error:? = e; "PD endpoint failed to respond");
                     continue;
                 }
             };
@@ -203,7 +205,7 @@ impl Connection {
 
         match members {
             Some(members) => {
-                info!("All PD endpoints are consistent: {:?}", endpoints);
+                info!(endpoints:? = endpoints; "all PD endpoints are consistent");
                 Ok(members)
             }
             _ => Err(internal_err!("PD cluster failed to respond")),
@@ -319,7 +321,7 @@ impl Connection {
                         break 'outer;
                     }
                     Err(e) => {
-                        error!("failed to connect to {}, {:?}", ep, e);
+                        error!(endpoint = ep.as_str(), error:? = e; "failed to connect to PD endpoint");
                         continue;
                     }
                 }

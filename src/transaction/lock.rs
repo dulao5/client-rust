@@ -723,8 +723,10 @@ fn resolve_in_background(
             .await
             {
                 info!(
-                    "failed to resolve lock asynchronously, start_ts: {}, commit_ts: {}, error: {:?}",
-                    start_version, commit_version, e
+                    start_ts = start_version,
+                    commit_ts = commit_version,
+                    error:? = e;
+                    "failed to resolve lock asynchronously"
                 );
                 return;
             }
@@ -787,7 +789,7 @@ async fn resolve_lock_with_retry(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        debug!("resolving locks: attempt {}", attempt);
+        debug!(attempt = attempt; "resolving locks attempt");
         let store = pd_client.clone().store_for_key(key).await?;
         let ver_id = store.region_with_leader.ver_id();
         if clean_regions.contains(&ver_id) {
@@ -859,13 +861,14 @@ async fn resolve_lock_with_retry(
             Err(Error::MultipleKeyErrors(mut errors)) => match errors.pop() {
                 Some(Error::KeyError(key_err)) => {
                     // Keyspace is not truncated here because we need full key info for logging.
+                    let formatted_key = format_key_for_log(key);
                     error!(
-                        "resolve_lock error, unexpected resolve err: {:?}, lock: {{key: {}, start_version: {}, commit_version: {}, is_txn_file: {}}}",
-                        key_err,
-                        format_key_for_log(key),
-                        start_version,
-                        commit_version,
-                        is_txn_file,
+                        error:? = key_err,
+                        key = formatted_key.as_str(),
+                        start_version = start_version,
+                        commit_version = commit_version,
+                        is_txn_file = is_txn_file;
+                        "resolve_lock error: unexpected resolve error"
                     );
                     return Err(Error::KeyError(key_err));
                 }
@@ -958,8 +961,9 @@ impl LockResolverState {
     pub fn save_resolved(&self, txn_id: u64, status: Arc<TransactionStatus>) {
         if !status.is_determined() {
             error!(
-                "unexpected undetermined status saved to cache, txn_id: {}, status: {:?}",
-                txn_id, status
+                txn_id = txn_id,
+                status:? = status;
+                "unexpected undetermined status saved to cache"
             );
             panic!("unexpected undetermined status saved to cache");
         }
@@ -967,8 +971,10 @@ impl LockResolverState {
         if let Some(saved) = cache.map.get(&txn_id) {
             if !saved.has_same_determined_status(&status) {
                 error!(
-                    "unexpected txn status saving to the cache, the existing status is not equal to the new one, txn_id: {}, existing: {:?}, new: {:?}",
-                    txn_id, saved, status
+                    txn_id = txn_id,
+                    existing:? = saved,
+                    new:? = status;
+                    "unexpected txn status saving to the cache, the existing status is not equal to the new one"
                 );
                 panic!("unexpected txn status saved to cache with existing different entry");
             }
@@ -1307,15 +1313,15 @@ impl LockResolver {
                     )
                     .await?;
                 debug!(
-                    "secondary status, txn_id:{}, commit_ts:{:?}, min_commit_version:{}, fallback_2pc:{}",
-                    txn_id,
-                    secondary_status.commit_ts,
-                    secondary_status.min_commit_ts,
-                    secondary_status.fallback_2pc,
+                    txn_id = txn_id,
+                    commit_ts:? = secondary_status.commit_ts,
+                    min_commit_version = secondary_status.min_commit_ts,
+                    fallback_2pc = secondary_status.fallback_2pc;
+                    "secondary status"
                 );
 
                 if secondary_status.fallback_2pc {
-                    debug!("fallback to 2pc, txn_id:{}, check_txn_status again", txn_id);
+                    debug!(txn_id = txn_id; "fallback to 2pc, check_txn_status again");
                     status = self
                         .check_txn_status(
                             pd_client.clone(),
@@ -1341,8 +1347,8 @@ impl LockResolver {
             match &status.kind {
                 TransactionStatusKind::Locked(_, lock_info) => {
                     error!(
-                        "cleanup_locks fail to clean locks, this result is not expected. txn_id:{}",
-                        txn_id
+                        txn_id = txn_id;
+                        "cleanup_locks fail to clean locks, this result is not expected"
                     );
                     return Err(Error::ResolveLockError(vec![lock_info.clone()]));
                 }
@@ -1354,9 +1360,9 @@ impl LockResolver {
         }
 
         debug!(
-            "batch resolve locks, region:{:?}, txn:{:?}",
-            store.region_with_leader.ver_id(),
-            txn_infos
+            region:? = store.region_with_leader.ver_id(),
+            txn:? = txn_infos;
+            "batch resolve locks"
         );
         let mut txn_ids = Vec::with_capacity(txn_infos.len());
         let mut txn_info_vec = Vec::with_capacity(txn_infos.len());
@@ -1561,8 +1567,10 @@ impl LockResolver {
                     let current = low_resolution_timestamp(pd_client.clone()).await?;
                     if lock_until_expired_ms(lock.lock_version, lock.lock_ttl, current) <= 0 {
                         warn!(
-                            "lock txn not found, lock has expired, lock {:?}, caller_start_ts {}, current_ts {}",
-                            lock, caller_start_ts, current_ts
+                            lock:? = lock,
+                            caller_start_ts = caller_start_ts,
+                            current_ts = current_ts;
+                            "lock txn not found, lock has expired"
                         );
                         rollback_if_not_exist = true;
                         continue;

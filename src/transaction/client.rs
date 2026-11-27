@@ -173,10 +173,7 @@ impl Client {
     /// ```
     pub async fn begin_optimistic(&self) -> Result<Transaction> {
         let timestamp = self.current_timestamp().await?;
-        debug!(
-            "began optimistic transaction, start_ts: {}",
-            timestamp.version()
-        );
+        debug!(start_ts = timestamp.version(); "began optimistic transaction");
         Ok(self.new_transaction(timestamp, TransactionOptions::new_optimistic()))
     }
 
@@ -199,10 +196,7 @@ impl Client {
     /// ```
     pub async fn begin_pessimistic(&self) -> Result<Transaction> {
         let timestamp = self.current_timestamp().await?;
-        debug!(
-            "began pessimistic transaction, start_ts: {}",
-            timestamp.version()
-        );
+        debug!(start_ts = timestamp.version(); "began pessimistic transaction");
         Ok(self.new_transaction(timestamp, TransactionOptions::new_pessimistic()))
     }
 
@@ -225,7 +219,7 @@ impl Client {
     /// ```
     pub async fn begin_with_options(&self, options: TransactionOptions) -> Result<Transaction> {
         let timestamp = self.current_timestamp().await?;
-        debug!("began transaction, start_ts: {}", timestamp.version());
+        debug!(start_ts = timestamp.version(); "began transaction");
         Ok(self.new_transaction(timestamp, options))
     }
 
@@ -282,8 +276,8 @@ impl Client {
             .await?;
         if !res {
             info!(
-                "GC safepoint not updated: PD already holds a safepoint newer than the requested {}",
-                safepoint.version()
+                requested_safepoint = safepoint.version();
+                "GC safepoint not updated: PD already holds a newer safepoint"
             );
         }
         Ok(res)

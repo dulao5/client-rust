@@ -454,10 +454,7 @@ impl<PdC: PdClient> RemoteScanner<PdC> {
                 // `onSendSuccess` → `switchWorkLeaderToPeer`,
                 // internal/locate/replica_selector.go:636-638).
                 if let Err(error) = self.pd_client.update_leader(region.ver_id(), peer).await {
-                    debug!(
-                        "scanner: failed to update leader after fallback: {:?}",
-                        error
-                    );
+                    debug!(error:? = error; "scanner: failed to update leader after fallback");
                 }
             }
             if let Some(errors) = response.key_errors() {

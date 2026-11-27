@@ -314,7 +314,7 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
                     let store = match region_cache.get_store_by_id(store_id).await {
                         Ok(store) => store,
                         Err(e) => {
-                            info!("[health check] failed to resolve store {store_id}: {e:?}");
+                            info!(store_id = store_id, error:? = e; "[health check] failed to resolve store");
                             return Some(Liveness::Unknown);
                         }
                     };
@@ -449,7 +449,7 @@ impl<KvC: KvConnect + Send + Sync + 'static, Cl> PdRpcClient<KvC, Cl> {
         if let Some(cached) = self.kv_client_cache.read().await.get(address) {
             return Ok(cached.clone());
         }
-        info!("connect to tikv endpoint: {:?}", address);
+        info!(endpoint = address; "connect to tikv endpoint");
         match self.kv_connect.connect_store(address, store_type).await {
             Ok(client) => {
                 self.kv_client_cache

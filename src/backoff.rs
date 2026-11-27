@@ -118,9 +118,10 @@ impl Backoff {
             Some(delay) => {
                 crate::metrics::backoff(t, delay);
                 tokio::time::sleep(delay).await;
+                self.log_retry_later(t, &err);
                 Ok(())
             }
-            None => Err(self.exhausted(err)),
+            None => Err(self.exhausted_for(Some(t), err)),
         }
     }
 
@@ -135,10 +136,24 @@ impl Backoff {
             Some(delay) => {
                 crate::metrics::backoff(t, delay);
                 tokio::time::sleep(delay).await;
+                self.log_retry_later(t, &err);
                 Ok(())
             }
-            None => Err(self.exhausted(err)),
+            None => Err(self.exhausted_for(Some(t), err)),
         }
+    }
+
+    /// Emit client-go `Backoffer.BackoffWithCfgAndMaxSleep`'s `"retry later"` debug log
+    /// (`config/retry/backoff.go:229`).
+    pub(crate) fn log_retry_later(&self, t: BackoffType, err: &crate::Error) {
+        log::debug!(
+            error:% = err,
+            totalSleep = self.total_sleep_ms(),
+            excludedSleep = self.excluded_sleep_ms(),
+            maxSleep = self.max_sleep_ms(),
+            "type" = t.go_config();
+            "retry later"
+        );
     }
 
     /// client-go `Backoffer.GetTotalSleep()` in ms: what a time budget has slept so far
@@ -153,6 +168,30 @@ impl Backoff {
                     .unwrap_or_else(|e| e.into_inner())
                     .total_sleep_ms
             }
+            _ => 0,
+        }
+    }
+
+    /// Excluded sleep (e.g. `serverBusy`) accumulated by a time budget in ms
+    /// (0 for other backoffs or before any sleep).
+    pub fn excluded_sleep_ms(&self) -> u64 {
+        match &self.kind {
+            BackoffKind::TimeBudget(TimeBudget {
+                state: Some(state), ..
+            }) => {
+                state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .excluded_sleep_ms
+            }
+            _ => 0,
+        }
+    }
+
+    /// Configured max sleep budget in ms (0 for non-budget backoffs).
+    pub fn max_sleep_ms(&self) -> u64 {
+        match &self.kind {
+            BackoffKind::TimeBudget(TimeBudget { max_sleep_ms, .. }) => *max_sleep_ms,
             _ => 0,
         }
     }
@@ -192,6 +231,52 @@ impl Backoff {
     /// last one. Any other backoff, or an undetermined outcome (which commit paths must
     /// recognise as such), returns `error` unchanged.
     pub(crate) fn exhausted(&self, error: crate::Error) -> crate::Error {
+        self.exhausted_for(None, error)
+    }
+
+    fn exhausted_for(&self, t: Option<BackoffType>, error: crate::Error) -> crate::Error {
+        if let BackoffKind::TimeBudget(TimeBudget {
+            max_sleep_ms,
+            state: Some(state),
+        }) = &self.kind
+        {
+            if *max_sleep_ms > 0 {
+                let (total_sleep_ms, excluded_sleep_ms, last_type, longest) = {
+                    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+                    let longest = BackoffType::ALL
+                        .into_iter()
+                        .filter(|kind| *kind != BackoffType::ServerBusy)
+                        .map(|kind| (kind, s.slept_ms[kind as usize]))
+                        .filter(|(_, ms)| *ms > 0)
+                        .max_by_key(|(_, ms)| *ms);
+                    (
+                        s.total_sleep_ms,
+                        s.excluded_sleep_ms,
+                        s.last_exhausted_type,
+                        longest,
+                    )
+                };
+                let cfg = t
+                    .or(last_type)
+                    .or_else(|| longest.map(|(kind, _)| kind))
+                    .map(BackoffType::go_config)
+                    .unwrap_or("unknown");
+                let (longest_type, longest_ms) = match longest {
+                    Some((kind, ms)) => (kind.go_config(), ms),
+                    None => ("", 0),
+                };
+                log::warn!(
+                    "type" = cfg,
+                    maxSleep = *max_sleep_ms,
+                    totalSleep = total_sleep_ms,
+                    excludedSleep = excluded_sleep_ms,
+                    longestSleepType = longest_type,
+                    longestSleepMs = longest_ms,
+                    error:% = error;
+                    "{cfg} backoffer.maxSleep {max_sleep_ms}ms is exceeded, errors:"
+                );
+            }
+        }
         if crate::request::plan::is_undetermined_region_error(&error) {
             return error;
         }
@@ -231,6 +316,7 @@ impl Backoff {
                     attempts: [0; BACKOFF_COUNT],
                     // `Fork` copies `backoffSleepMS` (backoff.go:287).
                     slept_ms: state.slept_ms,
+                    last_exhausted_type: None,
                 }
             });
             budget.state = forked.map(|state| Arc::new(Mutex::new(state)));
@@ -422,6 +508,8 @@ struct BudgetState {
     attempts: [u32; BACKOFF_COUNT],
     /// Sleep per kind (`backoffSleepMS`), for the error reported when the budget runs out.
     slept_ms: [u64; BACKOFF_COUNT],
+    /// The backoff type that hit the budget limit, for exhaustion warning logs.
+    last_exhausted_type: Option<BackoffType>,
 }
 
 /// `serverBusy` sleeps excluded from the budget, at most (`isSleepExcluded`, config.go:144).
@@ -471,6 +559,7 @@ impl TimeBudget {
             && state.excluded_sleep_ms >= SERVER_BUSY_EXCLUDED_MS
             && state.excluded_sleep_ms >= max_sleep_ms;
         if max_sleep_ms > 0 && (budget_spent || excluded_spent) {
+            state.last_exhausted_type = Some(t);
             return None;
         }
         // newBackoffFn (config.go:169-214), expo (:216): `base < 2` becomes 2; `expo` is
@@ -771,5 +860,87 @@ mod test {
         let mut count = Backoff::no_jitter_backoff(2, 500, 10);
         count.next_delay_duration();
         assert_eq!(count.longest_sleep(), None);
+    }
+
+    #[tokio::test]
+    async fn test_time_budget_logs_retry_later_and_exhaustion() {
+        let start = crate::util::log::test_logger::checkpoint();
+        let mut b = Backoff::time_budget(10).start();
+        let marker = "backoff-unit-test-err-991";
+
+        let mut retries = 0;
+        while b
+            .backoff(
+                BackoffType::RegionMiss,
+                crate::Error::StringError(marker.to_owned()),
+            )
+            .await
+            .is_ok()
+        {
+            retries += 1;
+        }
+        assert!(retries > 0);
+        assert!(b.total_sleep_ms() >= 10);
+        assert_eq!(b.excluded_sleep_ms(), 0);
+        assert_eq!(b.max_sleep_ms(), 10);
+
+        let records = crate::util::log::test_logger::since(start);
+        let retry_record = records
+            .iter()
+            .find(|r| {
+                r.level == log::Level::Debug
+                    && r.message == "retry later"
+                    && r.kv("error").is_some_and(|e| e.contains(marker))
+            })
+            .expect("expected 'retry later' debug log");
+        assert_eq!(retry_record.kv("type"), Some("regionMiss"));
+        assert_eq!(retry_record.kv("maxSleep"), Some("10"));
+        assert_eq!(retry_record.kv("excludedSleep"), Some("0"));
+        assert!(retry_record.kv("totalSleep").is_some());
+
+        let warn_record = records
+            .iter()
+            .find(|r| {
+                r.level == log::Level::Warn
+                    && r.message == "regionMiss backoffer.maxSleep 10ms is exceeded, errors:"
+                    && r.kv("error").is_some_and(|e| e.contains(marker))
+            })
+            .expect("expected backoffer.maxSleep warn log");
+        assert_eq!(warn_record.kv("type"), Some("regionMiss"));
+        assert_eq!(warn_record.kv("maxSleep"), Some("10"));
+        assert_eq!(warn_record.kv("excludedSleep"), Some("0"));
+        assert_eq!(warn_record.kv("longestSleepType"), Some("regionMiss"));
+        assert_eq!(
+            warn_record.kv("totalSleep"),
+            Some(b.total_sleep_ms().to_string().as_str())
+        );
+        assert_eq!(
+            warn_record.kv("longestSleepMs"),
+            Some(b.total_sleep_ms().to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lock_fast_logs_retry_later() {
+        let start = crate::util::log::test_logger::checkpoint();
+        let mut b = Backoff::time_budget(100).start();
+        let marker = "backoff-lock-fast-err-992";
+        b.backoff_with_max_sleep_txn_lock_fast(1, crate::Error::StringError(marker.to_owned()))
+            .await
+            .unwrap();
+
+        let records = crate::util::log::test_logger::since(start);
+        let retry_record = records
+            .iter()
+            .find(|r| {
+                r.level == log::Level::Debug
+                    && r.message == "retry later"
+                    && r.kv("error").is_some_and(|e| e.contains(marker))
+            })
+            .expect("expected 'retry later' debug log for txnLockFast");
+        assert_eq!(retry_record.kv("type"), Some("txnLockFast"));
+        assert_eq!(retry_record.kv("maxSleep"), Some("100"));
+        assert_eq!(retry_record.kv("totalSleep"), Some("1"));
+        assert_eq!(retry_record.kv("excludedSleep"), Some("0"));
     }
 }

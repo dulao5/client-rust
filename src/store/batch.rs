@@ -395,8 +395,8 @@ impl SendLoop {
         let (mut trigger, ok) = TurboBatchTrigger::from_policy(&self.cfg.batch_policy);
         if !ok {
             warn!(
-                "fallback to default batch policy due to invalid value {:?}",
-                self.cfg.batch_policy
+                batch_policy = self.cfg.batch_policy.as_str();
+                "fallback to default batch policy due to invalid value"
             );
         }
         let turbo_wait = trigger.turbo_wait_time();
@@ -535,8 +535,9 @@ impl SendLoop {
         }
         let Some((cli, mut state)) = chosen else {
             info!(
-                "no available connections, target {}, reasons {:?}",
-                clients[self.index].target, reasons
+                "target" = clients[self.index].target.as_str(),
+                reasons:? = reasons;
+                "no available connections"
             );
             crate::metrics::batch_no_available_connection();
             if self.cfg.max_concurrency_request_limit == i64::MAX {
@@ -676,8 +677,9 @@ impl BatchCommandsClient {
         if let Err(e) = stream.unbounded_send(req) {
             let req = e.into_inner();
             info!(
-                "sending batch commands meets error, target {}, request ids {:?}",
-                self.target, req.request_ids
+                "target" = self.target.as_str(),
+                request_ids:? = req.request_ids;
+                "sending batch commands meets error"
             );
             self.fail_requests_by_ids(
                 &Status::unavailable("batch commands stream closed"),
@@ -725,7 +727,7 @@ impl BatchCommandsClient {
             for (id, resp) in request_ids.into_iter().zip(responses) {
                 match batched.remove(&id) {
                     Some(res) => done.push((res, resp)),
-                    None => warn!("batchRecvLoop receives outdated response, request id {id}"),
+                    None => warn!(request_id = id; "batchRecvLoop receives outdated response"),
                 }
             }
         }
@@ -810,8 +812,9 @@ impl BatchCommandsClient {
                 return;
             }
             info!(
-                "batchRecvLoop fails when receiving, needs to reconnect, target {}: {err:?}",
-                self.target
+                "target" = self.target.as_str(),
+                error:? = err;
+                "batchRecvLoop fails when receiving, needs to reconnect"
             );
             let unavailable_since = Instant::now();
             {
