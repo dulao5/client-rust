@@ -817,7 +817,7 @@ impl<PdC: PdClient> Client<PdC> {
         let end_key = scan_args.end_key;
         loop {
             let region = self.rpc.clone().region_for_key(&start_key).await?;
-            let store = self.rpc.clone().store_for_id(region.id()).await?;
+            let store = self.rpc.clone().map_region_to_store(region.clone()).await?;
             let request = new_raw_scan_request(
                 (start_key.clone(), end_key.clone()).into(),
                 scan_args.limit,

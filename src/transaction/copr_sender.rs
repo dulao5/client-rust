@@ -191,13 +191,14 @@ impl<PdC: PdClient> CopSender<PdC> {
         Ok(out)
     }
 
-    /// client-go `RegionCache.GetTiKVRPCContext` for a leader read: `None` when the cache no
-    /// longer has this epoch of the region or it has no leader.
+    /// client-go `RegionCache.GetTiKVRPCContext` (`internal/locate/region_cache.go:915-1001`) for
+    /// a leader read: reads only the local region cache (`GetCachedRegionWithRLock`,
+    /// `internal/locate/region_cache.go:916,2549-2554`) and returns `Ok(None)` when the cache no
+    /// longer has this epoch of the region or it has no leader, without querying PD by region ID.
     pub async fn rpc_context(&self, ver_id: &RegionVerId) -> Result<Option<CopRpcContext>> {
-        let region = self.pd_client.region_for_id(ver_id.id).await?;
-        if region.ver_id() != *ver_id {
+        let Some(region) = self.pd_client.cached_region_for_ver_id(ver_id).await? else {
             return Ok(None);
-        }
+        };
         let Some(leader) = region.leader.clone() else {
             return Ok(None);
         };
@@ -234,13 +235,17 @@ impl<PdC: PdClient> CopSender<PdC> {
         req.context.get_or_insert_with(Default::default).api_version =
             self.keyspace.api_version().into();
         loop {
-            let region = self.pd_client.region_for_id(ver_id.id).await?;
-            if region.ver_id() != *ver_id {
+            // Mirrors client-go `newReplicaSelector` -> `GetCachedRegionWithRLock`
+            // (`internal/locate/replica_selector.go:44-50`) and `sendReqState.next`
+            // (`internal/locate/region_request.go:955-972`): never query PD by region ID on a
+            // cache miss (a merged-away region no longer exists in PD). Return a pseudo
+            // `EpochNotMatch` so the caller re-locates by key range and retries.
+            let Some(region) = self.pd_client.cached_region_for_ver_id(ver_id).await? else {
                 return Ok(CopSendResult {
                     resp: epoch_not_match_resp(),
                     rpc_ctx: None,
                 });
-            }
+            };
             let Some(target) = liveness_target(&*self.pd_client, &region) else {
                 // Every peer is unreachable: client-go's selector gives up, invalidates the
                 // region and hands back a region error.
@@ -688,5 +693,323 @@ mod tests {
         assert_eq!(ctx.store_id, 44);
         assert_eq!(ctx.peer.store_id, 44);
         assert_eq!(ctx.addr, "10.0.0.44:20160");
+    }
+
+    /// Real `RegionCache`-backed `PdClient` for testing merged-region cache misses without
+    /// querying PD by region ID (dulao5/tidb-rs#511).
+    struct CachedMockPd {
+        regions_by_key: Mutex<Vec<crate::region::RegionWithLeader>>,
+        get_region_by_key_calls: AtomicUsize,
+        get_region_by_id_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::pd::RetryClientTrait for CachedMockPd {
+        async fn get_region(
+            self: Arc<Self>,
+            key: Vec<u8>,
+        ) -> Result<crate::region::RegionWithLeader> {
+            self.get_region_by_key_calls.fetch_add(1, Ordering::SeqCst);
+            let k: Key = key.into();
+            self.regions_by_key
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.contains(&k))
+                .cloned()
+                .ok_or_else(|| Error::RegionForKeyNotFound { key: k.into() })
+        }
+
+        async fn get_region_by_id(
+            self: Arc<Self>,
+            region_id: crate::region::RegionId,
+        ) -> Result<crate::region::RegionWithLeader> {
+            self.get_region_by_id_calls.fetch_add(1, Ordering::SeqCst);
+            Err(Error::RegionNotFoundInResponse { region_id })
+        }
+
+        async fn get_store(self: Arc<Self>, id: crate::region::StoreId) -> Result<metapb::Store> {
+            Ok(metapb::Store {
+                id,
+                address: format!("10.0.0.{id}:20160"),
+                ..Default::default()
+            })
+        }
+
+        async fn get_all_stores(self: Arc<Self>) -> Result<Vec<metapb::Store>> {
+            unimplemented!()
+        }
+
+        async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp> {
+            unimplemented!()
+        }
+
+        async fn get_timestamp_silent(self: Arc<Self>) -> Result<Timestamp> {
+            unimplemented!()
+        }
+
+        async fn update_safepoint(self: Arc<Self>, _safepoint: u64) -> Result<bool> {
+            unimplemented!()
+        }
+
+        async fn load_keyspace(
+            &self,
+            _keyspace: &str,
+        ) -> Result<crate::proto::keyspacepb::KeyspaceMeta> {
+            unimplemented!()
+        }
+    }
+
+    struct RegionCachePdClient {
+        cache: crate::region_cache::RegionCache<CachedMockPd>,
+        kv: MockKvClient,
+    }
+
+    #[async_trait::async_trait]
+    impl PdClient for RegionCachePdClient {
+        type KvClient = MockKvClient;
+
+        async fn map_region_to_store(
+            self: Arc<Self>,
+            region: crate::region::RegionWithLeader,
+        ) -> Result<crate::store::RegionStore> {
+            let store_id = region.get_store_id()?;
+            let store = self.cache.get_store_by_id(store_id).await?;
+            Ok(
+                crate::store::RegionStore::new(region, Arc::new(self.kv.clone()))
+                    .with_store_address(store.address),
+            )
+        }
+
+        async fn store_address(&self, store_id: crate::region::StoreId) -> Result<String> {
+            Ok(self.cache.get_store_by_id(store_id).await?.address)
+        }
+
+        async fn region_for_key(&self, key: &Key) -> Result<crate::region::RegionWithLeader> {
+            self.cache.get_region_by_key(key).await
+        }
+
+        async fn region_for_id(
+            &self,
+            id: crate::region::RegionId,
+        ) -> Result<crate::region::RegionWithLeader> {
+            self.cache.get_region_by_id(id).await
+        }
+
+        async fn cached_region_for_ver_id(
+            &self,
+            ver_id: &RegionVerId,
+        ) -> Result<Option<crate::region::RegionWithLeader>> {
+            Ok(self.cache.get_cached_region_by_ver_id(ver_id).await)
+        }
+
+        async fn all_stores(&self) -> Result<Vec<crate::store::Store>> {
+            unimplemented!()
+        }
+
+        async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp> {
+            Ok(Timestamp::default())
+        }
+
+        async fn update_safepoint(self: Arc<Self>, _safepoint: u64) -> Result<bool> {
+            unimplemented!()
+        }
+
+        async fn load_keyspace(
+            &self,
+            _keyspace: &str,
+        ) -> Result<crate::proto::keyspacepb::KeyspaceMeta> {
+            unimplemented!()
+        }
+
+        async fn update_leader(&self, ver_id: RegionVerId, leader: metapb::Peer) -> Result<()> {
+            self.cache.update_leader(ver_id, leader).await
+        }
+
+        async fn invalidate_region_cache(&self, ver_id: RegionVerId) {
+            self.cache.invalidate_region_cache(ver_id).await
+        }
+
+        async fn invalidate_store_cache(&self, store_id: crate::region::StoreId) {
+            self.cache.invalidate_store_cache(store_id).await;
+        }
+    }
+
+    fn make_region(
+        id: u64,
+        start_key: Vec<u8>,
+        end_key: Vec<u8>,
+        version: u64,
+        store_id: u64,
+    ) -> crate::region::RegionWithLeader {
+        let peer = metapb::Peer {
+            id: id * 10,
+            store_id,
+            ..Default::default()
+        };
+        crate::region::RegionWithLeader::new(
+            metapb::Region {
+                id,
+                start_key,
+                end_key,
+                region_epoch: Some(metapb::RegionEpoch {
+                    conf_ver: 1,
+                    version,
+                }),
+                peers: vec![peer.clone()],
+                ..Default::default()
+            },
+            Some(peer),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_merged_region_cache_miss_returns_epoch_not_match_and_retries_cleanly() {
+        let r470 = make_region(470, vec![], vec![10], 1, 41);
+        let r471 = make_region(471, vec![10], vec![], 1, 42);
+        let merged_r471 = make_region(471, vec![], vec![], 2, 42);
+
+        let mock_pd = Arc::new(CachedMockPd {
+            regions_by_key: Mutex::new(vec![r470.clone(), r471.clone()]),
+            get_region_by_key_calls: AtomicUsize::new(0),
+            get_region_by_id_calls: AtomicUsize::new(0),
+        });
+        let kv_calls = Arc::new(AtomicUsize::new(0));
+        let kv_calls_hook = kv_calls.clone();
+        let kv = MockKvClient::with_dispatch_hook(move |req: &dyn Any| {
+            kv_calls_hook.fetch_add(1, Ordering::SeqCst);
+            let cop = req
+                .downcast_ref::<coprocessor::Request>()
+                .expect("cop request");
+            let region_id = cop.context.as_ref().unwrap().region_id;
+            assert_eq!(
+                region_id, 471,
+                "only merged region 471 should be dispatched"
+            );
+            ok("merged-ok")
+        });
+        let pd_client = Arc::new(RegionCachePdClient {
+            cache: crate::region_cache::RegionCache::new(mock_pd.clone()),
+            kv,
+        });
+        let sender =
+            CopSender::new(pd_client.clone(), Keyspace::Disable, Timestamp::default()).unwrap();
+
+        // 1. Caller locates key ranges before merge: caches region 470 and region 471.
+        let locs = sender
+            .locate_key_ranges(&mut bo(), &[(vec![1], vec![20])])
+            .await
+            .unwrap();
+        assert_eq!(locs.len(), 2);
+        assert_eq!(locs[0].ver_id, r470.ver_id());
+        assert_eq!(locs[1].ver_id, r471.ver_id());
+
+        // 2. Region 470 is merged into region 471 on PD and invalidated from the cache.
+        *mock_pd.regions_by_key.lock().unwrap() = vec![merged_r471.clone()];
+        pd_client.invalidate_region_cache(r470.ver_id()).await;
+
+        // 3. `rpc_context` reads only the cache and returns `Ok(None)` without calling PD by ID.
+        assert!(sender.rpc_context(&r470.ver_id()).await.unwrap().is_none());
+        assert_eq!(mock_pd.get_region_by_id_calls.load(Ordering::SeqCst), 0);
+
+        // 4. `send` treats the cache miss as stale (`EpochNotMatch`) with zero PD/TiKV calls.
+        let stale_res = sender
+            .send(
+                &mut bo(),
+                &r470.ver_id(),
+                coprocessor::Request::default(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(stale_res
+            .resp
+            .region_error
+            .as_ref()
+            .and_then(|e| e.epoch_not_match.as_ref())
+            .is_some());
+        assert!(stale_res.rpc_ctx.is_none());
+        assert_eq!(mock_pd.get_region_by_id_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(kv_calls.load(Ordering::SeqCst), 0);
+
+        // 5. Caller retries by re-locating key ranges and sending to the fresh merged region.
+        let fresh_locs = sender
+            .locate_key_ranges(&mut bo(), &[(vec![1], vec![20])])
+            .await
+            .unwrap();
+        assert_eq!(fresh_locs.len(), 1);
+        assert_eq!(fresh_locs[0].ver_id, merged_r471.ver_id());
+
+        let ok_res = sender
+            .send(
+                &mut bo(),
+                &fresh_locs[0].ver_id,
+                coprocessor::Request::default(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_res.resp.data, b"merged-ok");
+        assert!(ok_res.resp.region_error.is_none());
+        assert_eq!(ok_res.rpc_ctx.unwrap().ver_id, merged_r471.ver_id());
+        assert_eq!(mock_pd.get_region_by_id_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(kv_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_send_in_place_retry_after_invalidation_returns_epoch_not_match_without_region_for_id(
+    ) {
+        let r470 = make_region(470, vec![], vec![10], 1, 41);
+        let mock_pd = Arc::new(CachedMockPd {
+            regions_by_key: Mutex::new(vec![r470.clone()]),
+            get_region_by_key_calls: AtomicUsize::new(0),
+            get_region_by_id_calls: AtomicUsize::new(0),
+        });
+        let kv_calls = Arc::new(AtomicUsize::new(0));
+        let kv_calls_hook = kv_calls.clone();
+        // TiKV returns NotLeader(leader = None) while region 470 is being merged away;
+        // `handle_region_error` invalidates region 470 from the cache, so the retry iteration
+        // must return `EpochNotMatch` instead of querying PD by region ID.
+        let kv = MockKvClient::with_dispatch_hook(move |_req: &dyn Any| {
+            kv_calls_hook.fetch_add(1, Ordering::SeqCst);
+            region_err(errorpb::Error {
+                not_leader: Some(errorpb::NotLeader {
+                    region_id: 470,
+                    leader: None,
+                }),
+                ..Default::default()
+            })
+        });
+        let pd_client = Arc::new(RegionCachePdClient {
+            cache: crate::region_cache::RegionCache::new(mock_pd.clone()),
+            kv,
+        });
+        let sender =
+            CopSender::new(pd_client.clone(), Keyspace::Disable, Timestamp::default()).unwrap();
+
+        let locs = sender
+            .locate_key_ranges(&mut bo(), &[(vec![1], vec![5])])
+            .await
+            .unwrap();
+        assert_eq!(locs[0].ver_id, r470.ver_id());
+
+        let res = sender
+            .send(
+                &mut bo(),
+                &r470.ver_id(),
+                coprocessor::Request::default(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(res
+            .resp
+            .region_error
+            .as_ref()
+            .and_then(|e| e.epoch_not_match.as_ref())
+            .is_some());
+        assert!(res.rpc_ctx.is_none());
+        assert_eq!(kv_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mock_pd.get_region_by_id_calls.load(Ordering::SeqCst), 0);
     }
 }
