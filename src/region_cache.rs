@@ -140,10 +140,10 @@ impl<C: RetryClientTrait> RegionCache<C> {
             self.inner_client.clone().get_region(key.into()),
         )
         .await?;
-        log::debug!(
-            "region cache: loaded region {} (by key) from PD, leader store {:?}",
-            region.id(),
-            region.leader.as_ref().map(|l| l.store_id)
+        debug!(
+            region_id = region.id(),
+            leader_store_id:? = region.leader.as_ref().map(|l| l.store_id);
+            "region cache: loaded region by key from PD"
         );
         self.add_region(region.clone()).await;
         Ok(region)
@@ -164,10 +164,10 @@ impl<C: RetryClientTrait> RegionCache<C> {
         )
         .await;
         if let Ok(region) = &result {
-            log::debug!(
-                "region cache: loaded region {} (by id) from PD, leader store {:?}",
-                region.id(),
-                region.leader.as_ref().map(|l| l.store_id)
+            debug!(
+                region_id = region.id(),
+                leader_store_id:? = region.leader.as_ref().map(|l| l.store_id);
+                "region cache: loaded region by id from PD"
             );
             self.add_region(region.clone()).await;
         }
@@ -245,7 +245,7 @@ impl<C: RetryClientTrait> RegionCache<C> {
         let region_entry = cache.ver_id_to_region.get_mut(&ver_id);
         if let Some(region) = region_entry {
             region.leader = Some(leader);
-            debug!("updated cached region leader, region: {:?}", ver_id);
+            debug!(region:? = ver_id; "updated cached region leader");
         }
 
         Ok(())
@@ -261,7 +261,7 @@ impl<C: RetryClientTrait> RegionCache<C> {
             cache.id_to_ver_id.remove(&id);
             cache.key_to_ver_id.remove(&start_key);
             metrics::region_cache(RegionCacheOp::InvalidateRegionFromCache, true);
-            debug!("invalidated region cache entry, region: {:?}", ver_id);
+            debug!(region:? = ver_id; "invalidated region cache entry");
         }
     }
 
@@ -269,7 +269,7 @@ impl<C: RetryClientTrait> RegionCache<C> {
         let mut cache = self.store_cache.write().await;
         let removed = cache.remove(&store_id);
         if removed.is_some() {
-            debug!("invalidated store cache entry, store: {:?}", store_id);
+            debug!(store_id = store_id; "invalidated store cache entry");
         }
         removed
     }
@@ -397,6 +397,10 @@ mod test {
         }
 
         async fn get_timestamp(self: Arc<Self>) -> Result<crate::proto::pdpb::Timestamp> {
+            todo!()
+        }
+
+        async fn get_timestamp_silent(self: Arc<Self>) -> Result<crate::proto::pdpb::Timestamp> {
             todo!()
         }
 

@@ -48,6 +48,8 @@ pub trait RetryClientTrait {
 
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp>;
 
+    async fn get_timestamp_silent(self: Arc<Self>) -> Result<Timestamp>;
+
     async fn update_safepoint(self: Arc<Self>, safepoint: u64) -> Result<bool>;
 
     async fn load_keyspace(&self, keyspace: &str) -> Result<keyspacepb::KeyspaceMeta>;
@@ -225,6 +227,11 @@ impl RetryClientTrait for RetryClient<Cluster> {
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp> {
         retry!(self, "get_timestamp", PdCmd::Tso, |cluster| cluster
             .get_timestamp())
+    }
+
+    async fn get_timestamp_silent(self: Arc<Self>) -> Result<Timestamp> {
+        retry!(self, "get_timestamp", PdCmd::Tso, |cluster| cluster
+            .get_timestamp_silent())
     }
 
     async fn update_safepoint(self: Arc<Self>, safepoint: u64) -> Result<bool> {

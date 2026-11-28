@@ -15,7 +15,6 @@ use log::info;
 use log::warn;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tokio::time::sleep;
 use tonic::Code;
 
 use crate::backoff::Backoff;
@@ -233,8 +232,10 @@ where
             Ok((idx, val)) => results[idx] = Some(val),
             Err(e) => {
                 error!(
-                    "{}: failed to join task ({} tasks): {}",
-                    handler_name, task_count, e
+                    handler = handler_name,
+                    task_count = task_count,
+                    error:% = e;
+                    "failed to join task"
                 );
                 join_set.shutdown().await;
                 return Err(Error::JoinError(e));
@@ -518,8 +519,9 @@ pub(crate) async fn check_store_liveness<PdC: PdClient>(pd_client: &Arc<PdC>, st
     if let Some(store_liveness) = pd_client.store_liveness() {
         let liveness = store_liveness.check(store_id).await;
         debug!(
-            "store {} liveness after a send failure: {:?}",
-            store_id, liveness
+            store_id = store_id,
+            liveness:? = liveness;
+            "store liveness after a send failure"
         );
     }
 }
@@ -549,10 +551,10 @@ pub(crate) fn liveness_target<PdC: PdClient>(
         .first()
         .map(|peer| (*peer).clone())?;
     debug!(
-        "region {:?}: leader store {} is not reachable, sending to store {}",
-        region.ver_id(),
-        leader.store_id,
-        peer.store_id
+        region:? = region.ver_id(),
+        leader_store_id = leader.store_id,
+        target_store_id = peer.store_id;
+        "leader store is not reachable, sending to fallback store"
     );
     let mut target = region.clone();
     target.leader = Some(peer);
@@ -599,7 +601,7 @@ where
             .collect::<Vec<_>>()
             .await;
         let shards_len = shards.len();
-        debug!("single_plan_handler, shards: {}", shards_len);
+        debug!(shards = shards_len; "single_plan_handler");
         // The first attempt of a plan with one shard (a point get, a batch within one region):
         // run it on this task. Spawning it costs a task, a join set and two cross-thread
         // wake-ups per request, which is a visible share of a point get's latency; with one
@@ -731,8 +733,9 @@ where
             Ok(region_store) => region_store,
             Err(err) => {
                 debug!(
-                    "single_shard_handler::map_store, fallback: {}, error: {:?}",
-                    is_fallback, err
+                    fallback = is_fallback,
+                    error:? = err;
+                    "single_shard_handler::map_store failed"
                 );
                 if is_grpc_error(&err) {
                     check_store_liveness(pd_client, peer.store_id).await;
@@ -765,8 +768,9 @@ where
             ))),
             Err(error) if is_grpc_error(&error) => {
                 debug!(
-                    "single_shard_handler:execute: grpc error, fallback: {}, error: {:?}",
-                    is_fallback, error
+                    fallback = is_fallback,
+                    error:? = error;
+                    "single_shard_handler:execute: grpc error"
                 );
                 let action = grpc_error_action(&error);
                 if matches!(action, GrpcErrorAction::TryNextPeerAndInvalidate) {
@@ -796,7 +800,7 @@ where
                 }
             }
             Err(error) => {
-                debug!("single_shard_handler:execute: error: {:?}", error);
+                debug!(error:? = error; "single_shard_handler:execute: error");
                 CandidateRoundResult::OtherError(error)
             }
         }
@@ -922,10 +926,7 @@ where
         // returning key-level errors, which are interpreted by higher layers.
         if let Some(peer) = leader {
             if let Err(error) = pd_client.update_leader(region_ver_id.clone(), peer).await {
-                debug!(
-                    "failed to update leader after follower fallback: {:?}",
-                    error
-                );
+                debug!(error:? = error; "failed to update leader after follower fallback");
             }
         }
     }
@@ -940,17 +941,13 @@ where
         error: Error,
         backoff_type: BackoffType,
     ) -> ShardStep<P, <Self as Plan>::Result> {
-        match backoff.next_delay_for(backoff_type) {
-            Some(duration) => {
-                metrics::backoff(backoff_type, duration);
-                sleep(duration).await;
-                ShardStep::Again {
-                    plan,
-                    backoff,
-                    candidate_state,
-                }
-            }
-            None => ShardStep::Done(Err(backoff.exhausted(error))),
+        match backoff.backoff(backoff_type, error).await {
+            Ok(()) => ShardStep::Again {
+                plan,
+                backoff,
+                candidate_state,
+            },
+            Err(err) => ShardStep::Done(Err(err)),
         }
     }
 
@@ -1006,10 +1003,10 @@ where
         let region_ver_id = region.ver_id();
         let store_id = region.get_store_id().ok();
         debug!(
-            "single_shard_handler {}, region: {:?}, store: {:?}",
-            plan.label(),
-            region_ver_id,
-            store_id
+            plan = plan.label(),
+            region:? = region_ver_id,
+            store_id:? = store_id;
+            "single_shard_handler"
         );
 
         let followers_only = candidate_state.take_follower_probe();
@@ -1121,7 +1118,7 @@ where
         } = response;
 
         if let Some(error) = key_errors {
-            debug!("single_shard_handler:execute: key errors: {:?}", error);
+            debug!(error:? = error; "single_shard_handler:execute: key errors");
             return ShardStep::Done(Ok(vec![Err(Error::MultipleKeyErrors(error))]));
         }
         let Some(error) = region_error else {
@@ -1193,10 +1190,10 @@ where
         error: errorpb::Error,
     ) -> Result<<Self as Plan>::Result> {
         debug!(
-            "single_shard_handler:execute {}: region error: {:?}, region: {:?}",
-            plan.label(),
-            error,
-            region_ver_id
+            plan = plan.label(),
+            error:? = error,
+            region:? = region_ver_id;
+            "single_shard_handler:execute: region error"
         );
         // For CAS and commit points, an unknown apply outcome must surface on
         // first sight: replaying could contradict its own effect, and a later
@@ -1209,26 +1206,22 @@ where
         // but its step is still charged: client-go does not back off there and relies on the
         // replica selector's per-replica limits, which this crate does not port; charging
         // keeps such retries bounded.
-        let backoff_type = metrics::backoff_type_for_region_error(&error);
-        match backoff.next_delay_for(backoff_type) {
-            Some(duration) => {
-                let region_error_resolved =
-                    handle_region_error(context.pd_client.clone(), error, region_store).await?;
-                if !region_error_resolved {
-                    metrics::backoff(backoff_type, duration);
-                    sleep(duration).await;
-                }
-                Self::single_plan_handler(context, plan, backoff, false).await
-            }
-            None => {
+        retry_on_region_error(
+            context.pd_client.clone(),
+            &mut backoff,
+            error,
+            region_store,
+            false,
+            || {
                 warn!(
-                    "{}: giving up after exhausting retries on region error, region: {:?}",
-                    plan.label(),
-                    region_ver_id
+                    plan = plan.label(),
+                    region:? = region_ver_id;
+                    "giving up after exhausting retries on region error"
                 );
-                Err(backoff.exhausted(Error::RegionError(Box::new(error))))
-            }
-        }
+            },
+        )
+        .await?;
+        Self::single_plan_handler(context, plan, backoff, false).await
     }
 
     async fn retry_after_routing_error(
@@ -1238,7 +1231,7 @@ where
         backoff: Backoff,
         error: Error,
     ) -> Result<<Self as Plan>::Result> {
-        debug!("retry_after_routing_error {}: {:?}", plan.label(), error);
+        debug!(plan = plan.label(), error:? = error; "retry_after_routing_error");
         context.pd_client.invalidate_region_cache(region).await;
         Self::retry_after_error(context, plan, backoff, error).await
     }
@@ -1254,15 +1247,34 @@ where
         } else {
             BackoffType::RegionMiss
         };
-        match backoff.next_delay_for(t) {
-            Some(duration) => {
-                metrics::backoff(t, duration);
-                sleep(duration).await;
-                Self::single_plan_handler(context, plan, backoff, false).await
-            }
-            None => Err(backoff.exhausted(error)),
-        }
+        backoff.backoff(t, error).await?;
+        Self::single_plan_handler(context, plan, backoff, false).await
     }
+}
+
+/// Handle a region error and sleep using `backoff` unless the error was resolved immediately
+/// (e.g. a `NotLeader` carrying a valid leader hint) and `force_sleep` is `false`.
+pub(crate) async fn retry_on_region_error<PdC: PdClient>(
+    pd_client: Arc<PdC>,
+    backoff: &mut Backoff,
+    error: errorpb::Error,
+    region_store: RegionStore,
+    force_sleep: bool,
+    on_exhausted: impl FnOnce(),
+) -> Result<()> {
+    let backoff_type = metrics::backoff_type_for_region_error(&error);
+    let Some(step) = backoff.next_step(backoff_type, None) else {
+        on_exhausted();
+        return Err(backoff.exhausted_for(Some(backoff_type), Error::RegionError(Box::new(error))));
+    };
+    let region_error_resolved = handle_region_error(pd_client, &error, region_store).await?;
+    if !region_error_resolved || force_sleep {
+        let err_for_backoff = Error::RegionError(Box::new(error));
+        backoff
+            .finish_step(backoff_type, step, &err_for_backoff)
+            .await;
+    }
+    Ok(())
 }
 
 // Returns
@@ -1271,15 +1283,15 @@ where
 // 3. Err(Error): can't be resolved, return the error to upper level
 pub(crate) async fn handle_region_error<PdC: PdClient>(
     pd_client: Arc<PdC>,
-    e: errorpb::Error,
+    e: &errorpb::Error,
     region_store: RegionStore,
 ) -> Result<bool> {
     let ver_id = region_store.region_with_leader.ver_id();
     let store_id = region_store.region_with_leader.get_store_id();
-    debug!("handling region error: {:?}, region: {:?}", e, ver_id);
-    metrics::region_error(&e, store_id.as_ref().copied().unwrap_or(0));
-    if let Some(not_leader) = e.not_leader {
-        if let Some(leader) = not_leader.leader {
+    debug!(error:? = e, region:? = ver_id; "handling region error");
+    metrics::region_error(e, store_id.as_ref().copied().unwrap_or(0));
+    if let Some(not_leader) = &e.not_leader {
+        if let Some(leader) = not_leader.leader.clone() {
             match pd_client
                 .update_leader(region_store.region_with_leader.ver_id(), leader)
                 .await
@@ -1304,8 +1316,8 @@ pub(crate) async fn handle_region_error<PdC: PdClient>(
             pd_client.invalidate_store_cache(store_id).await;
         }
         Ok(false)
-    } else if e.epoch_not_match.is_some() {
-        on_region_epoch_not_match(pd_client.clone(), region_store, e.epoch_not_match.unwrap()).await
+    } else if let Some(epoch_not_match) = &e.epoch_not_match {
+        on_region_epoch_not_match(pd_client.clone(), region_store, epoch_not_match.clone()).await
     } else if e.stale_command.is_some() || e.region_not_found.is_some() {
         pd_client.invalidate_region_cache(ver_id).await;
         Ok(false)
@@ -1324,11 +1336,12 @@ pub(crate) async fn handle_region_error<PdC: PdClient>(
         // backoff and may run the one-shot follower probe for ServerIsBusy(0).
         Ok(false)
     } else if e.raft_entry_too_large.is_some() || e.max_timestamp_not_synced.is_some() {
-        Err(Error::RegionError(Box::new(e)))
+        Err(Error::RegionError(Box::new(e.clone())))
     } else {
         debug!(
-            "unknown region error, invalidating region and store caches, region: {:?}: {:?}",
-            ver_id, e
+            region:? = ver_id,
+            error:? = e;
+            "unknown region error, invalidating region and store caches"
         );
         pd_client.invalidate_region_cache(ver_id).await;
         if let Ok(store_id) = store_id {
@@ -1500,14 +1513,10 @@ where
                         return Ok(resp);
                     }
                 }
-                Err(e) if is_grpc_error(&e) => match backoff.next_delay_for(BackoffType::TikvRpc) {
-                    Some(duration) => {
-                        metrics::backoff(BackoffType::TikvRpc, duration);
-                        sleep(duration).await;
-                        continue;
-                    }
-                    None => return Err(backoff.exhausted(e)),
-                },
+                Err(e) if is_grpc_error(&e) => {
+                    backoff.backoff(BackoffType::TikvRpc, e).await?;
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1735,13 +1744,10 @@ where
                 result = self.inner.execute().await?;
             } else {
                 // client-go `BackoffWithMaxSleepTxnLockFast(msBeforeExpired)`.
-                match lock_backoff.next_wait(found.ms_before_expired) {
-                    None => return Err(lock_backoff.exhausted(Error::ResolveLockError(found.live))),
-                    Some(wait) => {
-                        wait.wait(pd_client.clone()).await?;
-                        result = clone.inner.execute().await?;
-                    }
-                }
+                lock_backoff
+                    .wait_or_exhausted(found.ms_before_expired, pd_client, found.live)
+                    .await?;
+                result = clone.inner.execute().await?;
             }
         }
     }
@@ -1833,11 +1839,11 @@ where
 
             // Propagate errors to `retry_multi_region` for retry.
             if let Some(e) = scan_lock_resp.key_errors() {
-                info!("CleanupLocks::execute, inner key errors:{:?}", e);
+                info!(error:? = e; "CleanupLocks::execute inner key errors");
                 result.key_error = Some(e);
                 return Ok(result);
             } else if let Some(e) = scan_lock_resp.region_error() {
-                info!("CleanupLocks::execute, inner region error:{}", e.message);
+                info!(error = e.message.as_str(); "CleanupLocks::execute inner region error");
                 result.region_error = Some(e);
                 return Ok(result);
             }
@@ -1845,7 +1851,7 @@ where
             // Iterate to next batch of inner.
             match scan_lock_resp.has_next_batch() {
                 Some(range) if region.contains(range.0.as_ref()) => {
-                    debug!("CleanupLocks::execute, next range:{:?}", range);
+                    debug!(next_range:? = range; "CleanupLocks::execute next range");
                     inner.next_batch(range);
                 }
                 _ => has_more_batch = false,
@@ -1869,7 +1875,7 @@ where
                     .filter(|l| l.use_async_commit)
                     .collect::<Vec<_>>();
             }
-            debug!("CleanupLocks::execute, meet locks:{}", locks.len());
+            debug!(locks = locks.len(); "CleanupLocks::execute meet locks");
 
             let lock_size = locks.len();
             match lock_resolver
@@ -2075,6 +2081,7 @@ mod test {
 
     use futures::stream::BoxStream;
     use futures::stream::{self};
+    use tokio::time::sleep;
 
     use super::*;
     use crate::mock::MockPdClient;
@@ -2797,6 +2804,136 @@ mod test {
         assert_eq!(
             liveness_target(&untracked, &region).and_then(|t| t.leader),
             region.leader
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_multi_region_logs_backoff_retry_later_and_max_sleep() {
+        use std::any::Any;
+
+        use crate::mock::MockKvClient;
+        use crate::request::PlanBuilder;
+        use crate::transaction::lowering::new_get_request;
+
+        let start = crate::util::log::test_logger::checkpoint();
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |_: &dyn Any| {
+                Ok(Box::new(kvrpcpb::GetResponse {
+                    region_error: Some(errorpb::Error {
+                        message: "not leader test-812".to_owned(),
+                        not_leader: Some(errorpb::NotLeader::default()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }) as Box<dyn Any>)
+            },
+        )));
+        let req = new_get_request(b"k".to_vec().into(), Timestamp::from_version(7777));
+        let bo = Backoff::time_budget(10).start().with_txn_start_ts(7777);
+        let plan = PlanBuilder::new(pd_client, Keyspace::Disable, req)
+            .retry_multi_region(bo)
+            .merge(CollectSingle)
+            .plan();
+        assert!(plan.execute().await.is_err());
+
+        let records = crate::util::log::test_logger::since(start);
+        assert!(
+            records.iter().any(|r| {
+                r.level == log::Level::Debug
+                    && r.message == "backoff"
+                    && r.kv("base") == Some("2")
+                    && r.kv("sleep") == Some("2")
+                    && r.kv("attempts") == Some("0")
+            }),
+            "expected 'backoff' log in plan retry path"
+        );
+        assert!(
+            records.iter().any(|r| {
+                r.level == log::Level::Debug
+                    && r.message == "retry later"
+                    && r.kv("type") == Some("regionScheduling")
+                    && r.kv("txnStartTS") == Some("7777")
+                    && r.kv("error")
+                        .is_some_and(|e| e.contains("not leader test-812"))
+            }),
+            "expected 'retry later' log with txnStartTS in plan retry path"
+        );
+        let warn_rec = records
+            .iter()
+            .find(|r| {
+                r.level == log::Level::Warn
+                    && r.message.starts_with(
+                        "regionScheduling backoffer.maxSleep 10ms is exceeded, errors:",
+                    )
+                    && r.message.contains("not leader test-812")
+            })
+            .expect("expected backoffer.maxSleep WARN from plan retry path");
+        assert!(warn_rec.kvs.is_empty(), "got kvs: {:?}", warn_rec.kvs);
+    }
+
+    #[tokio::test]
+    async fn retry_on_region_error_does_not_record_resolved_not_leader() {
+        let pd = Arc::new(MockPdClient::default().with_update_leader_hook(|_, _| Ok(())));
+        let region_store = pd
+            .clone()
+            .map_region_to_store(MockPdClient::region1())
+            .await
+            .unwrap();
+        let mut bo = Backoff::time_budget(2).start();
+        let start = crate::util::log::test_logger::checkpoint();
+
+        // Resolved NotLeader with leader hint does not sleep and must not record an error.
+        let resolved_err = errorpb::Error {
+            message: "resolved-hint-never-logged".to_owned(),
+            not_leader: Some(errorpb::NotLeader {
+                leader: Some(metapb::Peer {
+                    id: 99,
+                    store_id: 42,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        retry_on_region_error(
+            pd.clone(),
+            &mut bo,
+            resolved_err,
+            region_store.clone(),
+            false,
+            || {},
+        )
+        .await
+        .unwrap();
+
+        // Exhaust on a separate unresolved error: the earlier resolved hint must not appear.
+        let exhausted = retry_on_region_error(
+            pd,
+            &mut bo,
+            errorpb::Error {
+                message: "unresolved-final-err".to_owned(),
+                stale_command: Some(Default::default()),
+                ..Default::default()
+            },
+            region_store,
+            false,
+            || {},
+        )
+        .await;
+        assert!(matches!(exhausted, Err(Error::BackoffExhausted { .. })));
+
+        let records = crate::util::log::test_logger::since(start);
+        let warn_rec = records
+            .iter()
+            .find(|r| {
+                r.level == log::Level::Warn
+                    && r.message.contains("backoffer.maxSleep 2ms is exceeded")
+            })
+            .expect("expected maxSleep WARN");
+        assert!(
+            !warn_rec.message.contains("resolved-hint-never-logged"),
+            "resolved region error should not be in error history: {:?}",
+            warn_rec.message
         );
     }
 }

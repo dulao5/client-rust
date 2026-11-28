@@ -17,6 +17,7 @@ use super::timestamp::TimestampOracle;
 use crate::internal_err;
 use crate::proto::keyspacepb;
 use crate::proto::pdpb;
+use crate::util::log::GoDuration;
 use crate::Error;
 use crate::Result;
 use crate::SecurityManager;
@@ -83,6 +84,10 @@ impl Cluster {
 
     pub async fn get_timestamp(&self) -> Result<Timestamp> {
         self.tso.clone().get_timestamp().await
+    }
+
+    pub async fn get_timestamp_silent(&self) -> Result<Timestamp> {
+        self.tso.clone().get_timestamp_silent().await
     }
 
     pub async fn update_safepoint(
@@ -154,7 +159,7 @@ impl Connection {
             tso,
         };
 
-        info!("updating PD client done, spent {:?}", start.elapsed());
+        info!(spent:% = GoDuration(start.elapsed()); "updating PD client done");
         Ok(())
     }
 
@@ -176,7 +181,7 @@ impl Connection {
                 Ok(resp) => resp,
                 // Ignore failed PD node.
                 Err(e) => {
-                    warn!("PD endpoint {} failed to respond: {:?}", ep, e);
+                    warn!(endpoint = ep.as_str(), error:? = e; "PD endpoint failed to respond");
                     continue;
                 }
             };
@@ -203,7 +208,7 @@ impl Connection {
 
         match members {
             Some(members) => {
-                info!("All PD endpoints are consistent: {:?}", endpoints);
+                info!(endpoints:? = endpoints; "all PD endpoints are consistent");
                 Ok(members)
             }
             _ => Err(internal_err!("PD cluster failed to respond")),
@@ -319,7 +324,7 @@ impl Connection {
                         break 'outer;
                     }
                     Err(e) => {
-                        error!("failed to connect to {}, {:?}", ep, e);
+                        error!(endpoint = ep.as_str(), error:? = e; "failed to connect to PD endpoint");
                         continue;
                     }
                 }

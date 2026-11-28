@@ -144,12 +144,12 @@ impl KvConnect for TikvConnect {
         {
             Ok(grpc) => grpc,
             Err(e) => {
-                info!("[health check] connect to store {address} failed: {e:?}");
+                info!(store = address, error:% = e; "[health check] create grpc connection failed");
                 return Liveness::Unreachable;
             }
         };
         if let Err(e) = grpc.ready().await {
-            info!("[health check] store {address} not ready: {e:?}");
+            info!(store = address, error:% = e; "[health check] create grpc connection failed");
             return Liveness::Unreachable;
         }
         let mut request = tonic::Request::new(liveness::HealthCheckRequest::default());
@@ -165,13 +165,18 @@ impl KvConnect for TikvConnect {
             Ok(response) => {
                 let status = response.into_inner().status;
                 let liveness = liveness::liveness_of_status(status);
-                if liveness != Liveness::Reachable {
-                    info!("[health check] store {address} health status {status}: {liveness:?}");
+                if liveness == Liveness::Unknown {
+                    info!(store = address; "[health check] check health returns unknown");
+                } else if liveness != Liveness::Reachable {
+                    info!(
+                        status:% = liveness::ServingStatusDisplay(status);
+                        "[health check] service not serving"
+                    );
                 }
                 liveness
             }
             Err(status) => {
-                info!("[health check] check store {address} failed: {status:?}");
+                info!(store = address, error:% = status; "[health check] check health error");
                 Liveness::Unreachable
             }
         }

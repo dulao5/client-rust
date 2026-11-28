@@ -526,10 +526,10 @@ pub(crate) fn backoff_type_for_region_error(e: &errorpb::Error) -> BackoffType {
     }
 }
 
-/// About to sleep `delay` before a retry (client-go `Backoffer.BackoffWithCfgAndMaxSleep`
-/// observes each sleep).
+/// Record `delay` in the backoff histogram (client-go `Backoffer.BackoffWithCfgAndMaxSleep`
+/// observes each sleep; `"backoff"` debug logging happens in `backoff.rs` with `base`, `sleep`,
+/// `attempts`).
 pub(crate) fn backoff(t: BackoffType, delay: Duration) {
-    log::debug!("backoff {} {} ms", t.go_config(), delay.as_millis());
     if !ENABLED {
         return;
     }

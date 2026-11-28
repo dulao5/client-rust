@@ -462,8 +462,20 @@ async fn txn_read_recovers_expired_async_commit_locks() -> Result<()> {
     assert_eq!(reader.get(secondary).await?, Some(secondary_value));
     reader.rollback().await?;
 
-    let ts = client.current_timestamp().await?;
-    assert_eq!(client.scan_locks(&ts, .., 1024).await?.len(), 0);
+    // `resolve_locks_for_read` resolves settled transactions' locks in a spawned
+    // background task (`resolve_in_background`), so reads return before the
+    // ResolveLock RPCs necessarily finish. Poll briefly for the background cleanup
+    // to drain.
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    let remaining = loop {
+        let ts = client.current_timestamp().await?;
+        let count = client.scan_locks(&ts, .., 1024).await?.len();
+        if count == 0 || tokio::time::Instant::now() >= deadline {
+            break count;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    };
+    assert_eq!(remaining, 0);
 
     scenario.teardown();
     Ok(())

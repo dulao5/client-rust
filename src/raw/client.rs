@@ -5,7 +5,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use log::debug;
-use tokio::time::sleep;
 
 use crate::backoff::{DEFAULT_REGION_BACKOFF, DEFAULT_STORE_BACKOFF};
 use crate::common::Error;
@@ -831,16 +830,22 @@ impl<PdC: PdClient> Client<PdC> {
                 Ok(mut r) => {
                     if let Some(err) = r.region_error() {
                         let status =
-                            plan::handle_region_error(self.rpc.clone(), err.clone(), store.clone())
+                            plan::handle_region_error(self.rpc.clone(), &err, store.clone())
                                 .await?;
-                        if status {
-                            continue;
-                        } else if let Some(duration) = scan_args.backoff.next_delay_duration() {
-                            sleep(duration).await;
-                            continue;
-                        } else {
-                            return Err(RegionError(Box::new(err)));
+                        if !status {
+                            let region_err = RegionError(Box::new(err));
+                            if let Err(exhausted_err) = scan_args
+                                .backoff
+                                .backoff(crate::metrics::BackoffType::RegionMiss, region_err)
+                                .await
+                            {
+                                return Err(match exhausted_err {
+                                    Error::BackoffExhausted { last, .. } => *last,
+                                    other => other,
+                                });
+                            }
                         }
+                        continue;
                     }
                     Ok((Some(r), region.end_key()))
                 }
@@ -988,6 +993,53 @@ mod tests {
         assert_eq!(pairs, vec![KvPair(vec![251].into(), vec![42])]);
         assert_eq!(request_count.load(Ordering::SeqCst), 1);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_scan_exhaustion_preserves_region_error() {
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |_: &dyn Any| {
+                Ok(Box::new(kvrpcpb::RawScanResponse {
+                    region_error: Some(crate::proto::errorpb::Error {
+                        message: "raw-scan-not-leader".to_owned(),
+                        not_leader: Some(crate::proto::errorpb::NotLeader::default()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }) as Box<dyn Any>)
+            },
+        )));
+        let client = Client {
+            rpc: pd_client,
+            cf: None,
+            backoff: DEFAULT_REGION_BACKOFF,
+            atomic: false,
+            keyspace: Keyspace::Disable,
+        };
+
+        let start = crate::util::log::test_logger::checkpoint();
+        let err = client
+            .retryable_scan(ScanInnerArgs {
+                start_key: Key::from(vec![1]),
+                end_key: Some(Key::from(vec![2])),
+                limit: 10,
+                key_only: false,
+                reverse: false,
+                backoff: Backoff::time_budget(2).start(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::RegionError(re) if re.message == "raw-scan-not-leader"),
+            "expected original RegionError preserved on exhaustion, got {err:?}"
+        );
+        let records = crate::util::log::test_logger::since(start);
+        assert!(records.iter().any(|r| {
+            r.level == log::Level::Warn
+                && r.message
+                    .starts_with("regionMiss backoffer.maxSleep 2ms is exceeded, errors:")
+                && r.message.contains("raw-scan-not-leader")
+        }));
     }
 
     #[tokio::test]

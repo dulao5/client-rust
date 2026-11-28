@@ -28,7 +28,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::debug;
-use tokio::time::sleep;
 
 use super::coprocessor::CoprocessorRpc;
 use crate::backoff::Backoff;
@@ -214,14 +213,7 @@ impl<PdC: PdClient> CopSender<PdC> {
 
     /// Backs off `t` on `bo`, or returns `error` wrapped as the budget's exhaustion.
     async fn backoff(bo: &mut Backoff, t: BackoffType, error: Error) -> Result<()> {
-        match bo.next_delay_for(t) {
-            Some(delay) => {
-                metrics::backoff(t, delay);
-                sleep(delay).await;
-                Ok(())
-            }
-            None => Err(bo.exhausted(error)),
-        }
+        bo.backoff(t, error).await
     }
 
     /// One coprocessor request to region `ver_id` with `SendReqCtx` semantics (module docs).
@@ -236,6 +228,9 @@ impl<PdC: PdClient> CopSender<PdC> {
         mut req: coprocessor::Request,
         timeout: Duration,
     ) -> Result<CopSendResult> {
+        if bo.txn_start_ts().is_none() {
+            bo.set_txn_start_ts(self.timestamp.version());
+        }
         req.context.get_or_insert_with(Default::default).api_version =
             self.keyspace.api_version().into();
         loop {
@@ -311,7 +306,7 @@ impl<PdC: PdClient> CopSender<PdC> {
             let mut resp = match result {
                 Ok(resp) => resp,
                 Err(e) if is_grpc_error(&e) => {
-                    debug!("cop send: grpc error, region {:?}: {:?}", ver_id, e);
+                    debug!(region:? = ver_id, error:? = e; "cop send: grpc error");
                     match grpc_error_action(&e) {
                         GrpcErrorAction::TryNextPeerAndInvalidate => {
                             if let Some(store_id) = target_store_id {
@@ -330,10 +325,7 @@ impl<PdC: PdClient> CopSender<PdC> {
             };
 
             if let Some(region_error) = resp.region_error.take() {
-                debug!(
-                    "cop send: region error, region {:?}: {:?}",
-                    ver_id, region_error
-                );
+                debug!(region:? = ver_id, error:? = region_error; "cop send: region error");
                 // TiKV gave up at the `tikv_client_read_timeout` deadline: retry at once with
                 // the default timeout (`onReadReqConfigurableTimeout`).
                 let ctx = req.context.get_or_insert_with(Default::default);
@@ -348,18 +340,15 @@ impl<PdC: PdClient> CopSender<PdC> {
                 }
                 if !retried_in_place(&region_error) {
                     // Update the cache and hand the error back: the caller re-splits.
-                    let _ = handle_region_error(
-                        self.pd_client.clone(),
-                        region_error.clone(),
-                        region_store,
-                    )
-                    .await;
+                    let _ =
+                        handle_region_error(self.pd_client.clone(), &region_error, region_store)
+                            .await;
                     resp.region_error = Some(region_error);
                     return Ok(CopSendResult { resp, rpc_ctx });
                 }
                 let t = metrics::backoff_type_for_region_error(&region_error);
                 let resolved =
-                    handle_region_error(self.pd_client.clone(), region_error.clone(), region_store)
+                    handle_region_error(self.pd_client.clone(), &region_error, region_store)
                         .await?;
                 if !resolved {
                     Self::backoff(bo, t, Error::RegionError(Box::new(region_error))).await?;
@@ -380,6 +369,9 @@ impl<PdC: PdClient> CopSender<PdC> {
     /// waits for a live lock (`BackoffWithMaxSleepTxnLockFast(msBeforeExpired)`), all charged
     /// to `bo`.
     pub async fn resolve_lock(&self, bo: &mut Backoff, lock: kvrpcpb::LockInfo) -> Result<()> {
+        if bo.txn_start_ts().is_none() {
+            bo.set_txn_start_ts(self.timestamp.version());
+        }
         let read = resolve_locks_for_read(
             expand_shared_lock(lock),
             self.timestamp.clone(),
@@ -392,10 +384,9 @@ impl<PdC: PdClient> CopSender<PdC> {
         self.lock_hints.record(self.timestamp.version(), &read);
         if !read.live.is_empty() {
             let mut lock_backoff = LockBackoff::new(bo.clone());
-            match lock_backoff.next_wait(read.ms_before_expired) {
-                Some(wait) => wait.wait(self.pd_client.clone()).await?,
-                None => return Err(lock_backoff.exhausted(Error::ResolveLockError(read.live))),
-            }
+            lock_backoff
+                .wait_or_exhausted(read.ms_before_expired, self.pd_client.clone(), read.live)
+                .await?;
         }
         Ok(())
     }

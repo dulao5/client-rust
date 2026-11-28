@@ -110,7 +110,7 @@ impl SecurityManager {
     where
         Factory: FnOnce(Channel) -> Client,
     {
-        info!("connect to rpc server at endpoint: {:?}", addr);
+        info!(endpoint = addr; "connect to rpc server");
         let channel = if self.tls_configured() {
             self.tls_channel(addr).await?
         } else {
