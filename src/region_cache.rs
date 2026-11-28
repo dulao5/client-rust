@@ -96,6 +96,23 @@ impl<C: RetryClientTrait> RegionCache<C> {
         self.read_through_region_by_key(key.clone()).await
     }
 
+    /// Look up a cached region by its exact [`RegionVerId`] without querying PD.
+    ///
+    /// Mirrors client-go `RegionCache.GetCachedRegionWithRLock`
+    /// (`internal/locate/region_cache.go:2549-2554`): returns `None` when the cache does not
+    /// hold this exact epoch (for example after an invalidation, split, or merge).
+    pub async fn get_cached_region_by_ver_id(
+        &self,
+        ver_id: &RegionVerId,
+    ) -> Option<RegionWithLeader> {
+        self.region_cache
+            .read()
+            .await
+            .ver_id_to_region
+            .get(ver_id)
+            .cloned()
+    }
+
     // Retrieve cache entry by RegionId. If there's no entry, query PD and update cache.
     pub async fn get_region_by_id(&self, id: RegionId) -> Result<RegionWithLeader> {
         for _ in 0..=MAX_RETRY_WAITING_CONCURRENT_REQUEST {
@@ -613,6 +630,61 @@ mod test {
         assert!(cache.get_region_by_key(&vec![25].into()).await.is_err());
         assert_eq!(cache.get_region_by_key(&vec![60].into()).await?, region4);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_cached_region_by_ver_id() {
+        let retry_client = Arc::new(MockRetryClient::default());
+        let cache = RegionCache::new(retry_client.clone());
+
+        let r1 = region(470, vec![], vec![10]);
+        let r2 = region(471, vec![10], vec![20]);
+        let ver1 = r1.ver_id();
+
+        // Missing from cache: returns None without touching PD.
+        assert!(cache.get_cached_region_by_ver_id(&ver1).await.is_none());
+        assert_eq!(retry_client.get_region_count.load(SeqCst), 0);
+
+        cache.add_region(r1.clone()).await;
+        cache.add_region(r2.clone()).await;
+
+        // Exact ver_id hit: returns the cached region without touching PD.
+        assert_eq!(cache.get_cached_region_by_ver_id(&ver1).await, Some(r1));
+        assert_eq!(retry_client.get_region_count.load(SeqCst), 0);
+
+        // Stale epoch miss: returns None without touching PD.
+        let mut stale = ver1.clone();
+        stale.ver += 1;
+        assert!(cache.get_cached_region_by_ver_id(&stale).await.is_none());
+        assert_eq!(retry_client.get_region_count.load(SeqCst), 0);
+
+        // Invalidated region miss: returns None without touching PD.
+        cache.invalidate_region_cache(ver1.clone()).await;
+        assert!(cache.get_cached_region_by_ver_id(&ver1).await.is_none());
+        assert_eq!(retry_client.get_region_count.load(SeqCst), 0);
+
+        // Region evicted by a merged overlapping region: returns None without touching PD.
+        let merged = RegionWithLeader {
+            region: metapb::Region {
+                id: 471,
+                start_key: vec![],
+                end_key: vec![20],
+                region_epoch: Some(RegionEpoch {
+                    conf_ver: 0,
+                    version: 1,
+                }),
+                ..Default::default()
+            },
+            leader: None,
+        };
+        cache.add_region(region(470, vec![], vec![10])).await;
+        cache.add_region(merged.clone()).await;
+        assert!(cache.get_cached_region_by_ver_id(&ver1).await.is_none());
+        assert_eq!(
+            cache.get_cached_region_by_ver_id(&merged.ver_id()).await,
+            Some(merged)
+        );
+        assert_eq!(retry_client.get_region_count.load(SeqCst), 0);
     }
 
     // a helper function to assert the cache is in expected state

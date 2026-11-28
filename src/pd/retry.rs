@@ -186,19 +186,17 @@ impl RetryClientTrait for RetryClient<Cluster> {
     }
 
     async fn get_region_by_id(self: Arc<Self>, region_id: RegionId) -> Result<RegionWithLeader> {
-        retry_mut!(
+        // PD returning an empty `region` field is a valid answer that the region ID no longer
+        // exists (e.g. merged away), not a PD transport/leader failure. Do not retry or
+        // reconnect PD on it, matching client-go `RegionCache.loadRegionByID`
+        // (`internal/locate/region_cache.go:2210-2212`).
+        let resp = retry_mut!(
             self,
             "get_region_by_id",
             PdCmd::GetRegionById,
-            |cluster| async {
-                cluster
-                    .get_region_by_id(region_id, self.timeout)
-                    .await
-                    .and_then(|resp| {
-                        region_from_response(resp, || Error::RegionNotFoundInResponse { region_id })
-                    })
-            }
-        )
+            |cluster| async { cluster.get_region_by_id(region_id, self.timeout).await }
+        )?;
+        region_from_response(resp, || Error::RegionNotFoundInResponse { region_id })
     }
 
     async fn get_store(self: Arc<Self>, id: StoreId) -> Result<metapb::Store> {
@@ -437,5 +435,173 @@ mod test {
             assert!(retry_max_ok(client.clone(), max_retries).await.is_ok());
             assert_eq!(client.cluster.read().await.0.load(Ordering::SeqCst), 2);
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_region_by_id_not_found_does_not_retry_or_reconnect() {
+        use std::convert::Infallible;
+        use std::task::Context;
+        use std::task::Poll;
+
+        use tonic::codegen::http;
+        use tonic::codegen::Body;
+        use tonic::codegen::BoxFuture;
+        use tonic::codegen::Service;
+        use tonic::codegen::StdError;
+        use tonic::server::NamedService;
+        use tonic::server::UnaryService;
+        use tonic::transport::server::TcpIncoming;
+        use tonic::transport::Server;
+
+        #[derive(Clone)]
+        struct MissingRegionPd {
+            addr: String,
+            get_members_calls: Arc<AtomicUsize>,
+            get_region_by_id_calls: Arc<AtomicUsize>,
+        }
+
+        impl NamedService for MissingRegionPd {
+            const NAME: &'static str = "pdpb.PD";
+        }
+
+        struct GetMembersSvc(String, Arc<AtomicUsize>);
+        impl UnaryService<pdpb::GetMembersRequest> for GetMembersSvc {
+            type Response = pdpb::GetMembersResponse;
+            type Future = futures::future::Ready<
+                std::result::Result<tonic::Response<Self::Response>, tonic::Status>,
+            >;
+
+            fn call(&mut self, _req: tonic::Request<pdpb::GetMembersRequest>) -> Self::Future {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                let member = pdpb::Member {
+                    member_id: 1,
+                    client_urls: vec![self.0.clone()],
+                    ..Default::default()
+                };
+                futures::future::ready(Ok(tonic::Response::new(pdpb::GetMembersResponse {
+                    header: Some(pdpb::ResponseHeader {
+                        cluster_id: 42,
+                        ..Default::default()
+                    }),
+                    members: vec![member.clone()],
+                    leader: Some(member),
+                    ..Default::default()
+                })))
+            }
+        }
+
+        struct GetRegionByIdSvc(Arc<AtomicUsize>);
+        impl UnaryService<pdpb::GetRegionByIdRequest> for GetRegionByIdSvc {
+            type Response = pdpb::GetRegionResponse;
+            type Future = futures::future::Ready<
+                std::result::Result<tonic::Response<Self::Response>, tonic::Status>,
+            >;
+
+            fn call(&mut self, _req: tonic::Request<pdpb::GetRegionByIdRequest>) -> Self::Future {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                // Healthy PD response for a merged-away region: header ok, region is None.
+                futures::future::ready(Ok(tonic::Response::new(pdpb::GetRegionResponse {
+                    header: Some(pdpb::ResponseHeader {
+                        cluster_id: 42,
+                        ..Default::default()
+                    }),
+                    region: None,
+                    leader: None,
+                    ..Default::default()
+                })))
+            }
+        }
+
+        impl<B> Service<http::Request<B>> for MissingRegionPd
+        where
+            B: Body + Send + 'static,
+            B::Error: Into<StdError> + Send + 'static,
+        {
+            type Response = http::Response<tonic::body::BoxBody>;
+            type Error = Infallible;
+            type Future = BoxFuture<Self::Response, Self::Error>;
+
+            fn poll_ready(
+                &mut self,
+                _: &mut Context<'_>,
+            ) -> Poll<std::result::Result<(), Infallible>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, req: http::Request<B>) -> Self::Future {
+                let path = req.uri().path().to_owned();
+                let addr = self.addr.clone();
+                let members = self.get_members_calls.clone();
+                let by_id = self.get_region_by_id_calls.clone();
+                Box::pin(async move {
+                    let resp = match path.as_str() {
+                        "/pdpb.PD/GetMembers" => {
+                            let mut grpc =
+                                tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                            grpc.unary(GetMembersSvc(addr, members), req).await
+                        }
+                        "/pdpb.PD/GetRegionByID" => {
+                            let mut grpc =
+                                tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                            grpc.unary(GetRegionByIdSvc(by_id), req).await
+                        }
+                        other => panic!("unexpected PD path: {other}"),
+                    };
+                    Ok(resp)
+                })
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let endpoint = format!("{addr}");
+        let incoming = TcpIncoming::from_listener(listener, true, None).unwrap();
+        let get_members_calls = Arc::new(AtomicUsize::new(0));
+        let get_region_by_id_calls = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(MissingRegionPd {
+                    addr: endpoint.clone(),
+                    get_members_calls: get_members_calls.clone(),
+                    get_region_by_id_calls: get_region_by_id_calls.clone(),
+                })
+                .serve_with_incoming(incoming),
+        );
+
+        let client = Arc::new(
+            RetryClient::connect(
+                &[endpoint],
+                Arc::new(SecurityManager::default()),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap(),
+        );
+        let members_after_connect = get_members_calls.load(Ordering::SeqCst);
+
+        let start = Instant::now();
+        let err = client.get_region_by_id(470).await.unwrap_err();
+        let elapsed = start.elapsed();
+
+        server.abort();
+
+        assert!(
+            matches!(err, Error::RegionNotFoundInResponse { region_id: 470 }),
+            "expected RegionNotFoundInResponse(470), got {err:?}"
+        );
+        assert_eq!(
+            get_region_by_id_calls.load(Ordering::SeqCst),
+            1,
+            "missing region ID must not be retried"
+        );
+        assert_eq!(
+            get_members_calls.load(Ordering::SeqCst),
+            members_after_connect,
+            "missing region ID must not trigger PD reconnects"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "missing region ID must fail immediately without retry backoff, took {elapsed:?}"
+        );
     }
 }

@@ -35,6 +35,7 @@ use crate::store::{KvClient, Store};
 use crate::transaction::LockResolverState;
 use crate::BoundRange;
 use crate::Config;
+use crate::Error;
 use crate::Key;
 use crate::Result;
 use crate::SecurityManager;
@@ -69,6 +70,25 @@ pub trait PdClient: Send + Sync + 'static {
 
     /// In transactional API, the returned region is decoded (keys in raw format)
     async fn region_for_id(&self, id: RegionId) -> Result<RegionWithLeader>;
+
+    /// Look up `ver_id` in the local region cache without querying PD.
+    ///
+    /// Mirrors client-go `RegionCache.GetCachedRegionWithRLock`
+    /// (`internal/locate/region_cache.go:2549-2554`): returns `Ok(None)` when the cache does
+    /// not hold this exact `(id, conf_ver, ver)` entry (e.g. invalidated or replaced after a
+    /// split/merge).
+    ///
+    /// In transactional API, the returned region is decoded (keys in raw format).
+    async fn cached_region_for_ver_id(
+        &self,
+        ver_id: &RegionVerId,
+    ) -> Result<Option<RegionWithLeader>> {
+        match self.region_for_id(ver_id.id).await {
+            Ok(region) if region.ver_id() == *ver_id => Ok(Some(region)),
+            Ok(_) | Err(Error::RegionNotFoundInResponse { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp>;
 
@@ -295,6 +315,18 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
     async fn region_for_id(&self, id: RegionId) -> Result<RegionWithLeader> {
         let region = self.region_cache.get_region_by_id(id).await?;
         Self::decode_region(region, self.enable_codec)
+    }
+
+    async fn cached_region_for_ver_id(
+        &self,
+        ver_id: &RegionVerId,
+    ) -> Result<Option<RegionWithLeader>> {
+        // Cache-only lookup matching client-go `RegionCache.GetCachedRegionWithRLock`
+        // (`internal/locate/region_cache.go:2549-2554`): never query PD by region ID on miss.
+        match self.region_cache.get_cached_region_by_ver_id(ver_id).await {
+            Some(region) => Self::decode_region(region, self.enable_codec).map(Some),
+            None => Ok(None),
+        }
     }
 
     fn lock_resolver_state(&self) -> Option<&LockResolverState> {
