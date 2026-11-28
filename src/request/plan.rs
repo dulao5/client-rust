@@ -1263,18 +1263,16 @@ pub(crate) async fn retry_on_region_error<PdC: PdClient>(
     on_exhausted: impl FnOnce(),
 ) -> Result<()> {
     let backoff_type = metrics::backoff_type_for_region_error(&error);
-    let err_for_backoff = Error::RegionError(Box::new(error.clone()));
     let Some(step) = backoff.next_step(backoff_type, None) else {
         on_exhausted();
-        return Err(backoff.exhausted_for(Some(backoff_type), err_for_backoff));
+        return Err(backoff.exhausted_for(Some(backoff_type), Error::RegionError(Box::new(error))));
     };
-    let region_error_resolved = handle_region_error(pd_client, error, region_store).await?;
+    let region_error_resolved = handle_region_error(pd_client, &error, region_store).await?;
     if !region_error_resolved || force_sleep {
+        let err_for_backoff = Error::RegionError(Box::new(error));
         backoff
             .finish_step(backoff_type, step, &err_for_backoff)
             .await;
-    } else {
-        backoff.record_error(&err_for_backoff);
     }
     Ok(())
 }
@@ -1285,15 +1283,15 @@ pub(crate) async fn retry_on_region_error<PdC: PdClient>(
 // 3. Err(Error): can't be resolved, return the error to upper level
 pub(crate) async fn handle_region_error<PdC: PdClient>(
     pd_client: Arc<PdC>,
-    e: errorpb::Error,
+    e: &errorpb::Error,
     region_store: RegionStore,
 ) -> Result<bool> {
     let ver_id = region_store.region_with_leader.ver_id();
     let store_id = region_store.region_with_leader.get_store_id();
     debug!(error:? = e, region:? = ver_id; "handling region error");
-    metrics::region_error(&e, store_id.as_ref().copied().unwrap_or(0));
-    if let Some(not_leader) = e.not_leader {
-        if let Some(leader) = not_leader.leader {
+    metrics::region_error(e, store_id.as_ref().copied().unwrap_or(0));
+    if let Some(not_leader) = &e.not_leader {
+        if let Some(leader) = not_leader.leader.clone() {
             match pd_client
                 .update_leader(region_store.region_with_leader.ver_id(), leader)
                 .await
@@ -1318,8 +1316,8 @@ pub(crate) async fn handle_region_error<PdC: PdClient>(
             pd_client.invalidate_store_cache(store_id).await;
         }
         Ok(false)
-    } else if e.epoch_not_match.is_some() {
-        on_region_epoch_not_match(pd_client.clone(), region_store, e.epoch_not_match.unwrap()).await
+    } else if let Some(epoch_not_match) = &e.epoch_not_match {
+        on_region_epoch_not_match(pd_client.clone(), region_store, epoch_not_match.clone()).await
     } else if e.stale_command.is_some() || e.region_not_found.is_some() {
         pd_client.invalidate_region_cache(ver_id).await;
         Ok(false)
@@ -1338,7 +1336,7 @@ pub(crate) async fn handle_region_error<PdC: PdClient>(
         // backoff and may run the one-shot follower probe for ServerIsBusy(0).
         Ok(false)
     } else if e.raft_entry_too_large.is_some() || e.max_timestamp_not_synced.is_some() {
-        Err(Error::RegionError(Box::new(e)))
+        Err(Error::RegionError(Box::new(e.clone())))
     } else {
         debug!(
             region:? = ver_id,
@@ -2871,5 +2869,71 @@ mod test {
             })
             .expect("expected backoffer.maxSleep WARN from plan retry path");
         assert!(warn_rec.kvs.is_empty(), "got kvs: {:?}", warn_rec.kvs);
+    }
+
+    #[tokio::test]
+    async fn retry_on_region_error_does_not_record_resolved_not_leader() {
+        let pd = Arc::new(MockPdClient::default().with_update_leader_hook(|_, _| Ok(())));
+        let region_store = pd
+            .clone()
+            .map_region_to_store(MockPdClient::region1())
+            .await
+            .unwrap();
+        let mut bo = Backoff::time_budget(2).start();
+        let start = crate::util::log::test_logger::checkpoint();
+
+        // Resolved NotLeader with leader hint does not sleep and must not record an error.
+        let resolved_err = errorpb::Error {
+            message: "resolved-hint-never-logged".to_owned(),
+            not_leader: Some(errorpb::NotLeader {
+                leader: Some(metapb::Peer {
+                    id: 99,
+                    store_id: 42,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        retry_on_region_error(
+            pd.clone(),
+            &mut bo,
+            resolved_err,
+            region_store.clone(),
+            false,
+            || {},
+        )
+        .await
+        .unwrap();
+
+        // Exhaust on a separate unresolved error: the earlier resolved hint must not appear.
+        let exhausted = retry_on_region_error(
+            pd,
+            &mut bo,
+            errorpb::Error {
+                message: "unresolved-final-err".to_owned(),
+                stale_command: Some(Default::default()),
+                ..Default::default()
+            },
+            region_store,
+            false,
+            || {},
+        )
+        .await;
+        assert!(matches!(exhausted, Err(Error::BackoffExhausted { .. })));
+
+        let records = crate::util::log::test_logger::since(start);
+        let warn_rec = records
+            .iter()
+            .find(|r| {
+                r.level == log::Level::Warn
+                    && r.message.contains("backoffer.maxSleep 2ms is exceeded")
+            })
+            .expect("expected maxSleep WARN");
+        assert!(
+            !warn_rec.message.contains("resolved-hint-never-logged"),
+            "resolved region error should not be in error history: {:?}",
+            warn_rec.message
+        );
     }
 }

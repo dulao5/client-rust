@@ -63,6 +63,9 @@ fn write_scaled(
 
 /// Zero-allocation formatter for `SystemTime` in UTC matching Go's `time.RFC3339Nano`
 /// (`YYYY-MM-DDTHH:MM:SSZ` or `YYYY-MM-DDTHH:MM:SS.<trimmed_nanos>Z`).
+///
+/// Formats in UTC (`Z`) rather than local offset because Rust `std` exposes no local timezone
+/// API without `unsafe` FFI or adding an external timezone crate dependency.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Rfc3339NanoUtc(pub(crate) SystemTime);
 

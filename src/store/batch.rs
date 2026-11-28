@@ -390,16 +390,35 @@ struct SendLoop {
     cfg: BatchConfig,
 }
 
+static INIT_BATCH_POLICY_WARN: std::sync::Once = std::sync::Once::new();
+
+struct RequestIdsDisplay<'a>(&'a [u64]);
+
+impl std::fmt::Display for RequestIdsDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[")?;
+        for (i, id) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{id}")?;
+        }
+        f.write_str("]")
+    }
+}
+
 impl SendLoop {
     /// client-go `batchSendLoop` (client_batch.go:610-677). Ends when every [`BatchConn`]
     /// handle is dropped.
     async fn run(mut self) {
         let (mut trigger, ok) = TurboBatchTrigger::from_policy(&self.cfg.batch_policy);
         if !ok {
-            warn!(
-                value = self.cfg.batch_policy.as_str();
-                "fallback to default batch policy due to invalid value"
-            );
+            INIT_BATCH_POLICY_WARN.call_once(|| {
+                warn!(
+                    value = self.cfg.batch_policy.as_str();
+                    "fallback to default batch policy due to invalid value"
+                );
+            });
         }
         let turbo_wait = trigger.turbo_wait_time();
         let max_batch_size = self.cfg.max_batch_size.max(1);
@@ -682,7 +701,7 @@ impl BatchCommandsClient {
             info!(
                 "target" = self.target.as_str(),
                 forwardedHost = "",
-                requestIDs:? = req.request_ids,
+                requestIDs:% = RequestIdsDisplay(&req.request_ids),
                 error:% = err_status;
                 "sending batch commands meets error"
             );
@@ -801,8 +820,9 @@ impl BatchCommandsClient {
         let _guard = PendingGuard(&self);
         let mut rx = Some(rx);
         // client-go retries the stream with `BoTiKVRPC` (100 ms → 2 s, equal jitter,
-        // config/retry/config.go:122) until it is recreated.
-        let mut backoff = Backoff::equal_jitter_backoff(100, 2000, u32::MAX);
+        // config/retry/config.go:122) backed by `NewBackofferWithVars(ctx, math.MaxInt32, nil)`
+        // (client_batch.go:1146) until it is recreated.
+        let mut backoff = Backoff::time_budget(i32::MAX as u64).start();
         let mut failed_unused = false;
         loop {
             let mut healthy = false;
@@ -836,7 +856,7 @@ impl BatchCommandsClient {
             // and a recreated stream that fails again before any response is taken as a
             // connection that is not ready.
             if healthy {
-                backoff = Backoff::equal_jitter_backoff(100, 2000, u32::MAX);
+                backoff = Backoff::time_budget(i32::MAX as u64).start();
                 failed_unused = false;
             } else if !failed_unused {
                 failed_unused = true;
@@ -1440,5 +1460,12 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .recreating
         );
+    }
+
+    #[test]
+    fn request_ids_display_matches_go_compact_slice() {
+        assert_eq!(RequestIdsDisplay(&[]).to_string(), "[]");
+        assert_eq!(RequestIdsDisplay(&[7]).to_string(), "[7]");
+        assert_eq!(RequestIdsDisplay(&[1, 2, 3]).to_string(), "[1,2,3]");
     }
 }

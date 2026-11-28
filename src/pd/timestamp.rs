@@ -87,15 +87,20 @@ impl TimestampOracle {
         Ok(TimestampOracle { request_tx })
     }
 
-    /// Fetch a timestamp from PD.
-    ///
-    /// Unlike `client-go`'s `pdOracle` (which exposes both synchronous `GetTimestamp`, logging
-    /// `"get timestamp too slow"` above `30ms`, and pipelined `GetTimestampAsync` / `tsFuture`,
-    /// plus `GetMinTS` for `"get minimum timestamp too slow"`), `client-rust` routes every
-    /// timestamp fetch (`current_timestamp`, transaction begin, commit, lock wait, and
-    /// low-resolution refresh) through this single synchronous path and does not implement
-    /// `GetTimestampAsync` or `GetMinTS`.
+    /// Fetch a timestamp from PD, warning if latency exceeds `30ms` (`oracle/oracles/pd.go:252`).
     pub(crate) async fn get_timestamp(self) -> Result<Timestamp> {
+        self.get_timestamp_inner(true).await
+    }
+
+    /// Fetch a timestamp from PD without emitting `"get timestamp too slow"` warnings.
+    ///
+    /// Matches `client-go`'s `GetTimestampAsync` / `tsFuture.Wait` (`oracle/oracles/pd.go:236-250`).
+    /// (`GetMinTS` / `"get minimum timestamp too slow"` is not implemented in `client-rust`.)
+    pub(crate) async fn get_timestamp_silent(self) -> Result<Timestamp> {
+        self.get_timestamp_inner(false).await
+    }
+
+    async fn get_timestamp_inner(self, log_slow: bool) -> Result<Timestamp> {
         debug!("getting current timestamp");
         let start = std::time::Instant::now();
         let (request, response) = oneshot::channel();
@@ -106,7 +111,9 @@ impl TimestampOracle {
         match tokio::time::timeout(TSO_WAIT_LIMIT, response).await {
             Ok(ts) => {
                 let ts = ts?;
-                log_slow_tso(start.elapsed());
+                if log_slow {
+                    log_slow_tso(start.elapsed());
+                }
                 Ok(ts)
             }
             Err(_) => Err(internal_err!(
@@ -674,6 +681,7 @@ mod tests {
     /// and sends them again, so every concurrent request gets a timestamp, all distinct (as
     /// client-go's PD client: `tsoDispatcher` reconnects and retries).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
     async fn broken_tso_stream_is_reopened_and_requests_resent() {
         let streams = Arc::new(AtomicUsize::new(0));
         let client = start(MockPd {
@@ -703,6 +711,7 @@ mod tests {
     /// gives up on it and sends the request again on a new stream (client-go's per-batch
     /// deadline, clients/tso/dispatcher.go:324).
     #[tokio::test]
+    #[serial_test::serial]
     async fn silent_tso_stream_hits_the_batch_deadline() {
         let streams = Arc::new(AtomicUsize::new(0));
         let client = start(MockPd {
@@ -726,6 +735,7 @@ mod tests {
     /// Every stream fails at once: the oracle gives up after MAX_STREAM_FAILURES (so that the
     /// caller's `RetryClient` reconnects) instead of retrying forever; requests fail, not hang.
     #[tokio::test]
+    #[serial_test::serial]
     async fn oracle_gives_up_on_a_pd_that_keeps_failing() {
         let streams = Arc::new(AtomicUsize::new(0));
         let client = start(MockPd {
@@ -750,6 +760,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn slow_tso_warning_threshold_and_kv() {
         let start = crate::util::log::test_logger::checkpoint();
         log_slow_tso(SLOW_TSO_THRESHOLD);
@@ -778,6 +789,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn get_timestamp_emits_slow_tso_warning() {
         let (request_tx, mut request_rx) = mpsc::channel(MAX_BATCH_SIZE);
         let oracle = TimestampOracle { request_tx };
@@ -807,6 +819,35 @@ mod tests {
         assert!(
             cost.ends_with("ms") || cost.ends_with('s'),
             "expected Go-formatted duration, got {cost:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn get_timestamp_silent_does_not_emit_slow_tso_warning() {
+        let (request_tx, mut request_rx) = mpsc::channel(MAX_BATCH_SIZE);
+        let oracle = TimestampOracle { request_tx };
+        tokio::spawn(async move {
+            if let Some(sender) = request_rx.recv().await {
+                tokio::time::sleep(Duration::from_millis(45)).await;
+                let _ = sender.send(Timestamp {
+                    physical: 1,
+                    logical: 2,
+                    suffix_bits: 0,
+                });
+            }
+        });
+
+        let start = crate::util::log::test_logger::checkpoint();
+        let ts = oracle.get_timestamp_silent().await.unwrap();
+        assert_eq!(ts.logical, 2);
+
+        let records = crate::util::log::test_logger::since(start);
+        assert!(
+            !records
+                .iter()
+                .any(|r| r.level == log::Level::Warn && r.message == "get timestamp too slow"),
+            "silent TSO fetch must not emit 'get timestamp too slow'"
         );
     }
 }

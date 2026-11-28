@@ -148,7 +148,7 @@ async fn backoff_emits_structured_retry_later_and_max_sleep_warn() {
 }
 
 #[tokio::test]
-async fn backoff_lock_fast_logs_none_txn_start_ts_when_unset() {
+async fn backoff_lock_fast_logs_null_txn_start_ts_when_unset() {
     let start = checkpoint();
     let mut bo = Backoff::time_budget(100).start();
     assert_eq!(bo.txn_start_ts(), None);
@@ -171,5 +171,5 @@ async fn backoff_lock_fast_logs_none_txn_start_ts_when_unset() {
     assert_eq!(retry_later.kv("maxSleep"), Some("100"));
     assert_eq!(retry_later.kv("totalSleep"), Some("1"));
     assert_eq!(retry_later.kv("excludedSleep"), Some("0"));
-    assert_eq!(retry_later.kv("txnStartTS"), Some("None"));
+    assert_eq!(retry_later.kv("txnStartTS"), Some("null"));
 }

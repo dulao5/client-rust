@@ -48,13 +48,23 @@ pub enum Liveness {
     Unknown,
 }
 
+/// Result of probing one store for liveness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    Liveness(Liveness),
+    Invalid { addr: String, state: &'static str },
+}
+
 /// Probes one store, without a timeout of its own ([`StoreLiveness`] applies
 /// [`STORE_LIVENESS_TIMEOUT`]). `None`: the store no longer exists (tombstone), stop
 /// tracking it.
 pub type LivenessProbe =
     Arc<dyn Fn(StoreId) -> BoxFuture<'static, Option<Liveness>> + Send + Sync + 'static>;
 
-type SharedProbe = Shared<BoxFuture<'static, Option<Liveness>>>;
+pub(crate) type StoreProbe =
+    Arc<dyn Fn(StoreId) -> BoxFuture<'static, ProbeOutcome> + Send + Sync + 'static>;
+
+type SharedProbe = Shared<BoxFuture<'static, ProbeOutcome>>;
 
 /// See the module documentation.
 pub struct StoreLiveness {
@@ -62,7 +72,7 @@ pub struct StoreLiveness {
 }
 
 struct Inner {
-    probe: LivenessProbe,
+    probe: StoreProbe,
     timeout: Duration,
     interval: Duration,
     next_generation: AtomicU64,
@@ -81,10 +91,35 @@ impl StoreLiveness {
         StoreLiveness::with_timing(probe, STORE_LIVENESS_TIMEOUT, HEALTH_CHECK_INTERVAL)
     }
 
-    pub fn with_timing(probe: LivenessProbe, timeout: Duration, interval: Duration) -> Self {
+    pub(crate) fn with_store_probe(probe: StoreProbe) -> StoreLiveness {
         StoreLiveness {
             inner: Arc::new(Inner {
                 probe,
+                timeout: STORE_LIVENESS_TIMEOUT,
+                interval: HEALTH_CHECK_INTERVAL,
+                next_generation: AtomicU64::new(0),
+                stores: Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    pub fn with_timing(probe: LivenessProbe, timeout: Duration, interval: Duration) -> Self {
+        let wrapped: StoreProbe = Arc::new(move |store_id| {
+            let fut = probe(store_id);
+            async move {
+                match fut.await {
+                    Some(l) => ProbeOutcome::Liveness(l),
+                    None => ProbeOutcome::Invalid {
+                        addr: String::new(),
+                        state: "tombstone",
+                    },
+                }
+            }
+            .boxed()
+        });
+        StoreLiveness {
+            inner: Arc::new(Inner {
+                probe: wrapped,
                 timeout,
                 interval,
                 next_generation: AtomicU64::new(0),
@@ -134,14 +169,14 @@ impl StoreLiveness {
             // The first waiter to finish applies the probe's result.
             if matches!(&entry.probe, Some((g, _)) if *g == generation) {
                 entry.probe = None;
-                if let Some(liveness) = result.filter(|l| *l != Liveness::Reachable) {
-                    if entry.state == Liveness::Reachable {
+                if let ProbeOutcome::Liveness(liveness) = &result {
+                    if *liveness != Liveness::Reachable && entry.state == Liveness::Reachable {
                         info!(
                             storeID = store_id,
                             liveness:? = liveness;
                             "[health check] store is not reachable, start its health check loop"
                         );
-                        entry.state = liveness;
+                        entry.state = *liveness;
                         self.inner.spawn_health_check_loop(store_id);
                     }
                 }
@@ -150,7 +185,10 @@ impl StoreLiveness {
                 stores.remove(&store_id);
             }
         }
-        result.unwrap_or(Liveness::Unknown)
+        match result {
+            ProbeOutcome::Liveness(liveness) => liveness,
+            ProbeOutcome::Invalid { .. } => Liveness::Unknown,
+        }
     }
 }
 
@@ -161,13 +199,13 @@ impl Inner {
 
     /// One probe, bounded by the liveness timeout: a store that does not answer in time is
     /// unreachable (client-go's health check fails with its context's deadline).
-    fn probe_once(&self, store_id: StoreId) -> impl std::future::Future<Output = Option<Liveness>> {
+    fn probe_once(&self, store_id: StoreId) -> impl std::future::Future<Output = ProbeOutcome> {
         let probe = (self.probe)(store_id);
         let timeout = self.timeout;
         async move {
             tokio::time::timeout(timeout, probe)
                 .await
-                .unwrap_or(Some(Liveness::Unreachable))
+                .unwrap_or(ProbeOutcome::Liveness(Liveness::Unreachable))
         }
     }
 
@@ -189,23 +227,28 @@ impl Inner {
                     return;
                 };
                 match result {
-                    Some(Liveness::Reachable) | None => {
-                        if result.is_some() {
-                            info!(storeID = store_id; "[health check] store became reachable");
-                        } else {
-                            info!(
-                                storeID = store_id,
-                                state = "tombstone";
-                                "[health check] store is invalid(tombstone or removed), stop checking"
-                            );
-                        }
+                    ProbeOutcome::Liveness(Liveness::Reachable) => {
+                        info!(storeID = store_id; "[health check] store became reachable");
                         entry.state = Liveness::Reachable;
                         if entry.probe.is_none() {
                             stores.remove(&store_id);
                         }
                         return;
                     }
-                    Some(liveness) => entry.state = liveness,
+                    ProbeOutcome::Invalid { addr, state } => {
+                        info!(
+                            storeID = store_id,
+                            addr = addr.as_str(),
+                            state = state;
+                            "[health check] store is invalid(tombstone or removed), stop checking"
+                        );
+                        entry.state = Liveness::Reachable;
+                        if entry.probe.is_none() {
+                            stores.remove(&store_id);
+                        }
+                        return;
+                    }
+                    ProbeOutcome::Liveness(liveness) => entry.state = liveness,
                 }
             }
         });
@@ -357,5 +400,38 @@ mod tests {
         assert_eq!(liveness_of_status(0), Liveness::Unknown);
         assert_eq!(liveness_of_status(3), Liveness::Unknown);
         assert_eq!(liveness_of_status(2), Liveness::Unreachable);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_store_logs_store_id_addr_and_state() {
+        let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_gone = gone.clone();
+        let liveness = StoreLiveness::with_store_probe(Arc::new(move |_| {
+            let is_gone = probe_gone.load(Ordering::SeqCst);
+            async move {
+                if is_gone {
+                    ProbeOutcome::Invalid {
+                        addr: "127.0.0.1:20160".to_owned(),
+                        state: "removed",
+                    }
+                } else {
+                    ProbeOutcome::Liveness(Liveness::Unreachable)
+                }
+            }
+            .boxed()
+        }));
+        let start = crate::util::log::test_logger::checkpoint();
+        assert_eq!(liveness.check(99).await, Liveness::Unreachable);
+        gone.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let records = crate::util::log::test_logger::since(start);
+        assert!(records.iter().any(|r| {
+            r.level == log::Level::Info
+                && r.message
+                    == "[health check] store is invalid(tombstone or removed), stop checking"
+                && r.kv("storeID") == Some("99")
+                && r.kv("addr") == Some("127.0.0.1:20160")
+                && r.kv("state") == Some("removed")
+        }));
     }
 }

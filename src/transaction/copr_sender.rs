@@ -340,18 +340,15 @@ impl<PdC: PdClient> CopSender<PdC> {
                 }
                 if !retried_in_place(&region_error) {
                     // Update the cache and hand the error back: the caller re-splits.
-                    let _ = handle_region_error(
-                        self.pd_client.clone(),
-                        region_error.clone(),
-                        region_store,
-                    )
-                    .await;
+                    let _ =
+                        handle_region_error(self.pd_client.clone(), &region_error, region_store)
+                            .await;
                     resp.region_error = Some(region_error);
                     return Ok(CopSendResult { resp, rpc_ctx });
                 }
                 let t = metrics::backoff_type_for_region_error(&region_error);
                 let resolved =
-                    handle_region_error(self.pd_client.clone(), region_error.clone(), region_store)
+                    handle_region_error(self.pd_client.clone(), &region_error, region_store)
                         .await?;
                 if !resolved {
                     Self::backoff(bo, t, Error::RegionError(Box::new(region_error))).await?;

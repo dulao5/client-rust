@@ -88,24 +88,108 @@ impl std::fmt::Display for GoTxnStatusDisplay<'_> {
     }
 }
 
+struct CompactKeyError<'a>(&'a kvrpcpb::KeyError);
+
+impl std::fmt::Display for CompactKeyError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kvrpcpb::KeyError {
+            locked,
+            retryable,
+            abort,
+            conflict,
+            already_exist,
+            deadlock,
+            commit_ts_expired,
+            txn_not_found,
+            commit_ts_too_large,
+            assertion_failed,
+            primary_mismatch,
+            txn_lock_not_found,
+            debug_info,
+        } = self.0;
+        let mut first = true;
+        macro_rules! sep {
+            () => {
+                if !first {
+                    f.write_str(" ")?;
+                }
+                #[allow(unused_assignments)]
+                {
+                    first = false;
+                }
+            };
+        }
+        if let Some(locked) = locked {
+            sep!();
+            write!(f, "locked:<{}>", GoLockDisplay(locked))?;
+        }
+        if !retryable.is_empty() {
+            sep!();
+            write!(f, "retryable:{retryable:?}")?;
+        }
+        if !abort.is_empty() {
+            sep!();
+            write!(f, "abort:{abort:?}")?;
+        }
+        if let Some(v) = conflict {
+            sep!();
+            write!(f, "conflict:{v:?}")?;
+        }
+        if let Some(v) = already_exist {
+            sep!();
+            write!(f, "already_exist:{v:?}")?;
+        }
+        if let Some(v) = deadlock {
+            sep!();
+            write!(f, "deadlock:{v:?}")?;
+        }
+        if let Some(v) = commit_ts_expired {
+            sep!();
+            write!(f, "commit_ts_expired:{v:?}")?;
+        }
+        if let Some(v) = txn_not_found {
+            sep!();
+            write!(f, "txn_not_found:{v:?}")?;
+        }
+        if let Some(v) = commit_ts_too_large {
+            sep!();
+            write!(f, "commit_ts_too_large:{v:?}")?;
+        }
+        if let Some(v) = assertion_failed {
+            sep!();
+            write!(f, "assertion_failed:{v:?}")?;
+        }
+        if let Some(v) = primary_mismatch {
+            sep!();
+            write!(f, "primary_mismatch:{v:?}")?;
+        }
+        if let Some(v) = txn_lock_not_found {
+            sep!();
+            write!(f, "txn_lock_not_found:{v:?}")?;
+        }
+        if let Some(v) = debug_info {
+            sep!();
+            write!(f, "debug_info:{v:?}")?;
+        }
+        if first {
+            f.write_str("<empty>")?;
+        }
+        Ok(())
+    }
+}
+
 struct ResolveLockErrorDisplay<'a> {
     key_err: &'a kvrpcpb::KeyError,
-    key: &'a [u8],
-    start_version: u64,
-    commit_version: u64,
-    is_txn_file: bool,
+    lock: &'a kvrpcpb::LockInfo,
 }
 
 impl std::fmt::Display for ResolveLockErrorDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "unexpected resolve err: {:?}, lock: {{key: {}, start_version: {}, commit_version: {}, is_txn_file: {}}}",
-            self.key_err,
-            HexRepr(self.key),
-            self.start_version,
-            self.commit_version,
-            self.is_txn_file,
+            "unexpected resolve err: {}, lock: {}",
+            CompactKeyError(self.key_err),
+            GoLockDisplay(self.lock),
         )
     }
 }
@@ -612,9 +696,8 @@ async fn resolve_locks_impl(
         for (key, lite) in plan.requests() {
             resolve_lock_with_retry(
                 key.into(),
-                lock.lock_version,
+                &lock,
                 commit_version,
-                lock.is_txn_file,
                 lite,
                 pd_client.clone(),
                 keyspace,
@@ -779,8 +862,6 @@ fn resolve_in_background(
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
 ) {
-    let start_version = lock.lock_version;
-    let is_txn_file = lock.is_txn_file;
     let lock_for_log = lock.clone();
     let plan = ResolvePlan::new(lock, keys, lite);
     tokio::spawn(async move {
@@ -788,9 +869,8 @@ fn resolve_in_background(
         for (k, lite) in plan.requests() {
             if let Err(e) = resolve_lock_with_retry(
                 k.into(),
-                start_version,
+                &lock_for_log,
                 commit_version,
-                is_txn_file,
                 lite,
                 pd_client.clone(),
                 keyspace,
@@ -853,15 +933,16 @@ async fn pessimistic_rollback_lock(
 #[allow(clippy::too_many_arguments)]
 async fn resolve_lock_with_retry(
     key: &Key,
-    start_version: u64,
+    lock: &kvrpcpb::LockInfo,
     commit_version: u64,
-    is_txn_file: bool,
     lite: bool,
     pd_client: Arc<impl PdClient>,
     keyspace: Keyspace,
     mut backoff: Backoff,
     clean_regions: &mut HashSet<RegionVerId>,
 ) -> Result<()> {
+    let start_version = lock.lock_version;
+    let is_txn_file = lock.is_txn_file;
     debug!("resolving locks with retry");
     let mut attempt = 0;
     loop {
@@ -936,10 +1017,7 @@ async fn resolve_lock_with_retry(
                     error!(
                         error:% = ResolveLockErrorDisplay {
                             key_err: &key_err,
-                            key: key.as_ref(),
-                            start_version,
-                            commit_version,
-                            is_txn_file,
+                            lock,
                         };
                         "resolveLock error"
                     );
@@ -2567,11 +2645,15 @@ mod tests {
         let key = vec![1];
         let region1 = MockPdClient::region1();
         let mut clean_regions = HashSet::new();
+        let lock1 = kvrpcpb::LockInfo {
+            key: key.clone(),
+            lock_version: 1,
+            ..Default::default()
+        };
         resolve_lock_with_retry(
             (&key).into(),
-            1,
+            &lock1,
             2,
-            false,
             false,
             client.clone(),
             keyspace,
@@ -2589,11 +2671,15 @@ mod tests {
         )
         .unwrap();
         let key = vec![100];
+        let lock2 = kvrpcpb::LockInfo {
+            key: key.clone(),
+            lock_version: 3,
+            ..Default::default()
+        };
         resolve_lock_with_retry(
             (&key).into(),
-            3,
+            &lock2,
             4,
-            false,
             false,
             client,
             keyspace,
@@ -3401,11 +3487,18 @@ mod tests {
             },
         )));
         let mut clean_regions = HashSet::new();
+        let err_lock = kvrpcpb::LockInfo {
+            key: b"k1".to_vec(),
+            primary_lock: b"pk1".to_vec(),
+            lock_version: 10,
+            lock_ttl: 100,
+            lock_type: kvrpcpb::Op::Put as i32,
+            ..Default::default()
+        };
         let res = resolve_lock_with_retry(
             &Key::from(b"k1".to_vec()),
-            10,
+            &err_lock,
             20,
-            false,
             true,
             err_client,
             Keyspace::Disable,
@@ -3419,7 +3512,7 @@ mod tests {
             r.level == log::Level::Error
                 && r.message == "resolveLock error"
                 && r.kv("error").is_some_and(|e| {
-                    e.contains("unexpected resolve err:") && e.contains("key: 6B31")
+                    e.contains("unexpected resolve err: abort:\"resolve-key-err-99\", lock: key: 6B31, primary: 706B31, txnStartTS: 10")
                 })
         }));
 

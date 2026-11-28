@@ -86,6 +86,10 @@ impl Cluster {
         self.tso.clone().get_timestamp().await
     }
 
+    pub async fn get_timestamp_silent(&self) -> Result<Timestamp> {
+        self.tso.clone().get_timestamp_silent().await
+    }
+
     pub async fn update_safepoint(
         &mut self,
         safepoint: u64,

@@ -245,6 +245,16 @@ impl Client {
         self.pd.clone().get_timestamp().await
     }
 
+    /// Retrieve the current [`Timestamp`] for async/pipelined callers without emitting
+    /// `"get timestamp too slow"` warnings.
+    ///
+    /// Matches `client-go`'s `GetTimestampAsync` / `tsFuture.Wait`
+    /// (`oracle/oracles/pd.go:236-250`), refreshing the low-resolution timestamp while
+    /// omitting slow-TSO warnings.
+    pub async fn current_timestamp_async(&self) -> Result<Timestamp> {
+        self.pd.clone().get_timestamp_silent().await
+    }
+
     /// Request garbage collection (GC) of the TiKV cluster.
     ///
     /// GC deletes MVCC records whose timestamp is lower than the given `safepoint`. We must guarantee
@@ -331,37 +341,9 @@ impl Client {
         &self,
         locks: Vec<ProtoLockInfo>,
         timestamp: Timestamp,
-        mut backoff: Backoff,
+        backoff: Backoff,
     ) -> Result<Vec<ProtoLockInfo>> {
-        use crate::request::TruncateKeyspace;
-
-        let mut live_locks = locks;
-        loop {
-            let resolved_locks = resolve_locks(
-                live_locks.encode_keyspace(self.keyspace, KeyMode::Txn),
-                timestamp.clone(),
-                self.pd.clone(),
-                self.keyspace,
-            )
-            .await?;
-            live_locks = resolved_locks.truncate_keyspace(self.keyspace);
-            if live_locks.is_empty() {
-                return Ok(live_locks);
-            }
-
-            let t = crate::metrics::BackoffType::TikvLockFast;
-            match backoff.next_step(t, None) {
-                None => return Ok(live_locks),
-                Some(step) => {
-                    let err = crate::Error::ResolveLockError(live_locks);
-                    backoff.finish_step(t, step, &err).await;
-                    let crate::Error::ResolveLockError(returned_locks) = err else {
-                        unreachable!();
-                    };
-                    live_locks = returned_locks;
-                }
-            }
-        }
+        resolve_locks_with_pd(self.pd.clone(), self.keyspace, locks, timestamp, backoff).await
     }
 
     /// Cleans up all keys in a range and quickly reclaim disk space.
@@ -383,5 +365,99 @@ impl Client {
 
     fn new_transaction(&self, timestamp: Timestamp, options: TransactionOptions) -> Transaction {
         Transaction::new(timestamp, self.pd.clone(), options, self.keyspace)
+    }
+}
+
+async fn resolve_locks_with_pd(
+    pd: Arc<impl PdClient>,
+    keyspace: Keyspace,
+    locks: Vec<ProtoLockInfo>,
+    timestamp: Timestamp,
+    mut backoff: Backoff,
+) -> Result<Vec<ProtoLockInfo>> {
+    use crate::request::TruncateKeyspace;
+
+    let mut live_locks = locks;
+    loop {
+        let resolved_locks = resolve_locks(
+            live_locks.encode_keyspace(keyspace, KeyMode::Txn),
+            timestamp.clone(),
+            pd.clone(),
+            keyspace,
+        )
+        .await?;
+        live_locks = resolved_locks.truncate_keyspace(keyspace);
+        if live_locks.is_empty() {
+            return Ok(live_locks);
+        }
+
+        let t = crate::metrics::BackoffType::RegionMiss;
+        match backoff.next_step(t, None) {
+            None => return Ok(live_locks),
+            Some(step) => {
+                let err = crate::Error::ResolveLockError(live_locks);
+                backoff.finish_step(t, step, &err).await;
+                let crate::Error::ResolveLockError(returned_locks) = err else {
+                    unreachable!();
+                };
+                live_locks = returned_locks;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::mock::MockKvClient;
+    use crate::mock::MockPdClient;
+    use crate::proto::kvrpcpb;
+
+    #[tokio::test]
+    async fn resolve_locks_preserves_region_miss_curve_on_time_budget() {
+        let lock = ProtoLockInfo {
+            key: b"k".to_vec(),
+            primary_lock: b"pk".to_vec(),
+            lock_version: u64::MAX - (1 << 18),
+            lock_ttl: 60_000,
+            ..Default::default()
+        };
+        let lock_for_resp = lock.clone();
+        let pd = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if req.is::<kvrpcpb::CheckTxnStatusRequest>() {
+                    return Ok(Box::new(kvrpcpb::CheckTxnStatusResponse {
+                        lock_ttl: 60_000,
+                        lock_info: Some(lock_for_resp.clone()),
+                        ..Default::default()
+                    }) as Box<dyn Any>);
+                }
+                panic!("unexpected request");
+            },
+        )));
+        let bo = Backoff::time_budget(6).start();
+        let start = crate::util::log::test_logger::checkpoint();
+        let remaining = resolve_locks_with_pd(
+            pd,
+            Keyspace::Disable,
+            vec![lock],
+            Timestamp::default(),
+            bo.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(remaining.len(), 1);
+        // regionMiss sleeps 2ms + 4ms = 6ms, then stops without returning BackoffExhausted.
+        assert_eq!(bo.total_sleep_ms(), 6);
+        let records = crate::util::log::test_logger::since(start);
+        assert!(records.iter().any(|r| {
+            r.level == log::Level::Debug
+                && r.message == "retry later"
+                && r.kv("type") == Some("regionMiss")
+                && r.kv("totalSleep") == Some("2")
+        }));
     }
 }

@@ -239,7 +239,7 @@ impl Backoff {
             excludedSleep = self.excluded_sleep_ms(),
             maxSleep = self.max_sleep_ms(),
             "type" = t.go_config(),
-            txnStartTS = self.txn_start_ts;
+            txnStartTS:% = TxnStartTsDisplay(self.txn_start_ts);
             "retry later"
         );
     }
@@ -552,6 +552,17 @@ impl Backoff {
             current_delay_ms: base_delay_ms,
             max_delay_ms,
             txn_start_ts: None,
+        }
+    }
+}
+
+struct TxnStartTsDisplay(Option<u64>);
+
+impl std::fmt::Display for TxnStartTsDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(ts) => write!(f, "{ts}"),
+            None => f.write_str("null"),
         }
     }
 }
@@ -1135,7 +1146,7 @@ mod test {
         assert_eq!(retry_record.kv("maxSleep"), Some("100"));
         assert_eq!(retry_record.kv("totalSleep"), Some("1"));
         assert_eq!(retry_record.kv("excludedSleep"), Some("0"));
-        assert_eq!(retry_record.kv("txnStartTS"), Some("None"));
+        assert_eq!(retry_record.kv("txnStartTS"), Some("null"));
     }
 
     #[test]

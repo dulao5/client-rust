@@ -24,6 +24,7 @@ use crate::region::RegionVerId;
 use crate::region::RegionWithLeader;
 use crate::region::StoreId;
 use crate::region_cache::RegionCache;
+use crate::store::liveness::ProbeOutcome;
 use crate::store::KvConnect;
 use crate::store::Liveness;
 use crate::store::RegionStore;
@@ -70,6 +71,10 @@ pub trait PdClient: Send + Sync + 'static {
     async fn region_for_id(&self, id: RegionId) -> Result<RegionWithLeader>;
 
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp>;
+
+    async fn get_timestamp_silent(self: Arc<Self>) -> Result<Timestamp> {
+        self.get_timestamp().await
+    }
 
     async fn update_safepoint(self: Arc<Self>, safepoint: u64) -> Result<bool>;
 
@@ -307,21 +312,31 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
             // the store itself.
             let region_cache = self.region_cache.clone();
             let kv_connect = self.kv_connect.clone();
-            StoreLiveness::new(Arc::new(move |store_id| {
+            StoreLiveness::with_store_probe(Arc::new(move |store_id| {
                 let region_cache = region_cache.clone();
                 let kv_connect = kv_connect.clone();
                 async move {
                     let store = match region_cache.get_store_by_id(store_id).await {
                         Ok(store) => store,
                         Err(e) => {
+                            let msg = e.to_string();
+                            if msg.contains("invalid store ID") && msg.contains("not found") {
+                                return ProbeOutcome::Invalid {
+                                    addr: String::new(),
+                                    state: "removed",
+                                };
+                            }
                             warn!(error:% = e; "[health check] failed to re-resolve unhealthy store");
-                            return Some(Liveness::Unknown);
+                            return ProbeOutcome::Liveness(Liveness::Unknown);
                         }
                     };
                     if store.state == metapb::StoreState::Tombstone as i32 {
-                        return None;
+                        return ProbeOutcome::Invalid {
+                            addr: store.address,
+                            state: "tombstone",
+                        };
                     }
-                    Some(kv_connect.check_liveness(&store.address).await)
+                    ProbeOutcome::Liveness(kv_connect.check_liveness(&store.address).await)
                 }
                 .boxed()
             }))
@@ -341,6 +356,13 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
     async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp> {
         let ts = self.pd.clone().get_timestamp().await?;
         // client-go `GetTimestamp` → `setLastTS` (oracle/oracles/pd.go:220).
+        self.low_resolution_ts.set_last_ts(&ts);
+        Ok(ts)
+    }
+
+    async fn get_timestamp_silent(self: Arc<Self>) -> Result<Timestamp> {
+        let ts = self.pd.clone().get_timestamp_silent().await?;
+        // client-go `tsFuture.Wait` → `setLastTS` (oracle/oracles/pd.go:244).
         self.low_resolution_ts.set_last_ts(&ts);
         Ok(ts)
     }
